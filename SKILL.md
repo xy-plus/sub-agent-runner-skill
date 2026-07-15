@@ -31,7 +31,7 @@ CODEX_HOME=$HOME/.codex-subagent codex exec --cd /abs/dir -m gpt-5.5 -c model_re
 `CODEX_HOME=$HOME/.codex-subagent` 指向专用最小配置目录：skills/、plugins/ 全空，无 MCP、无 hooks，`auth.json` 软链主配置（登录态共享），config.toml 仅钉模型。**默认 codex 看不到任何用户安装的 skill/plugin**（曾出过 codex 自激活 xyworkflow 嵌套跑三遍审查的事故）。
 
 - **要传 skill 给它**：把指定 skill 目录软链进 `~/.codex-subagent/skills/`（用完删），或直接把内容写进 brief。
-- **残留可见**（0.144.1 无法关闭，实测）：5 个官方内置（imagegen/openai-docs/skill-creator/skill-installer/plugin-creator）+ `~/.agents/skills/` 共享根（跨工具目录，CODEX_HOME 管不到）。兜底：brief 里写明"不得使用任何 skill，除非本 brief 明确指定"。
+- **残留可见**（0.144.1 无法关闭，实测）：5 个官方内置（imagegen/openai-docs/skill-creator/skill-installer/plugin-creator）。另注意 `~/.agents/skills/` 是 CODEX_HOME 管不到的共享扫描根（已清空）——别往里放东西，放了 codex 就能看见。兜底：brief 里写明"不得使用任何 skill，除非本 brief 明确指定"。
 - codex 升级后：新版有 `features.skills` 总开关（官方文档），届时加 `--disable skills` 连内置一起关。
 - 该目录丢失时重建：`mkdir -p ~/.codex-subagent/{skills,plugins} && ln -sfn ~/.codex/auth.json ~/.codex-subagent/auth.json` + 最小 config.toml（model/effort/approval/sandbox/service_tier 五行）。
 
