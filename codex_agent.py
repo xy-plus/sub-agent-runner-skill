@@ -59,6 +59,84 @@ def task_name(value):
     return value
 
 
+# 控制字符（C0 全段 + DEL）。制表符和换行只是其中最容易撞上的两个。
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _reject_control_chars(flag, value, why):
+    """控制字符必须在**入口**挡住，不能指望「一般没人这么干」。
+
+    2026-09-19 实测：给一个含制表符和换行的路径，`mkdir`／`resolve()`／
+    `is_dir()` **全都放行**——文件系统这一层根本不管。
+
+    **`why` 由调用方传，不在这里写死。** 两个调用方坏的不是同一件事：`--dir`
+    进 status 的数据行、不进白名单；`--skill` 进白名单、**不**进 status 的列
+    （skills 刻意不进列，见 new_meta）。合成一句「要进数据行和白名单行」就是
+    对两个调用方各说了一半假话，而 stderr 那一行是 agent 唯一的线索。
+    """
+    hit = _CONTROL_CHARS.search(value)
+    if hit:
+        # 这里用 !r：value 已经确定含控制字符，裸插进错误信息会把 stderr 也弄成
+        # 多行／带制表符的一坨。skill_path 后面三条的 value 是干净路径，用裸的。
+        raise argparse.ArgumentTypeError(
+            f"{flag} {value!r} 含控制字符 {hit.group()!r}（第 {hit.start()} 个字符）。{why}")
+
+
+def work_dir(value):
+    """`--dir` 的 type=。只管控制字符；「是不是目录」归 cmd_run——它要先 expanduser／resolve。
+
+    **和 cmd_run 里 resolve 之后那道不是重复。** 这一道守的是命令行上那个原始串，
+    还买到两样别的：`..` 把控制字符折叠掉的路径（`/a/x\tb/../SKILL.md` 这种，
+    resolve 之后就没有控制字符了，而**原始串会原样出现在 stderr 和日志里**），
+    以及 argparse 免费的错误格式（`argument --dir: …`，点名是哪个参数）。
+    那一道守的是 resolve 之后的真身——软链一跨，这一道就够不着了。
+    """
+    _reject_control_chars(
+        "--dir", value,
+        "它要原样进 status 的数据行，一个换行就让「一行一任务」不成立，"
+        "任何切分方案都救不回来（见 status_row）。")
+    return value
+
+
+def skill_path(value):
+    """`--skill` 的 type=。四条缺一不可，全部当场拒，绝不「尽力而为」地继续。
+
+    收的是 **SKILL.md 文件本身**，不是 skill 目录。
+
+    为什么非得当场拒：2026-09-19 真跑（`--effort low`，brief 指向一个不存在的
+    SKILL.md）——codex 第一步 `cat` 退 1，第二步拿 `find` 翻真实 home **跑了
+    34.9 秒**，结论「未找到该文件，因此无法严格按其流程执行，尚未创建 out.txt」，
+    磁盘上产物**不存在**，而本工具判 `success`、**退出码 0**。
+    「零工作量」被报成「完成」，且没有任何别的信号救得回来：`cat` 的失败是 shell
+    退出码，不匹配 runtime_error_lines 的三种错误形式，judge 结构上看不见它。
+    """
+    _reject_control_chars(
+        "--skill", value,
+        "它要逐行进兜底句的白名单，一个换行就把一条静默劈成两条，"
+        "codex 读到的是两个都不存在的路径（见 build_skill_guard）。")
+    q = pathlib.Path(value)
+    if not q.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 不是绝对路径。codex 的 cwd 是 --dir，相对路径解释不出你的意思。")
+    if not q.is_file():
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 不是文件。要传的是 SKILL.md **文件本身**，不是 skill 目录。")
+    # 第三条是审查实测逼出来的：**权限 000 的文件 is_file() 返回 True**，
+    # 而 codex 的 `cat` 退 1。只查前两条的话，这次改动的核心承诺（路径写错从
+    # 静默失效变当场报错）在「文件存在但读不了」这一支上原样漏掉。
+    if not os.access(q, os.R_OK):
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 存在但当前用户读不了（权限 {oct(q.stat().st_mode)[-3:]}）。"
+            f"codex 的 cat 会退 1，而那个失败判据看不见。")
+    # **刻意返回原样，不 resolve()**：这个串会逐字进 brief 的白名单行，而
+    # 「codex 到底读没读」就是靠日志里那一行 `cat <这个串>` 看出来的
+    # （见 _add_prompt_round_args 的可观测性论证）。规范化之后，命令行上写的、
+    # brief 里印的、日志里出现的就成了三个不同的串，人和 grep 都对不上。
+    # 代价是审计侧：`/a/../a/SKILL.md` 和 `/a/SKILL.md` 在元数据里记成两个值。
+    # 接受这个代价——元数据记的本来就是「最后一次调用给了什么」。
+    return value
+
+
 USAGE_LIMIT_MARK = "You've hit your usage limit"
 THREAD_LOCK_MARK = "already has an active writer"
 REPORT_PREVIEW_LINES = 5
@@ -179,7 +257,7 @@ def interrupt_codex(pid, log_path, cause):
     codex 的上下文优先于留痕。这个降级方向正是「可观测的失效不许拖垮存活」。
     """
     # 校验必须排在 os.kill **之前**：INT 发出去收不回来，先打断再发现 cause
-    # 写错，那一轮白毁——和四道闸同一条道理。
+    # 写错，那一轮白毁——和发信号前那几道闸同一条道理。
     _require_enum(cause, _CAUSES, "cause")
     try:
         os.kill(pid, signal.SIGINT)
@@ -445,6 +523,11 @@ def judge(round):
     # 156 份真实报告只有 4 份是 JSON，`-o` 写的是 agent 的最后一条消息，通常是
     # markdown 散文。要结构化输出那是 --output-schema 的事。
     preview = [l for l in report_text.splitlines() if l.strip()][:REPORT_PREVIEW_LINES]
+    # **这条 success 仍然盖不住「它压根没干活」这一整类。** `--skill` 只堵住其中
+    # 一个实例（路径写错）：codex 读完 skill 之后**拒绝执行**、只在报告里写一句
+    # 「我没做」，这里照样判 success——报告非空、日志无错误行，两个条件都满足。
+    # 结构上看不见：产物存在性由 brief 的 DoD 定义（要 commit 还是要别的），
+    # 那是任务层的事，工具层没有任何东西知道该去找什么。**另案，别在这里补。**
     return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
@@ -466,10 +549,34 @@ CONFIG_NOTE = '''# codex-agent 的隔离配置。
 '''
 
 
+# 账号名里不许有空白或控制字符。它会进 status 数据行的第二列，而那一列是
+# `split(maxsplit=4)` 的切分边界之一（见 status_row）。和任务名限字符集同一条
+# 理由：这个值会进入按空白切分的输出，**约束必须在入口**——而扫描就是它进入
+# 系统的唯一入口。刻意只拒空白和控制字符、不照搬 _TASK_NAME 的字符集：
+# `工作` 这种账号名一点问题都没有，按任务名的白名单会把它一起误伤。
+_BAD_IN_ACCOUNT = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
 def account_choices():
-    """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。"""
+    """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。
+
+    扫到坏名字就**拒跑**，不静默跳过：跳过的话这个账号的隔离目录对
+    `find_meta`／`all_metas` 也一起消失，住在里面的任务从此 status 看不见、
+    而同名 run 又会当它不存在——正是这次改动要消灭的那种静默失效。
+
+    **代价要说清：拒绝半径是整个 CLI。** 本函数挂在 `build_parser()` 的
+    `choices=` 上，所以一个坏目录名会让 `status`／`stop` 也退 2——**连正在跑的
+    任务都停不了**，只能先把那个目录改名。选这一半是因为另一半更坏（静默失效
+    没有任何信号），而这一半的修法是一条 `mv`，且 stderr 直接点名是哪个目录。
+    """
     accounts_dir = pathlib.Path.home() / ".codex-accounts"
-    extra = sorted(p.name for p in accounts_dir.iterdir() if p.is_dir()) if accounts_dir.is_dir() else []
+    extra = sorted(q.name for q in accounts_dir.iterdir() if q.is_dir()) if accounts_dir.is_dir() else []
+    for name in extra:
+        hit = _BAD_IN_ACCOUNT.search(name)
+        if hit:
+            reject(f"账号目录名 {accounts_dir / name} 含空白或控制字符 {hit.group()!r}"
+                   f"（第 {hit.start()} 个字符）。账号名会进 status 数据行的第二列，"
+                   f"那一列是按空白切分的边界。改掉这个目录名再跑。")
     return ["default"] + extra
 
 
@@ -499,7 +606,23 @@ def shared_skill_root():
 
 
 def ensure_isolation(account):
-    """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。"""
+    """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。
+
+    **它挡的是动机，不是能力**——这条必须写明白，否则下一个人会拿它去推错结论。
+    2026-09-19 实测：`collaboration.spawn_agent` 等六个工具**恒在**，
+    `--disable multi_agent` **无效**（加与不加，codex 报的工具清单逐字相同）；
+    `skip_host_skill_discovery` 也不影响服务端那 5 个 skill（两次清单逐字吻合）。
+    真正被挡住的是**主目录那一侧**：23 个 skill、2 个 MCP、3 个 hook 全部看不见。
+    服务端那 5 个与「想去编排」无关，**刻意不管**（关它们是解决不存在的问题）。
+    `~/.agents/skills` 放哨兵文件确实会被 codex 列出来——所以下面那条
+    「共享扫描根非空即拒跑」是**承重的**，不是防御性编程。
+
+    顺带记下一条被审查推翻的错理由：曾经写过「不把 skill 软链进来，是因为
+    codex 看见流程类 skill 就想去编排」——**对精选集不成立**（只软链
+    test-driven-development 时，codex 够不着 subagent-driven-development，
+    那个口子打不开）。不软链的真理由在 _add_prompt_round_args 里：可观测性 +
+    奥卡姆。留着一条错理由比没有理由更危险。
+    """
     d = isolation_home(account)
     # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
     # 写失败（log 末尾只留一行 Failed to write last message file），而判据是
@@ -537,7 +660,14 @@ def ensure_isolation(account):
     return d
 
 
-SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
+# 兜底句的**词干**。派生出来的两种措辞都含有它，SKILL.md 历史上印过的那句
+# 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它。
+# 它只挡**复述过本工具措辞**的那一类——2026-09-20 实测：`禁止使用任何 skill。`
+# 和 `不要用任何 skill，除非我说了。` 都**放行**。挡不住的那一类靠的是工具的
+# 句子排在最前面（见 prepend_skill_guard 的拼接顺序），本来优先级就明确。
+# 刻意**不**升级成语义匹配：那要引入一个新判据，换来的只是挡住一类优先级本来
+# 就不含糊的输入。
+SKILL_GUARD_STEM = "不得使用任何 skill"
 
 # 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
 # `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
@@ -545,11 +675,91 @@ _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
            "--skip-git-repo-check", "--disable", "plugins"]
 
 
-def prepend_skill_guard(brief_text):
-    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。"""
-    if brief_text.startswith(SKILL_GUARD):
-        return brief_text
-    return f"{SKILL_GUARD}\n\n{brief_text}"
+def _require_skill_paths(skills):
+    """白名单的形状闸。照 `_require_enum` 的做法：内部调用方传错就**当场炸**。
+
+    `args.skills` 恒为 `tuple[str]` 这个不变量**只到 parser 为止**
+    （见 _AppendSkillPath），parser 之下本来一道闸都没有，而两种坏法全是静默的：
+
+        build_skill_guard("/abs/SKILL.md")  → 逐字符拼出 14 行：`- /`、`- a`、`- b`…
+        build_skill_guard(None)             → 返回「无白名单」那句，白名单被**无声吞掉**
+        new_meta(..., "/abs/SKILL.md")      → 照样落盘
+
+    仓内三个调用点都传 `args.skills`，所以今天不可达——`kind`／`cause`／`state`
+    当初上 `_require_enum` 时也一样不可达。**散文不是约束。**
+
+    只认 tuple，不认 list：不变量就是 tuple，放行 list 等于把刚统一掉的两种类型
+    又放回来。每一项必须是 `str`——`Path` 在兜底句里印出来一模一样，却会让
+    `write_meta` 的 `json.dumps` 在很久以后才炸；整数更坏，json 收得下，静默落盘。
+    """
+    if not isinstance(skills, tuple):
+        raise ValueError(
+            f"skills 必须是 tuple（只有一条就写 (路径,)），收到 "
+            f"{type(skills).__name__}: {skills!r}")
+    for q in skills:
+        if not isinstance(q, str):
+            raise ValueError(
+                f"skills 的每一项必须是路径字符串，收到 {type(q).__name__}: {q!r}")
+
+
+def build_skill_guard(skill_paths):
+    """本轮的兜底句。**每轮派生，不是常量**——白名单是每一轮的事。
+
+    旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
+    调用方无处声明白名单，只好让 brief 正文去破例。`--skill` 出现之后那半句就
+    该消失——白名单由 CLI 指定，brief 正文不再是声明渠道。
+
+    白名单**逐行**列出，所以路径里一个换行就能把一条静默劈成两条
+    （见 _reject_control_chars，那条拒绝就是为这里守的）。
+
+    **「除外」后面那句「动手前先逐个读一遍」是承重的，不是客套。**
+    只列路径的话，codex 拿到的是**许可**（你可以用这几个），而不是**指令**
+    （去读）。不读 → 日志里就没有那行 `cat <路径>` → `judge` 结构上看不见 →
+    照报 success，正是本次立项要杀的那类失效（34.9 秒那次）换了个形状。
+    而「刻意不把 skill 软链进隔离目录」的全部论证都架在那行 `cat` 上
+    （见 _add_prompt_round_args 的可观测性那段）——指令没了，那条论证也一起塌。
+    无白名单那一支**刻意不带**这句：没东西可读，加上去只是句废话。
+    """
+    _require_skill_paths(skill_paths)
+    if not skill_paths:
+        return f"**{SKILL_GUARD_STEM}。**"
+    return (f"**{SKILL_GUARD_STEM}，以下几个除外（动手前先逐个读一遍）：**\n"
+            + "\n".join(f"- {q}" for q in skill_paths))
+
+
+def check_brief_has_no_guard(brief_text):
+    """**调用方自己写了兜底句就拒跑**，不去重、不合并。**只拒绝，无副作用。**
+
+    两句兜底句并存时的优先级根本不该需要被定义（铁律 2）。而 SKILL.md 把那句话
+    明文印过、调用方照抄进 brief 开头是**可达路径**。拒绝比去重少一个分支，
+    且把「无定义」变成「不可能」。
+
+    抽成独立函数，是因为它必须在**两个**地方跑（同 check_can_resume 的两次调用）：
+      1. `check_can_resume` 里，排在 interrupt-and-resume 发 INT **之前**；
+      2. `prepend_skill_guard` 里，作为结构性兜底——闸留在动作本身上，
+         才没有一条绕过去的后门（cmd_run 根本不走 check_can_resume）。
+    纯拒绝、无副作用，跑两遍不花钱。
+
+    **判据用子串，不用整行**，这是对「本仓刚把轮次边界从子串改成整行」那条教训
+    的**刻意例外**：那次要从混杂文本里解析**自己的标记**，误判会让判据说谎；
+    这次要认的是**调用方复述了本工具的兜底句**，误判的后果是拒绝一个确实在谈
+    skill 禁令的 brief——而那正是我们要拒的。失败方向是良性的，而且前移之后
+    这个拒绝零副作用（见 check_can_resume）。
+    **不要把它读成「任意措辞都挡得住」**——挡不住，实测见 SKILL_GUARD_STEM 那段。
+    """
+    if SKILL_GUARD_STEM in brief_text:
+        reject(f"brief 里已经有兜底句（含「{SKILL_GUARD_STEM}」）。这句话归工具所有：\n"
+               f"要放行哪些 skill 就用 --skill 逐条给（SKILL.md 的绝对路径，可重复），"
+               f"一个都不给就用 --no-skill。")
+
+
+def prepend_skill_guard(brief_text, skill_paths):
+    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。
+
+    两个参数都**没有默认值**：白名单每轮重给，缺省成空就等于替调用方做了决定。
+    """
+    check_brief_has_no_guard(brief_text)
+    return f"{build_skill_guard(skill_paths)}\n\n{brief_text}"
 
 
 def build_run_argv(dir_abs, effort, report_path, brief):
@@ -595,29 +805,65 @@ def meta_path(home, task):
 
 
 def write_meta(home, task, meta):
-    meta_path(home, task).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    """落元数据。**原子替换，不原地截断重写。**
+
+    `Path.write_text` 先把目标截成 0 再往里填，而 `status` 随时可能在另一个
+    进程里读同一份 json（`all_metas`／`find_meta` 都是裸 `json.loads`）。
+    2026-09-20 实测截断重写的版本：1 秒里写 5289 次、并发读 12284 次，
+    其中 **8277 次读到半截 json**——撞上的调用方拿到一个裸 `JSONDecodeError`
+    traceback，不是干净的护栏拒绝。写进同目录的临时文件再 `os.replace`
+    （同一文件系统上是原子的），读者就只可能看到「旧的那份」或「新的那份」。
+
+    临时名固定、不带 pid：同一个任务不可能有两个并发写者——`cmd_run` 和
+    `cmd_resume` 都先拒绝「还在跑」的同名任务。固定名的好处是崩在中间留下的
+    那一个残片会被下一次写盖掉，不会越积越多。
+    后缀是 `.json.tmp` 而不是 `.tmp.json`：`all_metas` 扫的是 `*.json`，
+    残片要是被扫进去，它自己就成了一份「缺字段的坏元数据」，
+    而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）。
+    """
+    q = meta_path(home, task)
+    tmp = q.with_name(f"{q.name}.tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    os.replace(tmp, q)
 
 
 def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def new_meta(task, account, workdir, effort):
+def new_meta(task, account, workdir, effort, skills):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
 
     刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
     留着它只会诱导别人犯这个设计本来要防的错。
+
+    `skills` 记的是**最后一次调用**的白名单，与 effort／started_at 同一条原则
+    （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
+    skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
+    _require_skill_paths(skills)
     return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "session_id": None, "started_at": _now_iso()}
+            "skills": skills, "session_id": None, "started_at": _now_iso()}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
 # 静默的：少一个字段，run 照常报成败，但那个任务从此 status/resume/stop 全
 # 够不着，工具还会建议「删掉它重新 run」——会话就此丢掉。
+#
+# **爆炸半径是「列表」，不是「那一个任务」**（2026-09-20 逐条实测）：
+#   all_metas()        一个坏 json 就整条拒绝 → 不带任务名的 `status` 一个任务
+#                      都列不出来，连好的那些一起陪葬
+#   find_meta("好的")   **不受牵连**——它只 stat/读那一个任务的 json
+#   find_meta("坏的")   拒绝，而这是对的：你点名要的就是那一份
+# 所以 `status <任务名>`／`resume`／`stop` 只对坏掉的那个任务失灵。
+#
+# **往 REQUIRED_META_KEYS 加字段之前，先确认没有在跑的任务**：_load_meta 对缺
+# 字段的老元数据只会建议「删掉它重新 run」，而那等于丢会话。2026-09-19 加
+# `skills` 那次实测三个隔离目录的 tasks/ 全空（各 0 个 json），所以影响为零——
+# **那是当时的事实，不是永久豁免**，下次加字段要重新确认一遍。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "").keys())
+REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
 
 
 def _load_meta(path):
@@ -935,6 +1181,14 @@ def _tee_until_exit(proc, log, home, task, meta):
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
     # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
     # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
+    # **已登记的跟进项（尚未修）**：这个循环等的是 **stdout 管道 EOF**，
+    # 不是「codex 进程没了」。codex 起的孙进程会继承同一个 stdout，孙进程不退
+    # 管道就不 EOF，于是「codex 已经结束了」和「日志安静了」被当成一回事。
+    # 实测：直接子进程 t=0.03s 就退了，而这个 tee 循环挂到 **t=4.16s** 才退。
+    # 后果是 run/resume 的收尾被孙进程拖住——判据本身不受影响（它只看产物和
+    # 本轮日志），但「什么时候算这一轮结束」比真相晚。
+    # 修它要引入「等进程 + 另设管道超时」两件事，而本轮的范围是 --skill 和
+    # status，所以**只登记不修**。这几行是它唯一的书面记录。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
@@ -949,6 +1203,68 @@ def _tee_until_exit(proc, log, home, task, meta):
     proc.wait()
 
 
+# status 数据行的列序是**机器切分的契约**：前四列无空白，所以
+# `line.split(maxsplit=4)` 精确切出它们，第五段是「工作目录 + reason」。
+# **7 个 Verdict 构造点里有 4 个的 reason 含空格**（「本轮被 INT 打断，上下文
+# 保留——接着 resume 即可，不用重跑」、「报告在，但本轮日志有 N 条未分类的
+# codex 错误」、「会话被写锁占住（……曾被 SIGTERM 杀过），只能新起一个任务」、
+# 「pid=N 存活」），所以 reason 必须排在最后——这就是这次换列序的全部理由。
+# dir 与 reason 因此不可分，可以接受：dir 早就在 tasks/<task>.json 里，
+# 调用方真正要的是 state 和退出码。
+#
+# **刻意不换格式。** 初稿的制表符方案被实测否掉：按 tabstop=8 量四行真实输出
+# 的各列屏幕起始列，[0,16,24,32,40,80] / [0,16,24,32,40,88] / [0,8,16,24,32,40]
+# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]
+# （那是**换列序之前**的四列格式量出来的；定宽的稳定性与列数无关，结论照样成立）。
+#
+# 退出码单独成列：它和 state 是同一份事实的两种编码，但**同源派生**（都来自
+# EXIT[state]），不存在漂移风险。人读词，机器读码。
+#
+# 白名单（skills）刻意**不进列**：skill 路径是任意长度的绝对路径，进数据行会
+# 把定宽撑坏。要审计就读 tasks/<task>.json，那本来就是结构化的。
+_WHITESPACE = re.compile(r"\s")
+
+
+def status_row(meta, verdict):
+    """拼一行数据行，**拼之前先断言它切得开**——这条不是碰巧成立的。
+
+    收的是 `meta` 和 `verdict` 两个对象，不是五个位置 `str`：五个同类型参数里
+    **把 workdir 和 reason 传反会静默拼出旧列序**，而那正是这次改动要消灭的东西。
+    调用方（cmd_status）手里正好就是这两个对象，顺序传不反。
+
+    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。
+    状态和退出码由上面那条 `_require_enum` 保证（五态里没有一个含空白），
+    **剩下的任务名和账号两列都没人保证，两条断言都是承重的**：
+    这两列读的都是 `tasks/<task>.json`，而 `_load_meta` 只校验**键**在不在，
+    值长什么样一概不管——2026-09-20 实测手写一份 `"task": "t 1"` 的元数据，
+    `_load_meta` 一声不吭收下，挡住它的只有下面那条断言。
+    `--skill` 的 `_TASK_NAME` 和 `account_choices()` 守的是**另一个入口**
+    （命令行与目录扫描），手写的 json 从它们旁边绕过去，所以这里不是重复防御。
+
+    后两列断言「没有控制字符」：dir 和 reason 里空格是合法的（它们同在第五段），
+    换行和制表符不是——一个换行就让「一行一任务」不成立，任何切分方案都救不
+    回来。`--dir` 在入口已经挡过一道（见 work_dir），reason 当前也恰好不含
+    （穷举 Verdict 的 7 个构造点确认过），但那是**碰巧成立、无人守卫**。
+
+    明细行（错误行与报告预览）不走这里：它们由 cmd_status 加缩进打印，
+    首字符是空白，从而与数据行结构性可分；而它们的内容来自 splitlines()，
+    结构上不可能含换行。
+    """
+    # 先过枚举：退出码那一列是 EXIT[state]，裸下标对写错的状态只给一个 KeyError，
+    # 调用方看不出是什么坏了。和 kind／cause 同一条做法。
+    _require_enum(verdict.state, tuple(EXIT), "state")
+    task, account, workdir = meta["task"], meta["account"], meta["dir"]
+    for label, field in (("任务名", task), ("账号", account)):
+        if _WHITESPACE.search(field):
+            reject(f"{label} {field!r} 含空白字符——status 的前四列就切不开了，"
+                   f"调用方再也取不出 state。")
+    for label, field in (("工作目录", workdir), ("reason", verdict.reason)):
+        if _CONTROL_CHARS.search(field):
+            reject(f"{label} {field!r} 含控制字符——「一行一任务」就不成立了。")
+    return (f"{task:<24} {account:<8} {verdict.state:<8} {EXIT[verdict.state]:<4} "
+            f"{workdir}  {verdict.reason}")
+
+
 def _print_verdict(task, verdict):
     print(f"\n[codex-agent] {task}: {verdict.state} —— {verdict.reason}")
     for line in verdict.detail:
@@ -957,6 +1273,16 @@ def _print_verdict(task, verdict):
 
 def cmd_run(args):
     workdir = pathlib.Path(args.dir).expanduser().resolve()
+    # 入口那道（work_dir）守的是**命令行上那个原始串**，而落进元数据、随后进
+    # status 数据行的是 resolve() 之后的真身——软链一跨就绕过去了。实测：
+    # --dir 指向一个软链，真身叫 `a\tb\nc`，入口放行、resolve 出来含 \t\n、
+    # 落盘，之后 status 整条被 status_row 拒掉，一个任务都列不出来。
+    # 这里用 reject 而不是 ArgumentTypeError：此刻已经离开 argparse 了，
+    # 而 Rejected 和参数错误本来就同一个退出码 2，不必多一个实体。
+    hit = _CONTROL_CHARS.search(str(workdir))
+    if hit:
+        reject(f"--dir {args.dir} 解析出来的真身 {str(workdir)!r} 含控制字符 "
+               f"{hit.group()!r}（软链？）。它要原样进 status 的数据行，会把「一行一任务」切坏。")
     if not workdir.is_dir():
         reject(f"--dir {args.dir} 不是目录")
     brief_file = pathlib.Path(args.brief).expanduser()
@@ -978,13 +1304,15 @@ def cmd_run(args):
 
     ensure_isolation(args.account)
     report = _report_path(home, args.task)
-    brief = prepend_skill_guard(brief_file.read_text())
-    print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
+    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
+    # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
 
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
     verdict = judge(run_codex("run", home, args.task,
-                              new_meta(args.task, args.account, str(workdir), args.effort),
+                              new_meta(args.task, args.account, str(workdir),
+                                       args.effort, args.skills),
                               lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
@@ -1013,16 +1341,16 @@ def cmd_status(args):
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
                    else judge(Round(report, read_last_round(log))))
-        print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
-              f"{verdict.reason}  {meta['dir']}")
+        print(status_row(meta, verdict))
         for line in verdict.detail:
+            # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
             print(f"    {line}")
         worst = _worse(worst, verdict.state)
     return EXIT[worst]
 
 
 def check_can_resume(task, meta, brief_path):
-    """续跑的三道闸。**只拒绝，不产生任何副作用**，所以可以在发信号之前先跑一遍。
+    """续跑的四道闸。**只拒绝，不产生任何副作用**，所以可以在发信号之前先跑一遍。
 
     抽成独立函数，是因为 `interrupt-and-resume` 必须把**全部**拒绝跑在发信号
     之前：INT 发出去就收不回来，先打断、再发现没 session id，那一轮白毁**且拿
@@ -1033,16 +1361,21 @@ def check_can_resume(task, meta, brief_path):
     `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
 
-    **判据是「这个拒绝可不可恢复」，不是「所有拒绝都要排在信号之前」。**
-    这三道（加上调用方那道「任务存在吗」）拒的都是**不可恢复**的事：没 session id
-    就再也回不来，工作目录没了、brief 不是文件则连命令都拼不出来——这些必须在
-    INT 发出去**之前**问清楚，因为 INT 收不回来。
+    **判据（已精化）：凡是对「调用方已经交给我们的输入」的纯检查，一律在任何
+    不可逆动作之前做完。** 早先写的是「不可恢复的挪前面、可恢复的留后面」，
+    而那条按字面会把第四道闸放到信号后面——它确实「可恢复」（上下文还在）。
+    但那条判据的**本意**是「有些检查在动手之前做不了」（比如 `ensure_isolation`
+    要先解析出账号），不是「可恢复就随便放」。brief 的内容是调用方交进来的输入，
+    动手之前就问得出来；白白烧掉一轮，即使可恢复也是浪费。
+
+    四道闸里前三道拒的是**不可恢复**的事：没 session id 就再也回不来，工作目录
+    没了、brief 不是文件则连命令都拼不出来。第四道（brief 自带兜底句）是纯输入
+    检查。四道都必须在 INT 发出去**之前**问清楚，因为 INT 收不回来。
     而 `_resume_round` 里的 `ensure_isolation` 确实会在信号**之后**才拒绝
     （实测：`.agents/skills` 非空时 `os.kill` 已经调过一次，随后退出码 2），
-    那是**可恢复**的：修好不变量再 `resume` 一次就行，上下文还在。
-    所以它留在那儿没问题。
-    **往这条路上加新拒绝时，就按这条判据放**：不可恢复的挪到这里来，
-    可恢复的留在后面。
+    它既可恢复、又**必须先解析出账号才做得了**，所以留在那儿没问题。
+    **往这条路上加新拒绝时按这条判据放**：只要是对已经交进来的输入做纯检查，
+    就挪到这里来。
     """
     if not meta["session_id"]:
         reject(f"任务 {task} 没有记到 session id，无法 resume，只能新起一个任务")
@@ -1050,11 +1383,15 @@ def check_can_resume(task, meta, brief_path):
     if not workdir.is_dir():
         reject(f"任务 {task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
                f"codex 会以 os error 2 当场崩，所以这里直接拒。")
-    if not pathlib.Path(brief_path).expanduser().is_file():
+    brief_file = pathlib.Path(brief_path).expanduser()
+    if not brief_file.is_file():
         reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
+    # 第四道：读一遍 brief 正文。`_resume_round` 随后还要再读一次（经
+    # prepend_skill_guard），两次读同一个文件不花钱，换来的是「拒绝排在 INT 之前」。
+    check_brief_has_no_guard(brief_file.read_text())
 
 
-def _resume_round(kind, home, meta, task, brief_path, effort):
+def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
 
     名字是 `_resume_round` 不是 `_resume_with`：`with` 没说清 with 什么，
@@ -1068,13 +1405,16 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     判据收的就是 `run_codex` 回传的本轮文本，**不用 read_last_round**：本轮的
     拥有者手里有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动
     修掉的整类 bug）。
+
+    `skills` 是本轮的白名单，和 effort 一样每轮重给——白名单是每一轮的事。
     """
     check_can_resume(task, meta, brief_path)
     ensure_isolation(meta["account"])
-    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text())
-    # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
+    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
+    # 元数据描述的是**最后一次调用**：effort、白名单、开跑时间一起刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
+    meta["skills"] = skills
     meta["started_at"] = _now_iso()
     verdict = judge(run_codex(kind, home, task, meta,
                               lambda r: build_resume_argv(meta["dir"], meta["session_id"],
@@ -1099,7 +1439,8 @@ def cmd_resume(args):
     if find_codex_pid(_report_path(home, args.task)) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `codex-agent interrupt-and-resume {args.task}`。")
-    return _resume_round("resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
+                         args.skills)
 
 
 def cmd_interrupt_and_resume(args):
@@ -1124,13 +1465,13 @@ def cmd_interrupt_and_resume(args):
     工作损失多少」，后者在 codex 里根本不可观测。命令名把代价写在脸上，
     工具不替谁做这个决定。
 
-    下面的顺序是**硬约束**，不是排版顺序：四道闸全部走完才允许发信号。
+    下面的顺序是**硬约束**，不是排版顺序：五道闸全部走完才允许发信号。
     """
-    # ────── 四道闸 ──────
+    # ────── 五道闸 ──────
     home, meta = find_meta(args.task)                      # 1. 任务存在？
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    check_can_resume(args.task, meta, args.brief)          # 2/3/4. session id / 目录 / brief
+    check_can_resume(args.task, meta, args.brief)   # 2/3/4/5. session id / 目录 / brief 是文件 / brief 不自带兜底句
     # ────── 以上全过，才允许动手 ──────
 
     # meta 在这里读一次就一直用到 _resume_round。wait_for_exit 之后它已经旧于
@@ -1163,7 +1504,8 @@ def cmd_interrupt_and_resume(args):
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
-    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief,
+                         args.effort, args.skills)
 
 
 def cmd_stop(args):
@@ -1182,12 +1524,62 @@ def cmd_stop(args):
     return EXIT["success"]
 
 
+class _AppendSkillPath(argparse.Action):
+    """`--skill` 往 **tuple** 上拼，不用现成的 `action="append"`。
+
+    argparse 那两件现成零件各有一处毛病，凑在一起就是两条软约定：
+      - `action="append"` 给 list，而 `--no-skill` 的 `const=` 给的是**同一个
+        对象**（跨 parse 共享）。给 `[]` 的话谁原地改一下就污染另一次 parse。
+      - 两支类型还不一样，于是 `args.skills == []` 在一支上成立、另一支上踩空。
+    统一成不可变的 tuple 之后，「别原地改」和「别拿 `== []` 比」都不再需要
+    有人记得——前者结构上做不到，后者两支一致地为 False（要判空写
+    `if not args.skills`）。
+    """
+
+    # `option_string=None` 是 **argparse 的 Action 契约签名**，不是本仓禁止的那种
+    # 默认缺省值——argparse 调它时按位置传前三个、`option_string` 用关键字传，
+    # 签名少一个默认值就 TypeError。别当违规删掉。
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, (getattr(namespace, self.dest) or ()) + (value,))
+
+
+def _add_prompt_round_args(sub):
+    """带 prompt 的三条命令共用的「本轮 skill 白名单」。**二选一必填，没有默认值。**
+
+    白名单是**每一轮**的事，不是任务的事——resume 换一轮活，能用的 skill 就该
+    跟着换，所以三条命令各收一份，而不是在 run 时定死。
+
+    为什么 `--no-skill` 必须显式写：这个工具要交给其他 agent 用。省略时分不清
+    「调用方决定不给」和「调用方根本不知道有这个参数」，而 argparse 的
+    `required=True` 能把后者变成 exit 2 当场报错。代价很小——这个拒绝是即时且
+    完全可恢复的（加个参数重跑，零损失），不像 --effort/--account 写错要花钱
+    才发现。
+
+    **刻意不把 skill 软链进隔离目录**，理由是可观测性：路径在 brief 里、**而且
+    兜底句明文叫它去读**（见 build_skill_guard——那句指令就是这条论证的地基，
+    光给许可不给指令的话「读没读」根本无从观测），于是「codex 到底读没读」在
+    日志里看得见，就是那一行 `cat <路径>`；软链成能力之后，用没用由它决定、
+    **不可观测**。对一个主张「不骗调用方」的工具，这条是决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
+    一个」，isolation_home／find_meta／account_choices／ensure_isolation 全线
+    要改，换来的保证是零。
+    """
+    # 两支都给**不可变的 tuple**，所以 args.skills 的契约就一句话：
+    # 恒为 `tuple[str]`，`--no-skill` 时为空。理由见 _AppendSkillPath。
+    # 序列化不受影响：json.dumps(()) 就是 []，元数据的形状一个字没变。
+    g = sub.add_mutually_exclusive_group(required=True)
+    g.add_argument("--skill", action=_AppendSkillPath, dest="skills", type=skill_path,
+                   metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
+    g.add_argument("--no-skill", action="store_const", const=(), dest="skills",
+                   help="本轮一个 skill 都不给")
+
+
 def build_parser():
     """命令行契约。
 
     整个工具选 Python3 写，理由就在这个函数里：`argparse` 的 `required=True`
-    + `choices=` 天然实现了「强制显式」——五个参数一个都不能少、难度和账号只能
-    从枚举里挑，而且**错误消息是免费的**，不用自己写一遍校验和提示。
+    + `choices=` + 互斥组天然实现了「强制显式」——五个带值参数一个都不能少、
+    `--skill`/`--no-skill` 二选一、难度和账号只能从枚举里挑，而且**错误消息是
+    免费的**，不用自己写一遍校验和提示。
     另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
     """
     p = argparse.ArgumentParser(
@@ -1195,14 +1587,16 @@ def build_parser():
         description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # 五个参数全必填：不设默认值，因为隐式选中的账号／难度是最容易被误用的地方
+    # 五个带值参数全必填，外加 --skill/--no-skill 二选一：不设默认值，因为隐式
+    # 选中的账号／难度／白名单都是最容易被误用的地方
     r = sub.add_parser("run", help="起一个新任务")
     r.add_argument("--task", required=True, type=task_name,
                    help="任务名，全局唯一（PID 反查和产物命名都靠它）")
-    r.add_argument("--dir", required=True, help="codex 的工作目录，自动转绝对路径")
+    r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
     r.add_argument("--account", required=True, choices=account_choices(), help="codex 账号")
+    _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("status", help="看任务状态；省略任务名则列出全部")
@@ -1214,6 +1608,7 @@ def build_parser():
     m.add_argument("task", type=task_name)
     m.add_argument("--brief", required=True)
     m.add_argument("--effort", required=True, choices=EFFORTS)
+    _add_prompt_round_args(m)
     m.set_defaults(func=cmd_resume)
 
     # 名字刻意长而直白：它会**截断当前轮**，这个代价必须写在脸上。
@@ -1228,6 +1623,7 @@ def build_parser():
     j.add_argument("task", type=task_name)
     j.add_argument("--brief", required=True)
     j.add_argument("--effort", required=True, choices=EFFORTS)
+    _add_prompt_round_args(j)
     j.set_defaults(func=cmd_interrupt_and_resume)
 
     k = sub.add_parser("stop", help="停一个任务（只发 SIGINT）")
@@ -1289,8 +1685,14 @@ def main():
     # 而漏一个不会报错。实测那两个突变（新加一行裸 print、把某句 _say 改回裸
     # print）在收了 _say() 的版本上**都存活**。行缓冲之后裸 print 自动正确。
     sys.stdout.reconfigure(line_buffering=True)
-    args = build_parser().parse_args()
+    # build_parser() 也在 try 里面：account_choices() 扫到坏账号目录名时会 reject，
+    # 而 Rejected 就是 SystemExit(2)——漏在 try 外面它会直接逃出去，退出码还是 2
+    # 但 message 全丢，调用方拿到一个没有任何解释的 2。对 agent 调用方，
+    # 「有码无话」是最救不回来的一种失败。
+    # argparse 自己的参数错误不是 Rejected（它自己已经把话写到 stderr 了），
+    # 照旧原样逃出去，这里不拦。
     try:
+        args = build_parser().parse_args()
         return args.func(args)
     except Rejected as e:
         print(e.message, file=sys.stderr)

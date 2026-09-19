@@ -16,11 +16,18 @@
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
     退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
-    resume 的三处 flag 差异、任务名字符集、兜底句两条路都真的加上
+    resume 的三处 flag 差异、任务名字符集、兜底句**三条路**都真的加上且**每轮派生**
+    控制字符在入口就挡住（--dir / --skill，文件系统那一层根本不管）
+    status 数据行前四列无空白、明细行有缩进——「机器切得开」是断言出来的，不是碰巧
+    兜底句里那句「动手前先逐个读一遍」——**许可不等于指令**，没有指令就没有那行
+    `cat`，judge 看不见「它压根没读」，而「不软链」的论证正架在那行 `cat` 上
+    `--skill` 收下什么就原样还什么（不 resolve）——命令行、brief、日志三处必须同一个串
+    白名单的形状（恒为 tuple[str]）在 parser 之下也有闸——裸 str 会被逐字符拆开
+    元数据**原子替换**——status 在另一个进程里并发读，永远看不到半截 json
 
 总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
 凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
-地绿。这条是四次踩出来的，四次还都是同一个病——断言的两边一起动：
+地绿。这条是五次踩出来的，五次还都是同一个病——断言的两边一起动：
 
     1. 陪练进程写成 `sleep 5 <mark>`，而 sleep 收到多余参数会立刻退出。
        进程根本不存在，于是把承重的 comm 过滤整个删掉，测试照样绿。
@@ -33,20 +40,36 @@
        不钉「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，
        判据被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
        （见 TestRoundBoundary：正面钉拥有者的本轮文本，反面钉「猜边界当场失明」）。
+    5. `test_文档仍然保留代码替不了的那部分` 只断言「某个词出现过」。把 effort
+       分档表整张删掉，`--effort low` 那行还在，`effort` 这个词照样搜得到——
+       实测这条突变**存活**过。反向判据也要钉具体内容。
+       2026-09-20 加 `--skill`/`--no-skill` 那条时**原样又踩一次**：写成
+       `assertIn("--skill", skill)`，而把表格里那一行的两个参数整个删掉之后，
+       启动示例和「外加 --skill/--no-skill 二选一」那句里它们还在，突变存活。
+       改成钉**配对**（`--skill` 与「绝对路径」同行、`--no-skill` 与「二选一」
+       同行）并让每条事实在文档里只有一个家，两个突变才各自变红。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
-    suspect:3, running:4, interrupted:130}，字段清单钉那六个名字，
+    suspect:3, running:4, interrupted:130}，字段清单钉那七个名字，
     边界钉「这段文本从哪来」，别只钉「两边相等」。
+
+**没有任何一条测试允许把真的 codex 叫起来**，这条不再靠「记得包 _no_codex」：
+见本文件的 `setUpModule`，漏包当场喊出来（2026-09-20 真漏过一次）。
+
+写突变脚本时注意 `.pyc` 缓存：CPython 按 (mtime 秒, size) 判新旧，两条**字节数
+相同又在同一秒内**跑的突变会命中上一条的字节码，失败被错误归因。
+一律 `rm -rf __pycache__` + `PYTHONDONTWRITEBYTECODE=1`。
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
-行数（现在 61 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+行数（现在 65 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
 删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以只能
 interrupt-and-resume、退出码怎么读），正好把这次重写的目的做反。
 这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
 """
 import argparse
 import contextlib
+import io
 import json
 import os
 import pathlib
@@ -55,6 +78,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
@@ -91,6 +115,35 @@ HEADER = ("Reading additional input from stdin...\n"
           "--------\n")
 
 
+# 「单测绝不真的把 codex 叫起来」本来是**软约定**——靠每个作者记得包一层
+# _no_codex。2026-09-20 实测漏过一次：一条 cmd_run 的拒绝测试没包，而那道闸
+# 当时还没装上，cmd_run 一路走到 spawn，真的起了 codex（沙箱 HOME 没登录态，
+# 秒退，没花钱——但那是运气，不是设计）。
+# 在这里插一次桩，之后漏包**当场喊出来**，而且不必每个作者记得任何事。
+# 只挡 argv[0] 恰好是 "codex" 的那一种：陪练进程（sleep、python 驱动、
+# 命名成 codex 的假二进制都走绝对路径）一个都不受影响。
+# 真机冒烟（要真起 codex 的那一类）不在本文件里；将来若要加，给它一条显式豁免
+# 并在那里写清为什么。
+_REAL_POPEN_INIT = subprocess.Popen.__init__
+
+
+def setUpModule():
+    """全套测试里没有任何一条允许把真的 codex 叫起来。"""
+    def no_real_codex(self, args, *a, **kw):
+        argv0 = args[0] if isinstance(args, (list, tuple)) else args
+        assert argv0 != "codex", (
+            f"这条测试把真的 codex 叫起来了：{args!r}。少包了一层 _no_codex。")
+        return _REAL_POPEN_INIT(self, args, *a, **kw)
+    # **它刻意不还原**（没有 tearDownModule，也没有 addModuleCleanup）：
+    # 泄漏半径是**整个测试进程的余生**，同进程里后来 import 的任何模块调
+    # `Popen(["codex", ...])` 都会被它挡住。现在不可达——本仓只有这一个测试
+    # 模块，只 import 一次。
+    # **安全性唯一的地基是上面那行 `_REAL_POPEN_INIT` 在模块顶层、import 那一刻
+    # 抓的**，所以插桩永远只有一层。实测 50 次 importlib.reload + setUpModule
+    # 会叠成 RecursionError——真要多次 reload 本模块，先把这条前提想清楚。
+    subprocess.Popen.__init__ = no_real_codex
+
+
 @contextlib.contextmanager
 def _no_codex():
     """把 spawn 换成一个立刻 EOF 的假进程。
@@ -109,7 +162,7 @@ def _no_codex():
 def _full_meta(task, **over):
     """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
     meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "session_id": None, "started_at": "2026-09-19T00:00:00"}
+            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00"}
     meta.update(over)
     return meta
 
@@ -489,7 +542,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
@@ -502,7 +555,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_codex_pid", return_value=None), \
@@ -732,6 +785,35 @@ class TestIsolation(_HomeSandbox):
     def test_账号可选项来自实际目录扫描(self):
         self.assertEqual(ca.account_choices(), ["default", "acct2"])
 
+    def test_账号目录名含空白或控制字符就拒跑_并点名是哪个目录(self):
+        # 这个名字会进 status 的第二列，而那一列是按空白切分的边界之一。
+        # 约束必须在**入口**：扫描是它进入系统的唯一入口。
+        for bad in ("bad acct", "bad\tacct", "bad\nacct"):
+            with self.subTest(bad=bad):
+                d = self.home / ".codex-accounts" / bad
+                d.mkdir()
+                try:
+                    self.assertTrue(d.is_dir(), "前提不成立：这种名字的目录建不起来，那就没有洞")
+                    with self.assertRaises(ca.Rejected) as cm:
+                        ca.account_choices()
+                    self.assertIn(bad, cm.exception.message)
+                finally:
+                    d.rmdir()
+        self.assertEqual(ca.account_choices(), ["default", "acct2"],
+                         "前提不成立：坏目录清掉之后它就该正常返回")
+
+    def test_扫描期的拒绝也要说人话_不能只剩一个光秃秃的退出码2(self):
+        # account_choices() 在 build_parser() 里被调用，而那一句排在 main() 的
+        # try 之外的话，Rejected 会直接当 SystemExit(2) 逃出去——message 全丢，
+        # 调用方拿到一个没有任何解释的 2。这是 agent 最救不回来的一种失败。
+        (self.home / ".codex-accounts" / "bad acct").mkdir()
+        err = io.StringIO()
+        with mock.patch.object(ca.sys, "stdout", mock.MagicMock()), \
+             mock.patch.object(ca.sys, "argv", ["codex-agent", "status"]), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(ca.main(), 2)
+        self.assertIn("bad acct", err.getvalue())
+
     def test_default账号映射到不带后缀的隔离目录(self):
         self.assertEqual(ca.isolation_home("default"), self.home / ".codex-subagent")
         self.assertEqual(ca.isolation_home("acct2"), self.home / ".codex-subagent-acct2")
@@ -794,12 +876,87 @@ class TestIsolation(_HomeSandbox):
         self.assertIn("登录", cm.exception.message)
 
 
-class TestArgv(unittest.TestCase):
-    def test_兜底句被前置且只加一次(self):
-        once = ca.prepend_skill_guard("干活")
-        self.assertTrue(once.startswith(ca.SKILL_GUARD))
-        self.assertEqual(ca.prepend_skill_guard(once), once)
+class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
+    """兜底句**每轮派生**，且**只能由工具写**。
 
+    旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
+    调用方无处声明白名单，只好让 brief 正文去破例。--skill 出现之后那半句就该
+    消失——白名单由 CLI 指定，brief 正文不再是声明渠道。
+
+    断言的是**字面量**，不是 ca.SKILL_GUARD_STEM 拼出来的串：后者两边会一起动，
+    把措辞整个改掉测试照样绿（本仓在这上面栽过五次）。
+    """
+
+    def test_无白名单时的措辞(self):
+        self.assertEqual(ca.build_skill_guard(()), "**不得使用任何 skill。**")
+
+    def test_有白名单时逐行列出每条绝对路径_并且带上去读的指令(self):
+        """**许可不等于指令**——这是立项要杀的那类失效换了个形状。
+
+        只说「这几个除外」，codex 拿到的是「你可以用」，没有任何一句让它去读。
+        不读 → 日志里就没有那行 `cat <路径>` → judge 结构上看不见 → 照报 success，
+        正是 34.9 秒那次的同一种失效。
+        而「不把 skill 软链进隔离目录」的全部论证都架在这行 `cat` 上
+        （见 _add_prompt_round_args），指令没了那条论证也一起塌。
+        """
+        self.assertEqual(
+            ca.build_skill_guard(("/abs/one/SKILL.md", "/abs/two/SKILL.md")),
+            "**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**\n"
+            "- /abs/one/SKILL.md\n"
+            "- /abs/two/SKILL.md")
+
+    def test_无白名单时不带这条指令_没东西可读(self):
+        # 正面控制：指令只在有白名单那一支出现。少了它，一个「两支都加指令」的
+        # 实现也全绿，而那句话在无白名单时是句废话（让它去读一个空清单）。
+        self.assertNotIn("读一遍", ca.build_skill_guard(()))
+
+    def test_白名单必须是tuple_裸str会被逐字符拆开(self):
+        """`args.skills` 恒为 tuple 这个不变量**只到 parser 为止**，parser 之下
+        本来一道闸都没有。实测那两种坏法**全是静默的**：
+
+            build_skill_guard("/abs/SKILL.md") → 拼出 14 行：`- /`、`- a`、`- b`…
+            build_skill_guard(None)            → 返回「无白名单」那句，白名单被无声吞掉
+
+        仓内三个调用点都传 args.skills 所以现在不可达——但 kind／cause／state
+        当初上 _require_enum 时也一样不可达。散文不是约束。
+        """
+        for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as cm:
+                    ca.build_skill_guard(bad)
+                self.assertIn("skills", str(cm.exception))
+
+    def test_白名单的每一项必须是路径字符串(self):
+        # Path 对象在兜底句里印出来一模一样，却会让 write_meta 的 json.dumps
+        # 在很久以后才炸；整数更坏，json 收得下，静默落盘。
+        for bad in ((pathlib.Path("/abs/SKILL.md"),), (1,)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ca.build_skill_guard(bad)
+
+    def test_空tuple和正常tuple都照收(self):
+        # 正面控制：没有它，一个「什么都拒」的实现也全绿
+        self.assertEqual(ca.build_skill_guard(()), "**不得使用任何 skill。**")
+        self.assertIn("- /a/SKILL.md", ca.build_skill_guard(("/a/SKILL.md",)))
+
+    def test_brief自带兜底句就拒跑_并提示改用参数(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.prepend_skill_guard("**不得使用任何 skill。**\n\n干活", ())
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--no-skill", cm.exception.message)
+        self.assertIn("--skill", cm.exception.message)
+
+    def test_旧那句兜底句也算自带_SKILL_md历史上印过它(self):
+        # 调用方照抄 SKILL.md 开头那句是**可达路径**，不拒就会出现两句互相
+        # 矛盾的兜底句。字面量写死那句旧话：它已经不在代码里了，只能这么钉。
+        with self.assertRaises(ca.Rejected):
+            ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", ())
+
+    def test_SKILL_GUARD常量已经不存在_它不再是每轮同一句话(self):
+        self.assertFalse(hasattr(ca, "SKILL_GUARD"),
+                         "常量留着就是第二个家：派生一份、常量一份，两份必然漂移")
+
+
+class TestArgv(unittest.TestCase):
     def test_run参数完整(self):
         argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief")
         self.assertEqual(argv[:3], ["codex", "exec", "--cd"])
@@ -926,6 +1083,71 @@ class TestMeta(_HomeSandbox):
         self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
 
 
+class TestWriteMetaIsAtomic(_HomeSandbox):
+    """落元数据必须**原子替换**，不许原地截断重写。
+
+    `Path.write_text` 先把目标截成 0 再往里填，而 `status` 随时可能在另一个
+    进程里读同一份 json——`all_metas`／`find_meta` 都是裸 `json.loads`。
+    2026-09-20 实测（截断重写的版本）：1 秒里写 5289 次、并发读 12284 次，
+    其中 **8277 次读到半截 json**。撞上的调用方拿到的是一个裸
+    `JSONDecodeError` traceback，不是干净的护栏拒绝——正是本工具存在的理由
+    反过来。这个 bug 是被那条真进程信号测试偶发地照出来的：它轮询
+    `tasks/t.json` 等 session_id 落盘，而包装器正好在写。
+    """
+
+    def test_并发读永远读不到半截json(self):
+        d = ca.ensure_isolation("default")
+        meta = _full_meta("t", session_id="01a0b408-f718-7ff3-8123-d5202551acba")
+        ca.write_meta(d, "t", meta)
+        q = ca.meta_path(d, "t")
+        stop, bad, good = [False], [0], [0]
+
+        def reader():
+            while not stop[0]:
+                try:
+                    json.loads(q.read_text())
+                    good[0] += 1
+                except json.JSONDecodeError:
+                    bad[0] += 1
+                except FileNotFoundError:
+                    bad[0] += 1      # 目标短暂消失也算坏：status 会当成「没这个任务」
+
+        th = threading.Thread(target=reader)
+        th.start()
+        try:
+            deadline = time.time() + 0.3
+            while time.time() < deadline:
+                ca.write_meta(d, "t", meta)
+        finally:
+            stop[0] = True
+            th.join()
+        self.assertGreater(good[0], 100,
+                           f"前提不成立：读者根本没跑起来（成功读 {good[0]} 次），这条测不到并发")
+        self.assertEqual(bad[0], 0, f"{bad[0]} 次读到半截或消失的 json——写不是原子的")
+
+    def test_崩在替换之前留下的残片不会被当成任务(self):
+        """残片得由 `write_meta` **自己**造出来，不能手写一个名字去测。
+
+        手写 `t.json.tmp` 再断言 all_metas 忽略它，测的是那个手写的名字；
+        实现把临时名改成 `t.tmp.json`（会被 `*.json` 扫进去）照样全绿——
+        实测这个突变**存活**过。这里改成让 os.replace 崩掉，残片就是实现
+        真正用的那个名字。
+        """
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "good", _full_meta("good"))
+        tasks = ca.meta_path(d, "good").parent
+        before = {q.name for q in tasks.iterdir()}
+        with mock.patch.object(ca.os, "replace", side_effect=OSError("崩在替换之前")):
+            with self.assertRaises(OSError):
+                ca.write_meta(d, "t", _full_meta("t"))
+        leftovers = {q.name for q in tasks.iterdir()} - before
+        self.assertTrue(leftovers, "前提不成立：没留下残片，这条测不到任何东西")
+        # 残片要是被 *.json 扫进去，它自己就成了一份「缺字段的坏元数据」，
+        # 而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）
+        self.assertEqual([m["task"] for _, m in ca.all_metas()], ["good"],
+                         f"残片 {leftovers} 被当成任务扫进来了")
+
+
 class TestMetaShape(_HomeSandbox):
     """元数据的形状只许有一个家。
 
@@ -944,7 +1166,7 @@ class TestMetaShape(_HomeSandbox):
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
     # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
-    FIELDS = {"task", "account", "dir", "effort", "session_id", "started_at"}
+    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at"}
 
     def test_字段清单的绝对值(self):
         self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
@@ -953,9 +1175,12 @@ class TestMetaShape(_HomeSandbox):
         self.assertIn("session_id", self.FIELDS)
         # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
         self.assertNotIn("pid", self.FIELDS)
+        # 白名单是「最后一次调用给了什么」，要审计就读这个字段——它刻意不进
+        # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
+        self.assertIn("skills", self.FIELDS)
 
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low")),
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
@@ -964,11 +1189,60 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
                          set(ca.REQUIRED_META_KEYS))
+
+    def test_new_meta也守同一道_它是白名单的第二个家(self):
+        # 两个家各守一道：build_skill_guard 管送进 codex 的那份，new_meta 管落盘
+        # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
+        for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ca.new_meta("t", "default", "/abs/x", "low", bad)
+        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
+
+    def test_run落盘的skills就是命令行给的那几条(self):
+        d = ca.ensure_isolation("default")
+        skill = self.home / "tdd_SKILL.md"
+        skill.write_text("---\nname: tdd\n---\n")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--skill", str(skill)])
+        with _no_codex():
+            ca.cmd_run(args)
+        self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
+
+    def test_resume刷新skills_元数据描述的是最后一次调用(self):
+        d = ca.ensure_isolation("default")
+        first, second = self.home / "a_SKILL.md", self.home / "b_SKILL.md"
+        for q in (first, second):
+            q.write_text("---\nname: x\n---\n")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir),
+                                         skills=[str(first)]))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "high",
+             "--skill", str(second)])
+        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+            ca.cmd_resume(args)
+        meta = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertEqual(meta["skills"], [str(second)], "skills 没跟着 effort 一起刷新")
+        self.assertEqual(meta["effort"], "high", "前提不成立：effort 本来就该刷新")
+
+    def test_interrupt_and_resume也把skills接了进去(self):
+        # _resume_round 是两条路共用的，但接线是各自的：这条命令传成 [] 或漏传，
+        # 上面那条测试一个字都测不出来。
+        d = ca.ensure_isolation("default")
+        skill = self.home / "c_SKILL.md"
+        skill.write_text("---\nname: x\n---\n")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--skill", str(skill)])
+        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+            ca.cmd_interrupt_and_resume(args)
+        self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
 
 class TestPid(unittest.TestCase):
@@ -1134,6 +1408,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
         r"session id|session_id": "extract_session_id / 元数据",
         r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
+        r"不得使用任何 skill": "build_skill_guard（兜底句由 --skill/--no-skill 每轮派生）",
     }
 
     def test_没有一条代码级约束泄漏进文档(self):
@@ -1176,6 +1451,22 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
         # 在途工作损失多少，后者在 codex 里根本不可观测
         self.assertIn("值不值", skill)
+        # 白名单是**对外契约**：给哪几个 skill 是判断力，代码替不了。
+        # 钉的是**配对**，不是「这两个词出现过」——实测过那种写法是空的：
+        # 把表格里「给它 skill」整行的两个参数删掉，`--no-skill` 在启动那行的
+        # 示例命令里还在，`--skill` 在「外加 --skill/--no-skill 二选一」里也还在，
+        # 于是删掉承重内容照样全绿（这正是本文件开头第 5 条踩过的坑）。
+        # 两条各钉一个家，删任一处都红：
+        self.assertRegex(skill, r"--skill[^\n]*绝对路径",
+                         "「--skill 收的是 SKILL.md 的绝对路径」这条没了")
+        self.assertRegex(skill, r"(--no-skill[^\n]*二选一|二选一[^\n]*--no-skill)",
+                         "「--skill/--no-skill 二选一必填」这条契约没了")
+        # status 列表形态的行结构是**接口事实**，不是机制泄漏（怎么切是调用方
+        # 自己的事，文档不写 split）。它没人守的话整段删掉照样全绿——实测过。
+        self.assertRegex(skill, r"一行一个任务", "status 是「一行一个任务」这条接口事实没了")
+        self.assertRegex(skill, r"前四列.*任务名.*账号.*状态.*退出码",
+                         "前四列是哪四列、什么顺序——这条没了，调用方就得自己猜")
+        self.assertRegex(skill, r"缩进的行是明细", "「缩进的行不是任务」这条没了")
 
 
 class TestTaskName(unittest.TestCase):
@@ -1193,12 +1484,149 @@ class TestTaskName(unittest.TestCase):
                 ca.task_name(bad)
 
 
+class TestSkillPathArg(unittest.TestCase):
+    """`--skill` 的四条校验。**四条缺一不可**，每条各钉一条。
+
+    为什么必须当场拒（而不是让 codex 自己去发现）：2026-09-19 真跑过一次
+    brief 指向不存在的 SKILL.md，codex 第一步 `cat` 退 1，第二步拿 `find` 翻
+    真实 home **跑了 34.9 秒**，结论是「未找到该文件，因此无法严格按其流程
+    执行，尚未创建 out.txt」——磁盘上产物**不存在**，而本工具判 success、
+    **退出码 0**。「零工作量」被报成「完成」，没有任何别的信号救得回来。
+    """
+
+    def _dir(self):
+        return pathlib.Path(tempfile.mkdtemp())
+
+    def _skill_file(self):
+        d = self._dir()
+        q = d / "SKILL.md"
+        q.write_text("---\nname: x\n---\n")
+        return q
+
+    def test_收一个正常的绝对路径SKILL文件(self):
+        q = self._skill_file()
+        self.assertTrue(q.is_absolute() and q.is_file(), "前提不成立：样本文件没建起来")
+        self.assertEqual(ca.skill_path(str(q)), str(q))
+
+    def test_相对路径被拒(self):
+        with self.assertRaises(argparse.ArgumentTypeError) as cm:
+            ca.skill_path("skills/foo/SKILL.md")
+        self.assertIn("绝对路径", str(cm.exception))
+
+    def test_指向不存在的文件被拒(self):
+        missing = self._dir() / "SKILL.md"
+        self.assertFalse(missing.exists(), "前提不成立：这个文件居然存在")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            ca.skill_path(str(missing))
+
+    def test_权限000的文件被拒_is_file说True而codex的cat退1(self):
+        # 这条是审查实测逼出来的：只查 is_absolute + is_file 的话，
+        # 「文件不可读」这一支原样漏掉——而那正是核心承诺失效的地方。
+        self.assertNotEqual(os.geteuid(), 0, "前提不成立：root 读得了 000 的文件，这条测不到")
+        q = self._skill_file()
+        os.chmod(q, 0o000)
+        try:
+            self.assertTrue(q.is_file(), "前提不成立：is_file 本来就该返回 True，这条才有意义")
+            self.assertFalse(os.access(q, os.R_OK), "前提不成立：这个文件居然读得了")
+            self.assertEqual(subprocess.run(["cat", str(q)], capture_output=True).returncode, 1,
+                             "前提不成立：codex 用的 cat 居然没退 1")
+            with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                ca.skill_path(str(q))
+            self.assertIn("读不了", str(cm.exception))
+        finally:
+            os.chmod(q, 0o644)
+
+    def test_传目录被拒_错误信息要说清期望的是文件本身(self):
+        # 传 skill 目录是最容易犯的错，而 is_file() 为 False 时调用方看不出为什么
+        d = self._dir()
+        self.assertTrue(d.is_dir(), "前提不成立：目录没建起来")
+        with self.assertRaises(argparse.ArgumentTypeError) as cm:
+            ca.skill_path(str(d))
+        self.assertIn("SKILL.md", str(cm.exception))
+
+    def test_含控制字符的路径被拒(self):
+        q = self._skill_file()
+        for bad in (f"{q}\t", f"{q}\n", "/abs\x00/SKILL.md"):
+            # assertRaises 必须嵌在 subTest **里面**：写成 `with subTest(), assertRaises()`
+            # 再在块外读 cm.exception，一旦没抛出，真正的失败信息会被随后那句
+            # `'_AssertRaisesContext' object has no attribute 'exception'` 盖掉。
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                    ca.skill_path(bad)
+                self.assertIn("控制字符", str(cm.exception))
+
+    def test_收下什么就原样还什么_刻意不resolve(self):
+        """这条是**可观测性论证的地基**，不是洁癖。
+
+        命令行上写的、brief 白名单行里印的、日志里 `cat` 出现的必须是**同一个
+        串**——人和 grep 才对得上「codex 到底读没读那一个」。规范化之后这三者
+        就成了三个不同的串。
+        用 `/./` 而不是靠 /tmp 是不是软链：那种样本在这台机器上恰好相等，
+        `return str(q.resolve())` 的突变会**存活**（实测过）。
+        """
+        q = self._skill_file()
+        weird = f"{q.parent}/./{q.name}"
+        self.assertNotEqual(weird, str(q), "前提不成立：这个样本没制造出任何差别")
+        self.assertTrue(pathlib.Path(weird).is_file(), "前提不成立：带 /./ 的路径打不开")
+        self.assertEqual(ca.skill_path(weird), weird)
+
+    def test_每条拒绝都点名是哪个路径(self):
+        # 调用方是 agent：它拿到的只有 stderr 那一行，不点名就无从改起
+        q = self._skill_file()
+        os.chmod(q, 0o000)
+        try:
+            cases = ["skills/foo/SKILL.md", str(self._dir() / "SKILL.md"),
+                     str(q.parent), str(q)]
+            for bad in cases:
+                with self.subTest(bad=bad):
+                    with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                        ca.skill_path(bad)
+                    self.assertIn(bad, str(cm.exception))
+        finally:
+            os.chmod(q, 0o644)
+
+
+class TestWorkDirArg(unittest.TestCase):
+    def test_两个调用方的拒绝各说各的_不许混成一句(self):
+        # stderr 那一行是 agent 唯一的线索。混成一句「要进 status 的数据行和
+        # 兜底句的白名单行」就是对两个调用方**各说了一半假话**：--dir 不进白名单，
+        # --skill 不进 status 的列（skills 刻意不进列，见 new_meta）。
+        # 本仓刚在 ensure_isolation 上吃过「错理由比没理由更危险」的亏。
+        with self.assertRaises(argparse.ArgumentTypeError) as d:
+            ca.work_dir("/tmp/a\tb")
+        with self.assertRaises(argparse.ArgumentTypeError) as k:
+            ca.skill_path("/abs/a\tb/SKILL.md")
+        self.assertIn("status", str(d.exception))
+        self.assertNotIn("白名单", str(d.exception))
+        self.assertIn("白名单", str(k.exception))
+        self.assertNotIn("status", str(k.exception))
+
+    def test_收一个正常目录路径(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.assertEqual(ca.work_dir(str(d)), str(d))
+
+    def test_含制表符或换行的目录被拒_而mkdir和is_dir全都放行(self):
+        # 前提断言就是这条测试存在的理由：文件系统那一层**根本不管**，
+        # 2026-09-19 实测含 \t 和 \n 的目录 mkdir / resolve() / is_dir() 全过。
+        weird = pathlib.Path(tempfile.mkdtemp()) / "a\tb\nc"
+        weird.mkdir()
+        self.assertTrue(weird.is_dir(), "前提不成立：带控制字符的目录建不起来，这条就没意义了")
+        self.assertIn("\n", str(weird.resolve()), "前提不成立：resolve 居然把换行吃掉了")
+        for bad in (str(weird), "/tmp/a\tb", "/tmp/a\nb"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                    ca.work_dir(bad)
+                self.assertIn("控制字符", str(cm.exception))
+
+
 class TestParser(_HomeSandbox):
     def test_run的五个参数一个都不能少(self):
         parser = ca.build_parser()
         for missing in ["--task", "--dir", "--brief", "--effort", "--account"]:
+            # --no-skill 不加的话这条就静默退化成同义反复：缺 --skill/--no-skill
+            # 照样 SystemExit，于是不管 --task/--dir/… 还必不必填，它都绿。
             argv = ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                    "--effort", "low", "--account", "default"]
+                    "--effort", "low", "--account", "default", "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -1209,7 +1637,8 @@ class TestParser(_HomeSandbox):
         for e in ca.EFFORTS:
             with self.subTest(effort=e):
                 args = parser.parse_args(["run", "--task", "t", "--dir", "/tmp",
-                                          "--brief", "b.md", "--effort", e, "--account", "default"])
+                                          "--brief", "b.md", "--effort", e,
+                                          "--account", "default", "--no-skill"])
                 self.assertEqual(args.effort, e)
 
     def test_effort只收这五个档位(self):
@@ -1219,15 +1648,17 @@ class TestParser(_HomeSandbox):
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", bad, "--account", "default"])
+                                   "--effort", bad, "--account", "default", "--no-skill"])
 
     def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
         for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
-                      "--effort", "low", "--account", "default"],
-                     ["status", "a|b"], ["resume", "a|b", "--brief", "b.md", "--effort", "low"],
+                      "--effort", "low", "--account", "default", "--no-skill"],
+                     ["status", "a|b"],
+                     ["resume", "a|b", "--brief", "b.md", "--effort", "low", "--no-skill"],
                      ["stop", "a|b"],
-                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low"]):
+                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low",
+                      "--no-skill"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
 
@@ -1235,7 +1666,7 @@ class TestParser(_HomeSandbox):
         parser = ca.build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "low",
-                               "--account", "default"])
+                               "--no-skill", "--account", "default"])
 
     def test_不提供会造成误用的参数(self):
         """这六个参数是**刻意不提供**的，各有各的理由：
@@ -1248,14 +1679,18 @@ class TestParser(_HomeSandbox):
         | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
         | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
         | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
+        | `--json` | 同一份事实两种呈现，要永远保持一致——正是本仓一路在消灭的东西。列表形态已经机器切得开（见 status_row），单任务查询用退出码就够 |
 
-        前两个是「会造成误用」，后四个是「由工具派生」。
+        前两个是「会造成误用」，中间四个是「由工具派生」，`--json` 是「第二种呈现」。
+        （`--json` 没有对应的 assertRaises：它和别的不一样，不是「给了会出事」，
+        而是「根本不该存在」——真加了它，红的会是 status_row 那一整组契约测试。）
         """
         parser = ca.build_parser()
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", "low", "--account", "default", bad, "x"])
+                                   "--effort", "low", "--account", "default", "--no-skill",
+                                   bad, "x"])
 
 
 class TestInterruptAndResumeParser(_HomeSandbox):
@@ -1266,7 +1701,8 @@ class TestInterruptAndResumeParser(_HomeSandbox):
     def test_与resume同一张参数表_少一个都不收(self):
         parser = ca.build_parser()
         for missing in ["--brief", "--effort"]:
-            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"]
+            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low",
+                    "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -1276,18 +1712,19 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         parser = ca.build_parser()
         for e in ca.EFFORTS:
             with self.subTest(effort=e):
-                args = parser.parse_args(["interrupt-and-resume", "t",
-                                          "--brief", "b.md", "--effort", e])
+                args = parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
+                                          "--effort", e, "--no-skill"])
                 self.assertEqual(args.effort, e)
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", bad])
+                                   "--effort", bad, "--no-skill"])
 
     def test_不收account_账号是查出来的(self):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                          "--effort", "low", "--account", "default"])
+                                          "--effort", "low", "--no-skill",
+                                          "--account", "default"])
 
     def test_不提供任何旋钮_没有第二种正确行为(self):
         # 每个旋钮都是一个让调用方做错的机会：
@@ -1300,15 +1737,129 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         for bad in ["--now", "--wait", "--force", "--timeout", "--message", "--account"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", "low", bad, "x"])
+                                   "--effort", "low", "--no-skill", bad, "x"])
 
     def test_子命令接到的确实是这条命令的实现(self):
-        # Task 5 的测试是直接拿 Namespace 调命令体的，接错了函数它测不出来。
+        # TestInterruptAndResumeOrder 是直接拿 Namespace 调命令体的，接错了函数它测不出来。
         # 这里是命令行到实现之间唯一那根线。
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"])
+            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low", "--no-skill"])
         self.assertIs(args.func, ca.cmd_interrupt_and_resume)
         self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "low"))
+
+
+class TestSkillWhitelistFlags(_HomeSandbox):
+    """白名单是**每一轮**的事，不是任务的事——所以三条带 prompt 的命令各收一份。
+
+    二选一**必填**而不是缺省成空白名单：这个工具要交给其他 agent 用，省略时
+    分不清「调用方决定不给」和「调用方根本不知道有这个参数」。强制显式把
+    「没想过」变成 exit 2 当场报错，而这个拒绝是即时且完全可恢复的
+    （加个参数重跑，零损失），不像 --effort/--account 写错要花钱才发现。
+    """
+
+    PROMPT_CMDS = ("run", "resume", "interrupt-and-resume")
+
+    def setUp(self):
+        super().setUp()
+        self.skill_a = self.home / "a_SKILL.md"
+        self.skill_b = self.home / "b_SKILL.md"
+        for q in (self.skill_a, self.skill_b):
+            q.write_text("---\nname: x\n---\n")
+
+    def _argv(self, cmd, *tail):
+        base = {"run": ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
+                        "--effort", "low", "--account", "default"],
+                "resume": ["resume", "t", "--brief", "b.md", "--effort", "low"],
+                "interrupt-and-resume": ["interrupt-and-resume", "t", "--brief", "b.md",
+                                         "--effort", "low"]}[cmd]
+        return base + list(tail)
+
+    def test_三条带prompt的命令都必须二选一_都不给就拒(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd), self.assertRaises(SystemExit):
+                parser.parse_args(self._argv(cmd))
+
+    def test_三条命令都不许同时给(self):
+        # 正面控制是**必须的**：单给任一个都过得去，下面那个拒绝才确实来自互斥。
+        # 少了它，在参数还不存在的版本上这条也绿（两个都 unrecognized），
+        # 是条永远不会红的空测试。
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(self._argv(cmd, "--skill", str(self.skill_a), "--no-skill"))
+
+    def test_no_skill解析成空白名单(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
+
+    def test_两支都给不可变序列_args_skills只有一种类型(self):
+        """`args.skills` 的类型只能有**一种**，而且哪一支都改不动。
+
+        argparse 现成的两件零件都有毛病：`const=` 在同一个 parser 上是**同一个
+        对象**（给 `[]` 的话两次 parse 共享一个 list，谁原地改一下就污染另一次），
+        `action="append"` 给的又是 list。两支类型不同，调用方写
+        `args.skills == []` 会在一支上踩空——而那是最可能的下一个误用。
+        统一成 tuple：两条软约定（别原地改、别拿 `== []` 比）一起消失。
+        """
+        parser = ca.build_parser()
+        empty = parser.parse_args(self._argv("run", "--no-skill")).skills
+        one = parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills
+        self.assertEqual(empty, ())
+        self.assertEqual(one, (str(self.skill_a),))
+        for got in (empty, one):
+            with self.subTest(got=got), self.assertRaises(AttributeError):
+                got.append("/x/SKILL.md")
+        # 跨 parse 不许渗：拼在一个共享对象上的话，第二次会带上第一次那条
+        self.assertEqual(
+            parser.parse_args(self._argv("resume", "--skill", str(self.skill_b))).skills,
+            (str(self.skill_b),), "上一次 parse 的 --skill 渗过来了")
+
+    def test_skill可重复且保持给定顺序(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                args = parser.parse_args(self._argv(
+                    cmd, "--skill", str(self.skill_a), "--skill", str(self.skill_b)))
+                self.assertEqual(args.skills, (str(self.skill_a), str(self.skill_b)))
+
+    def test_status和stop不收这两个参数_它们不带prompt(self):
+        # 这条**前后都绿**，它守的是「别顺手给 status 也加上」：白名单是发 prompt
+        # 那一刻的事，status/stop 根本不发 prompt，多一个参数就多一个误用机会。
+        # 正面控制钉住「不带这两个参数时它们是收的」，否则整条是空的。
+        parser = ca.build_parser()
+        for cmd in ("status", "stop"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args([cmd, "t"]).task, "t")
+                for flag in ("--no-skill", "--skill"):
+                    with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                        parser.parse_args([cmd, "t", flag, str(self.skill_a)])
+
+    def test_dir的控制字符校验真的挂在命令行上(self):
+        # 纯函数写对、parser 没挂 type= 的话，bug 原样还在——这是唯一那根线。
+        # 正面控制是**必须的**：只钉「坏值被拒」的话，在 --no-skill 还不存在的
+        # 版本上这条也绿（整条命令本来就被拒），永远不会红。
+        parser = ca.build_parser()
+        good = self._argv("run", "--no-skill")
+        self.assertEqual(parser.parse_args(good).dir, "/tmp", "前提不成立：好的那条都过不去")
+        bad = list(good)
+        bad[bad.index("--dir") + 1] = "/tmp/a\tb"
+        with self.assertRaises(SystemExit):
+            parser.parse_args(bad)
+
+    def test_skill的路径校验真的挂在命令行上(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                good = self._argv(cmd, "--skill", str(self.skill_a))
+                self.assertEqual(parser.parse_args(good).skills, (str(self.skill_a),),
+                                 "前提不成立：好的那条都过不去，坏的被拒就说明不了任何事")
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(self._argv(cmd, "--skill", "relative/SKILL.md"))
 
 
 class TestRunGuards(_HomeSandbox):
@@ -1321,7 +1872,8 @@ class TestRunGuards(_HomeSandbox):
 
     def _args(self, **over):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
-                "--brief", over.get("brief", str(self.brief)), "--effort", "low", "--account", "default"]
+                "--brief", over.get("brief", str(self.brief)), "--effort", "low",
+                "--account", "default", "--no-skill"]
         return ca.build_parser().parse_args(argv)
 
     def test_dir不是目录就拒跑(self):
@@ -1371,7 +1923,7 @@ class TestRunGuards(_HomeSandbox):
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         def grab(*a, **k):
             seen["argv"] = a[0]
             return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
@@ -1382,6 +1934,25 @@ class TestRunGuards(_HomeSandbox):
         cd = seen["argv"][seen["argv"].index("--cd") + 1]
         self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
         self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
+
+    def test_dir是软链且真身含控制字符时拒跑_入口那道守的是原始串(self):
+        # work_dir 挂在 argparse 的 type= 上，它看到的是**命令行上那个串**；
+        # 而落进元数据、随后进 status 数据行的是 `resolve()` 之后的真身。
+        # 软链一跨，入口那道就绕过去了——所以 resolve 之后必须再守一次。
+        ca.ensure_isolation("default")
+        real = self.home / "a\tb\nc"
+        real.mkdir()
+        link = self.home / "link"
+        link.symlink_to(real)
+        self.assertTrue(link.is_dir(), "前提不成立：软链没指到目录上")
+        self.assertEqual(ca.work_dir(str(link)), str(link),
+                         "前提不成立：入口这道本来就该放行它，否则这条测的不是软链那个洞")
+        self.assertIn("\n", str(link.resolve()), "前提不成立：resolve 居然没解出真身")
+        # _no_codex 是**必须**的：这条闸没装上时 cmd_run 会一路走到 spawn，
+        # 不挡住就真的把 codex 叫起来了（实测过，单测绝不能发网络请求）。
+        with _no_codex(), self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(dir=str(link)))
+        self.assertIn("控制字符", cm.exception.message)
 
     def test_run也要校验隔离不变量_resume那一半补过了这一半漏了(self):
         # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
@@ -1445,7 +2016,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def _args(self, task):
         return ca.build_parser().parse_args(
-            ["resume", task, "--brief", str(self.brief), "--effort", "low"])
+            ["resume", task, "--brief", str(self.brief), "--effort", "low", "--no-skill"])
 
     def test_任务不存在就报错(self):
         # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
@@ -1534,12 +2105,14 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
 
     def _args(self, task="t", brief=None):
-        """这一类测的是**命令体的执行顺序**，不是参数表——参数表归 Task 6，
-        那里用真 parser 从命令行一路验下来。所以这里直接搭 Namespace：
-        三个字段逐个显式写出，不走默认值。
+        """这一类测的是**命令体的执行顺序**，不是参数表——参数表归
+        TestInterruptAndResumeParser 和 TestSkillWhitelistFlags，那里用真 parser
+        从命令行一路验下来。所以这里直接搭 Namespace：四个字段逐个显式写出，
+        不走默认值（skills 也照写，缺省成空就等于替调用方做了决定）。
         """
         return argparse.Namespace(
-            task=task, brief=str(self.brief if brief is None else brief), effort="low")
+            task=task, brief=str(self.brief if brief is None else brief), effort="low",
+            skills=())
 
     def test_在跑时顺序是先打断再确认退出再续跑(self):
         order = []
@@ -1575,6 +2148,29 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_interrupt_and_resume(self._args("t2"))
         self.assertIn("session id", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_brief自带兜底句时绝不发信号_这条纯检查必须前移(self):
+        """spec 的判据精化：**凡是对「调用方已经交给我们的输入」的纯检查，
+        一律在任何不可逆动作之前做完。**
+
+        「brief 里已经有兜底句」完全由调用方交进来的那个文件决定，动手之前就
+        问得出来。留在 prepend_skill_guard 里的话，这条路会先发 INT 把当前轮
+        截断、再因为一个**本可提前发现**的理由拒绝——白烧一轮，即使可恢复
+        也是浪费。所以它进了 check_can_resume，和另外三道闸并排。
+        """
+        ca.write_meta(self.d, "t9", _full_meta("t9", session_id="s9", dir=str(self.workdir)))
+        bad = self.home / "自带兜底句.md"
+        bad.write_text("**不得使用任何 skill。**\n\n顺便把 X 也改了")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args("t9", brief=bad))
+        self.assertEqual(cm.exception.code, 2, "护栏拒绝走 2，不许和判据结论撞码")
+        self.assertIn("--no-skill", cm.exception.message)
         ic.assert_not_called()
         k.assert_not_called()
 
@@ -1677,14 +2273,16 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
 
 class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
-    """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
+    """兜底句是 SKILL.md 印给调用方的**对外承诺**，三条路都必须真的加上。
 
     `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
-    不证明「run 和 resume 真的调了它」。把两处都换成裸 `read_text()` 的突变
-    曾经**全部存活**——一条印出去的承诺，没有任何东西守着。
+    不证明「run / resume / interrupt-and-resume 真的调了它、而且传的是**本轮**
+    的白名单」。把调用点换成裸 `read_text()` 的突变曾经**全部存活**——
+    一条印出去的承诺，没有任何东西守着。
 
-    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），
-    这句是内容层的第二道：万一哪天隔离被绕开，brief 里这句还在。
+    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），这句是
+    内容层的第二道；白名单则是这一道上唯一的开口，所以它长什么样必须钉在
+    **真正送进 codex argv 的那段文本**上，不是钉在派生函数的返回值上。
     """
 
     def setUp(self):
@@ -1693,6 +2291,8 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
         self.brief.write_text("干活")
+        self.skill = self.home / "tdd_SKILL.md"
+        self.skill.write_text("---\nname: tdd\n---\n")
 
     @staticmethod
     def _brief_codex_actually_got(run_it):
@@ -1708,24 +2308,194 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
             run_it()
         return seen["argv"][-1]
 
-    def test_run这条路(self):
+    def _meta_for_resume(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        return d
+
+    def test_run这条路_无白名单(self):
         ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
-        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
 
-    def test_resume这条路(self):
-        d = ca.ensure_isolation("default")
-        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+    def test_run这条路_有白名单时路径真的进了argv(self):
+        ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--skill", str(self.skill)])
+        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn(f"- {self.skill}", brief)
+        # 钉在**真正送进 argv 的那段文本**上：许可送到了不等于指令送到了，
+        # 而没有指令就没有那行 `cat`，judge 看不见「它压根没读」
+        self.assertIn("动手前先逐个读一遍", brief)
+        self.assertIn("干活", brief)
+
+    def test_resume这条路_有白名单(self):
+        self._meta_for_resume()
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--skill", str(self.skill)])
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
-        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn(f"- {self.skill}", brief)
+        self.assertIn("动手前先逐个读一遍", brief)
+
+    def test_interrupt_and_resume这条路_无白名单(self):
+        self._meta_for_resume()
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--no-skill"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            brief = self._brief_codex_actually_got(
+                lambda: ca.cmd_interrupt_and_resume(args))
+        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
+
+
+class TestStatusIsSplittable(_HomeSandbox):
+    """列表形态的 status 必须**机器切得开**。这是本改动的全部理由。
+
+    旧格式是 `f"{task:<24} {account:<8} {state:<8} {reason}  {dir}"`，而 reason
+    含空格 → 后面任何一列都取不出来。**7 个 Verdict 构造点里有 4 个的 reason
+    真的含空格**：「本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑」、
+    「报告在，但本轮日志有 N 条未分类的 codex 错误」、「会话被写锁占住（……曾被
+    SIGTERM 杀过），只能新起一个任务」、「pid=N 存活」。
+    （spec 和计划都写成「5 个」，实跑逐条数过是 4 个——它们把 suspect 那条重复
+    数了一次。另外 spec §1 举的那个例子「报告缺失或为空＝没正常收尾」**不含
+    空格**，照它写的测试测不到任何东西，所以这里一律用真的含空格的那几条。）
+
+    真正缺的只有一样：列表形态下每行的 state（单任务查询用退出码就够了，
+    dir/account/effort/session_id 早就在 tasks/<task>.json 里）。
+
+    采纳的方案是**换列序、不换格式**。初稿的制表符方案被实测否掉：按 tabstop=8
+    量四行真实 status 输出的各列屏幕起始列，[0,16,24,32,40,80] /
+    [0,16,24,32,40,88] / [0,8,16,24,32,40] / [0,32,40,56,64,80]——四行没有一列
+    对齐，而空格定宽是稳定的 [0,25,34,43]。
+    """
+
+    # 真的含空格的那一条（judge 的 interrupted 分支原文），不是造出来的例子
+    REASON_WITH_SPACES = "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑"
+
+    def test_前四列用split切得开_reason含空格也不影响(self):
+        row = ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                            ca.Verdict("failed", self.REASON_WITH_SPACES, []))
+        self.assertGreater(len(self.REASON_WITH_SPACES.split()), 1,
+                           "前提不成立：reason 不含空格的话，这条根本测不到东西")
+        self.assertEqual(row.split(maxsplit=4)[:4], ["t1", "default", "failed", "1"])
+
+    def test_第五段是工作目录加reason_dir含空格也切得开(self):
+        row = ca.status_row(_full_meta("t1", dir="/abs/my repo"),
+                            ca.Verdict("failed", self.REASON_WITH_SPACES, []))
+        tail = row.split(maxsplit=4)[4]
+        self.assertTrue(tail.startswith("/abs/my repo"), tail)
+        self.assertTrue(tail.endswith(self.REASON_WITH_SPACES), tail)
+
+    def test_退出码那一列的绝对值_五态逐个(self):
+        # 绝对值，不写 ca.EXIT[state]：那样两边一起动，EXIT["running"]=0 这种
+        # 突变照样绿——而那正是 status && deploy 提前部署的那个 bug。
+        for state, code in (("success", "0"), ("failed", "1"), ("suspect", "3"),
+                            ("running", "4"), ("interrupted", "130")):
+            with self.subTest(state=state):
+                row = ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                                    ca.Verdict(state, "一句人话", []))
+                self.assertEqual(row.split(maxsplit=4)[3], code)
+
+    def test_明细行有缩进_数据行没有(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        ca._log_path(d, "t").write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00")
+                                        + "\n" + ERR_FATAL + "\n")
+        ca._report_path(d, "t").write_text("干完了\n")
+        screen = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(screen):
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        lines = [l for l in screen.getvalue().splitlines() if l]
+        data = [l for l in lines if not l[0].isspace()]
+        detail = [l for l in lines if l[0].isspace()]
+        self.assertEqual(len(data), 1, f"数据行不止一行：{lines}")
+        self.assertTrue(detail, "前提不成立：这一轮没有明细行，那这条测不到可分性")
+        self.assertEqual(data[0].split(maxsplit=4)[:3], ["t", "default", "suspect"])
+
+    def test_reason含制表符时当场拒绝(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("failed", "坏\treason", []))
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_工作目录含换行时当场拒绝(self):
+        with self.assertRaises(ca.Rejected):
+            ca.status_row(_full_meta("t1", dir="/abs/a\nb"),
+                          ca.Verdict("failed", "一句人话", []))
+
+    def test_账号含空白时当场拒绝_这一列的值来自元数据文件(self):
+        # 前四列「天生无空格」这句话对账号**不成立**。目录名那一侧由
+        # account_choices() 在入口拒（见 TestIsolation），而 status 第二列读的是
+        # tasks/<task>.json 里的 account 字段——_load_meta 只校验**键**在不在，
+        # 值长什么样一概不管，所以这一道是独立的第二个入口，不是重复防御。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", account="bad acct"))
+        self.assertEqual(ca._load_meta(ca.meta_path(d, "t"))["account"], "bad acct",
+                         "前提不成立：元数据这一侧居然校验了 account 的值，那就不是真的洞")
+        with self.assertRaises(ca.Rejected):
+            ca.status_row(_full_meta("t1", account="bad acct", dir="/abs/repo"),
+                          ca.Verdict("failed", "一句人话", []))
+
+    def test_任务名含空白也拒绝_而reason含空格照样放行(self):
+        # 正面控制在这里是承重的：reason 含空格**必须**放行（它在第五段，
+        # 那正是换列序买到的东西）。少了它，一条「什么都拒」的假实现也全绿。
+        self.assertIn(" ", ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                                         ca.Verdict("success", "有 空 格 的 reason", [])))
+        with self.assertRaises(ca.Rejected):
+            ca.status_row(_full_meta("t 1", dir="/abs/repo"),
+                          ca.Verdict("failed", "一句人话", []))
+        # 状态那一列自己带空白的话，它压根就不是五态之一——归 _require_enum 管，
+        # 那是内部调用方传错枚举，当场 ValueError，不是护栏拒绝
+        with self.assertRaises(ValueError):
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("fai led", "一句人话", []))
+
+    def test_不是五态之一当场炸_不给一个裸KeyError(self):
+        # 退出码那一列是 EXIT[state]，state 写错的话裸下标只给一个 KeyError，
+        # 调用方看不出是什么坏了。和 kind/cause 一样走 _require_enum。
+        with self.assertRaises(ValueError) as cm:
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("done", "一句人话", []))
+        self.assertIn("state", str(cm.exception))
+
+    def test_真实status输出每行一个任务_两个任务各切出四列(self):
+        # 刻意选 interrupted 这一支：它的 reason **真的含空格**，端到端走一遍才算
+        # 把「reason 排在最后」这件事钉住。选 failed 那一支测不到——它的 reason
+        # （「报告缺失或为空＝没正常收尾」）一个空格都没有。
+        d = ca.ensure_isolation("default")
+        for name in ("alpha", "beta"):
+            ca.write_meta(d, name, _full_meta(name, dir="/abs/repo"))
+            ca._log_path(d, name).write_text(
+                ca.round_separator("run", name, "2026-09-19T00:00:00") + "\n"
+                + ca.INTERRUPT_MARK + "\n")
+        screen = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(screen):
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        data = [l for l in screen.getvalue().splitlines() if l and not l[0].isspace()]
+        self.assertEqual([l.split(maxsplit=4)[0] for l in data], ["alpha", "beta"])
+        for line in data:
+            with self.subTest(line=line):
+                self.assertEqual(line.split(maxsplit=4)[1:4], ["default", "interrupted", "130"])
+                tail = line.split(maxsplit=4)[4]
+                self.assertTrue(tail.startswith("/abs/repo"), tail)
+                self.assertIn(" ", tail[len("/abs/repo"):].strip(),
+                              "前提不成立：这一支的 reason 不含空格，那就没测到列序")
 
 
 class TestExitCodeContract(_HomeSandbox):
@@ -1746,11 +2516,11 @@ class TestExitCodeContract(_HomeSandbox):
     def _run_args(self):
         return ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
 
     def _resume_args(self):
         return ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
 
     def _spawner(self, d, report_text, log_extra):
         """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
@@ -1808,7 +2578,8 @@ class TestExitCodeContract(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--no-skill"])
         # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
         with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
@@ -2333,6 +3104,16 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
     SIGTERM(15) 前面。所以「收到第一个就退出」的写法在 codex 同时挨了 TERM 和
     INT 时照样只记到 INT——测试会在 start_new_session 被删掉时照样绿。
     实测过：那样写的版本，去掉 start_new_session 和改成转发 TERM 两个突变都杀不掉。
+
+    **它曾经偶发，而根因不在它自己身上**：它轮询 `tasks/t.json` 等 session_id
+    落盘，而 `write_meta` 当时是 `Path.write_text`——先把目标截成 0 再填。
+    读到半截就是一个裸 `JSONDecodeError`。2026-09-20 量过：1 秒里写 5289 次、
+    并发读 12284 次，**8277 次读到半截**。`write_meta` 改成原子替换之后
+    连跑 20 次零失败（见 TestWriteMetaIsAtomic）。
+    **教训记在这里**：一条真进程测试偶发地红，先别归因到「机器慢」——
+    那次差一点就把它当成调度抖动登记掉，而它照出来的是一个真的并发 bug。
+    那几个 deadline 刻意不往上加：10 秒已经宽出两个量级，加大只会掩盖下一个
+    这样的 bug，还让真的挂死多等好几秒。
     """
 
     FAKE_CODEX = (

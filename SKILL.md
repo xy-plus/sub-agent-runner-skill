@@ -13,11 +13,12 @@ description: 把有明确规划的执行类任务（照 DoD 写代码、对抗�
 ## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
 
 ```bash
-codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort low --account default
+codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort low --account default --no-skill
 ```
 
-五个参数**全必填**，没有默认值。`run_in_background: true` 是唯一正确的启动方式——
-harness 追踪它、面板可监控、**完成时的通知里直接带成败结论**。
+五个带值参数**全必填**，外加 `--skill`/`--no-skill` 二选一，没有默认值。
+`run_in_background: true` 是唯一正确的启动方式——harness 追踪它、面板可监控、
+**完成时的通知里直接带成败结论**。
 绝不 `nohup … &`：detach 之后就只剩存活、没有通知。
 
 ## 难度靠 effort 分档，不靠换模型
@@ -37,10 +38,13 @@ harness 追踪它、面板可监控、**完成时的通知里直接带成败结�
 
 ```bash
 codex-agent status [任务名]        # 省略则列出全部
-codex-agent resume <任务名> --brief follow.md --effort low
-codex-agent interrupt-and-resume <任务名> --brief msg.md --effort low
+codex-agent resume <任务名> --brief follow.md --effort low --no-skill
+codex-agent interrupt-and-resume <任务名> --brief msg.md --effort low --no-skill
 codex-agent stop <任务名>          # 上下文保留，之后还能 resume
 ```
+
+`status` 不带任务名时**一行一个任务**：前四列（任务名／账号／状态／退出码）都不含空格，
+第五段起是工作目录和一句人话；**缩进的行是明细，不是任务**。
 
 `codex exec` **没有收件箱**——给正在跑的那一轮塞消息是做不到的。要给它新信息，
 只有 `interrupt-and-resume` 一条路，而它＝**打断当前轮**。
@@ -55,7 +59,7 @@ codex-agent stop <任务名>          # 上下文保留，之后还能 resume
 | 事 | 内容 |
 |---|---|
 | 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
-| brief | 只收**文件路径**，不收内联字符串。工具会自动前置「不得使用任何 skill」并打印一行提示 |
-| 给它 skill | 在 brief 里写该 skill 的**绝对路径**让 codex 自己读，不要往共享目录里放东西 |
+| brief | 只收**文件路径**，不收内联字符串。**skill 禁令那句话归工具所有，不要自己写进 brief**——写了当场拒跑 |
+| 给它 skill | `--skill <SKILL.md 的绝对路径>`，可重复；一个都不给就 `--no-skill`。**路径写错当场拒跑**，不会再静默跑出一个「零工作量的成功」。它给的是**许可**——工具会叫 codex 动手前先读一遍，但**什么时候按它办事仍要 brief 自己说**。不要往共享目录里放东西 |
 
 codex 不靠谱 → 换 claude 子代理。
