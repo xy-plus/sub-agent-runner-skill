@@ -164,8 +164,9 @@ def strip_ansi(text):
 def read_round(log_path, start_offset):
     """读日志的 `[start_offset, 之后第一个 ROUND_MARK)` 这一段——本轮，且只有本轮。
 
-    `start_offset` 是 `run_codex` 写完本轮分隔符之后回传的**字节**偏移，
+    `start_offset` 是 `run_codex` 写完本轮分隔符之后记下的**字节**偏移，
     是 codex 还没起跑之前就拿到的事实，**后来的任何一轮都不可能把它致盲**。
+    偏移**不外泄**：`run_codex` 自己拿它切好本轮文本再回传（见那里的理由）。
     这替掉了「按最后一个 ROUND_MARK 往回猜」那套：日志是多个进程共写的，
     interrupt-and-resume 一确认退出就往同一个日志追加新分隔符，而被打断那一轮的
     包装器此刻正要跑判据——谁先谁后没有任何保证，实测两者落在同一秒内。
@@ -683,7 +684,7 @@ def _log_path(home, task):
 
 
 def run_codex(kind, home, task, meta, make_argv):
-    """唯一的 spawn 入口。**返回本轮在日志中的字节起始偏移。**
+    """唯一的 spawn 入口。**返回本轮的日志文本**（codex 退出那一刻的快照）。
 
     开跑前必须做的三件事全在这里，调用方不需要记住顺序：
     ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
@@ -714,7 +715,7 @@ def run_codex(kind, home, task, meta, make_argv):
     with open(_log_path(home, task), "ab") as log:
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
-        # 本轮的起点：分隔符之后的第一个字节。**这是本函数唯一的返回值。**
+        # 本轮的起点：分隔符之后的第一个字节。
         # O_APPEND 下每次 write 都是「原子地跳到末尾再写」，所以即使别的进程
         # 正往同一个日志追加（留痕、另一轮的分隔符），这个位置依然精确指向
         # **我们自己刚写的那行之后**——拥有者的边界由此成为事实而非推测。
@@ -750,7 +751,11 @@ def run_codex(kind, home, task, meta, make_argv):
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
-    return start_offset
+    # 回传**本轮的日志文本**而不是偏移。偏移是可以被悄悄丢掉的：调用方忘了接，
+    # 唯一还能拿到本轮文本的路就是 read_last_round——正好是这次要修的那个 bug。
+    # 文本丢不掉，它就是 judge 的参数（铁律 2：把约束做进签名本身）。
+    # 副带好处：快照在 codex 退出那一刻取走，比「调用方稍后自己读」窗口更小。
+    return read_round(_log_path(home, task), start_offset)
 
 
 def _tee_until_exit(proc, log, home, task, meta):
@@ -805,13 +810,13 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text())
     print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
-    # 本轮的拥有者：用 run_codex 回传的偏移，**不用 read_last_round**——
-    # 后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    start_offset = run_codex("run", home, args.task,
-                             new_meta(args.task, args.account, str(workdir), args.effort),
-                             lambda r: build_run_argv(str(workdir), args.effort, r, brief))
-
-    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
+    # 本轮的拥有者：judge 收的就是 run_codex 回传的本轮文本，**不用 read_last_round**
+    # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
+    verdict = judge(report,
+                    run_codex("run", home, args.task,
+                              new_meta(args.task, args.account, str(workdir), args.effort),
+                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)),
+                    None)
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
@@ -874,8 +879,9 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     退出。这条边界是刻意的：要不要停是调用方的判断，怎么续是工具的事。
 
     `kind` 进日志分隔符，所以日志里看得出这一轮是被插话打断后续上的。
-    判据用 `run_codex` 回传的偏移，**不用 read_last_round**：本轮的拥有者手里
-    有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动修掉的整类 bug）。
+    判据收的就是 `run_codex` 回传的本轮文本，**不用 read_last_round**：本轮的
+    拥有者手里有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动
+    修掉的整类 bug）。
     """
     check_can_resume(task, meta, brief_path)
     ensure_isolation(meta["account"])
@@ -884,11 +890,11 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
     meta["started_at"] = _now_iso()
-    start_offset = run_codex(kind, home, task, meta,
-                             lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                         effort, r, brief))
     verdict = judge(_report_path(home, task),
-                    read_round(_log_path(home, task), start_offset), None)
+                    run_codex(kind, home, task, meta,
+                              lambda r: build_resume_argv(meta["dir"], meta["session_id"],
+                                                          effort, r, brief)),
+                    None)
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 

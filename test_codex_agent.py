@@ -236,70 +236,71 @@ class TestRoundBoundary(unittest.TestCase):
             (d / sub).mkdir()
         return d
 
-    def test_run_codex返回的偏移正好是本轮内容的起点(self):
+    def _spawn_writing(self, log, *chunks):
+        """假 codex：spawn 的那一刻往日志追加这几段。
+
+        **必须在 run_codex 返回之前写**——本轮文本的快照就在它返回那一刻取走。
+        写在 with 块外面的话，右端截断那条根本测不到。
+        """
+        def spawn(*a, **k):
+            with open(log, "ab") as f:
+                for c in chunks:
+                    f.write(c.encode())
+            return mock.DEFAULT
+        return spawn
+
+    def test_run_codex回传的就是本轮的日志文本_上一轮的不带进来(self):
         d = self._home()
         log = ca._log_path(d, "t")
         log.write_bytes("上一轮的尾巴\n".encode())
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        # 绝对值：此刻日志 = 上一轮 + 本轮分隔符行，偏移必须正好落在文件末尾
-        self.assertEqual(offset, len(log.read_bytes()))
-        with open(log, "ab") as f:
-            f.write("本轮的内容\n".encode())
-        self.assertEqual(ca.read_round(log, offset), "本轮的内容\n")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(text, "本轮的内容\n")
 
     def test_后来的轮次不能把前一轮判瞎_这是P1的回归锁(self):
         d = self._home()
         log, report = ca._log_path(d, "t"), ca._report_path(d, "t")
-
-        def spawn(*a, **k):
-            # 本轮被 INT 打断：只留下打断标记，没有报告
-            with open(log, "ab") as f:
-                f.write((ca.INTERRUPT_MARK + "\n").encode())
-            return mock.DEFAULT
-
+        # 本轮被 INT 打断（只留痕、没有报告），而判据还没跑，interrupt-and-resume
+        # 已经把下一轮的分隔符追了进去——实测两者落在同一秒内。
         with _no_codex() as popen:
-            popen.side_effect = spawn
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            popen.side_effect = self._spawn_writing(
+                log, ca.INTERRUPT_MARK + "\n",
+                ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
+                + "\n干净收尾\n")
+            round_text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
 
-        # 判据还没跑，interrupt-and-resume 已经把下一轮的分隔符追了进去（实测同一秒内）
-        with open(log, "ab") as f:
-            f.write((ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
-                     + "\n干净收尾\n").encode())
-
-        self.assertIn("resume", ca.judge(report, ca.read_round(log, offset), None).reason)
+        self.assertEqual(ca.judge(report, round_text, None).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotIn("resume", ca.judge(report, ca.read_last_round(log), None).reason)
+        self.assertNotEqual(ca.judge(report, ca.read_last_round(log), None).state, "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
         d = self._home()
         log = ca._log_path(d, "t")
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        with open(log, "ab") as f:
-            f.write("本轮干净\n".encode())
-            f.write((ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n").encode())
-            f.write((ERR_FATAL + "\n").encode())
-        text = ca.read_round(log, offset)
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(
+                log, "本轮干净\n",
+                ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n",
+                ERR_FATAL + "\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual(text, "本轮干净\n")
         self.assertEqual(ca.runtime_error_lines(text), [],
                          "后一轮的致命错误被算到了前一轮头上")
 
-    def test_偏移是字节数不是字符数_中文日志不许错位(self):
+    def test_切的是字节不是字符_中文日志不许错位(self):
         # 日志里全是中文：brief 原文、codex 的中文输出。按字符切会整体错位，
         # 切出来的开头是半截字节——判据读到的「本轮」根本不是本轮。
         d = self._home()
         log = ca._log_path(d, "t")
         log.write_bytes("上一轮写了很多中文内容\n".encode())
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        with open(log, "ab") as f:
-            f.write("本轮第一行\n".encode())
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, "本轮第一行\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         raw = log.read_bytes()
         self.assertNotEqual(len(raw), len(raw.decode()),
                             "前提不成立：日志里没有多字节字符，这条测不到错位")
-        self.assertEqual(ca.read_round(log, offset), "本轮第一行\n")
+        self.assertEqual(text, "本轮第一行\n")
 
     def test_日志还没有时读回空串_不许抛(self):
         d = self._home()
@@ -321,7 +322,8 @@ class TestRoundBoundaryWiring(_HomeSandbox):
     """谁用哪种边界，是这次改动的全部意义所在。
 
     单元层的 read_round 全绿、cmd_run 却接成 read_last_round —— bug 一点没修。
-    所以三条路各钉一条：run 用自己的偏移、resume 用自己的偏移、status 用最后一轮。
+    所以三条路各钉一条：run 和 resume 用 run_codex 回传的本轮文本，
+    status 用最后一轮。
     """
 
     def setUp(self):
@@ -341,7 +343,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             return mock.DEFAULT
         return spawn
 
-    def test_run收尾用的是自己的偏移(self):
+    def test_run收尾用的是run_codex回传的本轮文本(self):
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
@@ -354,7 +356,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         self.assertIn("resume", seen["v"].reason,
                       "run 接成了 read_last_round：被后来的一轮判瞎了")
 
-    def test_resume收尾用的是自己的偏移(self):
+    def test_resume收尾用的是run_codex回传的本轮文本(self):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
