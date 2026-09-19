@@ -843,27 +843,10 @@ def _tee_until_exit(proc, log, home, task, meta):
     proc.wait()
 
 
-def _say(message):
-    """包装器自己说的话。**必须 flush**，所以收成一个函数。
-
-    这条 fd 有两个写者：本函数走文本层，`run_codex` 的 tee 走
-    `sys.stdout.buffer`（它自己 flush）。stdout 接管道／文件时文本层是**块缓冲**的，
-    不 flush 的话本函数的话会一直躺在缓冲区里、到进程退出才随 atexit 一起吐出来——
-    排在 codex 整轮输出**之后**。
-    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 和
-    `已确认退出` 两句都排在最后面，而它们要说的恰恰是「此刻正在发生什么」；
-    `wait_for_exit` 卡住的那 60 秒里屏幕上更是一个字都没有。
-
-    收成一个函数而不是在每个 print 上加 `flush=True`：后者是软约定，
-    漏一个就静默错序，而错序这件事不会报错、只会让人读到假的时间顺序。
-    """
-    print(message, flush=True)
-
-
 def _print_verdict(task, verdict):
-    _say(f"\n[codex-agent] {task}: {verdict.state} —— {verdict.reason}")
+    print(f"\n[codex-agent] {task}: {verdict.state} —— {verdict.reason}")
     for line in verdict.detail:
-        _say(f"  {line}")
+        print(f"  {line}")
 
 
 def cmd_run(args):
@@ -885,12 +868,12 @@ def cmd_run(args):
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
         if find_codex_pid(_report_path(home, args.task)) is not None:
             reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-agent stop {args.task}`")
-        _say(f"[codex-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
+        print(f"[codex-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
 
     ensure_isolation(args.account)
     report = _report_path(home, args.task)
     brief = prepend_skill_guard(brief_file.read_text())
-    _say(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
+    print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
@@ -898,7 +881,7 @@ def cmd_run(args):
                               new_meta(args.task, args.account, str(workdir), args.effort),
                               lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
-    _say(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
+    print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
 
 
@@ -911,7 +894,7 @@ def cmd_status(args):
     else:
         rows = all_metas()
     if not rows:
-        _say("还没有任何任务")
+        print("还没有任何任务")
         return EXIT["success"]
     worst = "success"
     for home, meta in rows:
@@ -924,10 +907,10 @@ def cmd_status(args):
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
                    else judge(Round(report, read_last_round(log))))
-        _say(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
+        print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
               f"{verdict.reason}  {meta['dir']}")
         for line in verdict.detail:
-            _say(f"    {line}")
+            print(f"    {line}")
         worst = _worse(worst, verdict.state)
     return EXIT[worst]
 
@@ -1032,7 +1015,7 @@ def cmd_interrupt_and_resume(args):
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
-        _say(f"[codex-agent] {args.task} 本来就没在跑，直接续跑")
+        print(f"[codex-agent] {args.task} 本来就没在跑，直接续跑")
     else:
         # 超时的处置是「稍后重试」，而重试就是再跑一遍这条命令——不加这道判断，
         # 重试就会发出**第二发 INT**。很多 CLI 把第二发 Ctrl-C 当强退，codex
@@ -1041,16 +1024,16 @@ def cmd_interrupt_and_resume(args):
         # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
         # 恰好就是最后一轮的事。
         if has_interrupt_mark(read_last_round(log)):
-            _say(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
+            print(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
             interrupt_codex(pid, log)
-            _say(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
+            print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
         if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
             reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
                    f"还在收尾。稍后重跑这条命令即可——它不会再发第二发 INT。"
                    f"绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。")
-        _say("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
+        print("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
     return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
 
 
@@ -1060,13 +1043,13 @@ def cmd_stop(args):
         reject(f"没有这个任务：{args.task}")
     pid = find_codex_pid(_report_path(home, args.task))
     if pid is None:
-        _say(f"任务 {args.task} 已经不在跑了")
+        print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]
     # 发 INT 与留痕焊在 interrupt_codex 里，这条路不可能只做一半。
     # 上面 `pid is None` 那一支正是「调用之前判它在不在跑」的地方，
     # 所以 interrupt_codex 不需要回一个 bool 让这里再判一遍。
     interrupt_codex(pid, _log_path(home, args.task))
-    _say(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
+    print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
 
@@ -1150,6 +1133,17 @@ def main():
     （附：codex 0.154.0 的 `codex mcp` 只是管理**外部** MCP server，
     它不提供「把自己暴露成 MCP server」这回事。）
     """
+    # stdout 接管道／文件时文本层默认**块缓冲**，而这条 fd 有两个写者：
+    # 本模块的 print 走文本层，run_codex 的 tee 走 sys.stdout.buffer（自己 flush）。
+    # 不改成行缓冲，包装器「此刻正在发生什么」的话会排到 codex 整轮输出之后
+    # （2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT`、`已确认退出` 两句
+    # 都落在最后面，而 wait_for_exit 卡住的那 60 秒里屏幕上一个字都没有）。
+    #
+    # **在这里改一次**，而不是每个 print 加 flush=True，也不是收一个 _say()——
+    # 那两种都是软约定：15 个调用点都得记得用对的那个，漏一个就静默错序，
+    # 而漏一个不会报错。实测那两个突变（新加一行裸 print、把某句 _say 改回裸
+    # print）在收了 _say() 的版本上**都存活**。行缓冲之后裸 print 自动正确。
+    sys.stdout.reconfigure(line_buffering=True)
     args = build_parser().parse_args()
     try:
         return args.func(args)

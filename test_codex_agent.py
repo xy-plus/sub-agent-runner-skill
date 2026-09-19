@@ -2049,7 +2049,7 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
 class TestWrapperSpeaksImmediately(unittest.TestCase):
     """包装器自己说的话必须**当场**出现在屏幕上，不能攒到进程退出才吐。
 
-    这条 fd 有两个写者：包装器走文本层的 print，run_codex 的 tee 走
+    这条 fd 有两个写者：包装器的 print 走文本层，run_codex 的 tee 走
     sys.stdout.buffer（它自己 flush）。stdout 接管道／文件时文本层是**块缓冲**的，
     于是包装器的话会一直躺在缓冲区里，到退出才随 atexit 一起吐出来——排在
     codex 整轮输出**之后**。
@@ -2057,31 +2057,39 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
     2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 和
     `已确认退出` 两句都排在 codex 整轮输出的最后面，而它们要说的恰恰是
     「此刻正在发生什么」。wait_for_exit 卡住的那 60 秒里，屏幕上更是一个字都没有。
+
+    **钉的是裸 `print`，不是某个助手函数。** 收一个 `_say()` 不解决问题，只是把
+    软约定上移一层：每个调用点都得记得用它，新加一行裸 print 照样静默错序——
+    实测那两个突变（新加裸 print、把某句 _say 改回裸 print）都**存活**。
+    治本是在入口把文本层改成行缓冲，之后裸 print 自动正确。
     """
 
-    def test_说完就能被读到_不等进程退出(self):
+    def test_走过真实入口之后_裸print当场就读得到(self):
         d = pathlib.Path(tempfile.mkdtemp())
         screen = d / "screen.out"
+        # 走 main() 这条真实入口（status 一个不存在的任务：只读、当场被护栏拒绝，main 自己接住返回 2），
+        # 再用**裸 print**——不经任何助手函数。stdout 接的是文件不是 tty，
+        # Python 默认块缓冲，所以「这行现在就读得到」只可能来自入口那行行缓冲配置。
         driver = (
             "import sys,time\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
             "import codex_agent as ca\n"
-            "ca._say('这句必须当场看得到')\n"
+            "sys.argv = ['codex-agent', 'status', 'no-such-task-2026']\n"
+            "ca.main()\n"
+            "print('裸 print 这句必须当场看得到')\n"
             "time.sleep(30)\n"
         )
-        # 接的是文件不是 tty，Python 默认块缓冲——所以「这行现在就读得到」
-        # 只可能来自 _say 自己的 flush。
         with open(screen, "wb") as out:
             proc = subprocess.Popen([sys.executable, "-c", driver],
                                     stdout=out, stderr=subprocess.PIPE)
         try:
             deadline = time.time() + 8
-            while time.time() < deadline and "这句必须当场看得到" not in screen.read_text():
+            while time.time() < deadline and "裸 print 这句必须当场看得到" not in screen.read_text():
                 if proc.poll() is not None:
                     self.fail(f"驱动进程提前退出：{proc.stderr.read().decode()}")
                 time.sleep(0.05)
             self.assertIsNone(proc.poll(), "驱动进程已经退出了，那这条测的就不是实时性")
-            self.assertIn("这句必须当场看得到", screen.read_text())
+            self.assertIn("裸 print 这句必须当场看得到", screen.read_text())
         finally:
             proc.kill()
             proc.wait()
