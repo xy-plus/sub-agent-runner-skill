@@ -149,6 +149,8 @@ resume: codex exec --cd <abs> resume <session_id> …同上，但
 ### 真实 PID 怎么拿（不能靠 `$!`、不能靠日志）
 
 `pgrep -f "reports/<任务>.json"` → 再按 `ps -o comm=` 是 `codex` 收窄 → `kill -0` 确认。
+**`comm` 这道过滤是承重的，不是保险**：2026-09-19 实测 `pgrep -f <报告路径>` 确实命中了
+发命令的 bash 自己（`comm=bash`），少了这道过滤会把 shell 当成 codex。
 报告路径在 argv 里且按任务唯一，这是「按任务命名」的第二个用处。
 `$!` 拿到的是包装链最外层，不是 codex（2026-09-17 实测：`$!`=254151，codex=254153）。
 
@@ -158,11 +160,24 @@ log 里**混着 brief 原文和 codex 转述的子进程输出**，裸 `grep -E 
 实测出现过的误报源：cargo 的 `error[E0599]`、pytest 的 `E   KeyError`、
 brief 里引用 TDD skill 的 `**Test errors?**`、markdown 标题 `## Warning Signs`。
 
-判据必须是：**剥掉 ANSI 转义后，行首为 `ERROR:` 或 `WARN:`**（codex 自己的运行时前缀）。
+**codex 自己的运行时日志有两种形态，判据必须同时认，漏掉任一种都等于判据失效**
+（剥掉 ANSI 转义之后看）：
 
-已知良性（过滤掉，不计入）：
-- `failed to refresh available models`
-- `Reconnecting... waiting for network`（可恢复，后续正常继续）
+| 形态 | 样例（已剥 ANSI） | 特征 |
+|---|---|---|
+| A 用户层 | `ERROR: You've hit your usage limit. …` | **行首**是 `ERROR:` / `WARN:` |
+| B tracing 结构化日志 | `2026-09-18T16:49:02.380969Z ERROR codex_models_manager::manager: failed to refresh available models: …` | **行首是 ISO8601 时间戳**，其后为 `ERROR`/`WARN` + `codex_*` target |
+
+形态 B 的行首不是 `ERROR:`——只按行首匹配会把整类结构化日志漏掉。
+（原 SKILL.md 写的 `ERROR/WARN codex` 匹配的就是 B 的 `codex_*` target，A 靠行首。）
+
+正则两条，取并集：
+- `^(ERROR|WARN):\s`
+- `^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(ERROR|WARN)\s+codex\S*:`
+
+已知良性（命中后过滤掉，不计入判据）：
+- `failed to refresh available models`（形态 B）
+- `Reconnecting...`（形态 A，可恢复，后续正常继续）
 
 特判进 `reason`（不新增状态）：`You've hit your usage limit` —— 补救手段不同（换账号／等额度）。
 
