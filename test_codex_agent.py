@@ -51,6 +51,21 @@
        改成钉**配对**（`--skill` 与「绝对路径」同行、`--no-skill` 与「二选一」
        同行）并让每条事实在文档里只有一个家，两个突变才各自变红。
 
+    6. 前提断言用了**突变要改的那个函数**。2026-09-20：回归锁的前提原写成
+       `ca._previous_writer_alive(home, task)`，而突变改的正是它的签名 →
+       前提行先炸 `TypeError: takes 1 positional argument but 2 were given`
+       （0.005s），**红的是「签名变了」而不是「等错了人」**。改用
+       `_read_stat_fields` 表达前提之后，突变才由真实的 `Rejected` 杀掉（0.405s）。
+       写前提时问一句：**这一行会不会被我正要改坏的那个东西带下水。**
+    7. 突变算子把 `if` 体删空 → `IndentationError`。**红的是语法错，不是那条约束。**
+       写突变脚本时先 `ast.parse` 一遍，语法错要和「它红了」分开记账，
+       否则会把「我把代码改崩了」当成「这条约束有人守」。
+
+    另有一类不是写测试时犯的，是**改接口时误伤**的：新加一个短路分支，可能把
+    原本有效的断言吃掉。2026-09-20 加「不许等自己」那一行时，回归锁里「参数那份」
+    用的正好是本进程身份 → 被短路救活 → 突变存活而测试全绿。解法是
+    `_live_writer(test)`：需要「一个活着的 writer」时一律起真陪练，不拿本进程充数。
+
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
     suspect:3, running:4, interrupted:130}，字段清单钉那七个名字，
     边界钉「这段文本从哪来」，别只钉「两边相等」。
@@ -1375,6 +1390,27 @@ class TestProcessIdentity(unittest.TestCase):
 
     裸 PID 判不了 PID 复用：同一个 PID 换了个进程，`os.kill(pid, 0)` 一样说「活着」。
     """
+
+    def test_state和starttime是同一次读取出来的(self):
+        """注释明写「必须同一次读取」，这条把它钉住。
+
+        分两次读 `/proc` 的话，进程正好在两次之间变僵尸时，starttime 对得上、
+        state 却是存活期那次的——「僵尸算停了」那一行当场失效。竞态本身没法
+        确定性触发，但**结构**可以钉：一次调用只许读一次那个文件。
+        """
+        真读 = pathlib.Path.read_bytes
+        次数 = []
+
+        def 记一笔(self):
+            if str(self).startswith("/proc/"):
+                次数.append(str(self))
+            return 真读(self)
+
+        with mock.patch.object(pathlib.Path, "read_bytes", 记一笔):
+            ca._read_stat_fields(str(os.getpid()))
+        self.assertEqual(len(次数), 1,
+                         f"一次调用读了 {len(次数)} 次 /proc：{次数}——"
+                         f"分两次读会让 state 和 starttime 来自不同时刻")
 
     def test_身份成对返回_两半都是str(self):
         # 两半必须同时拿到：分开取就会出现「记了 PID 没记启动时刻」的半截身份，
