@@ -743,3 +743,83 @@ class TestStop(_HomeSandbox):
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
         k.assert_called_once_with(4242, signal.SIGINT)
+
+
+class TestSignalSafetyRealProcesses(unittest.TestCase):
+    """用真进程、真信号验证 spec §9 的那条保证：
+
+    无论谁怎么停包装器，codex 收到的永远**只有** INT。
+    上面 TestSignalSafety 用 mock 验的是「参数传对了没」，这里验的是
+    「传对了之后，内核那一层真的照做了没」——这两件事不是一回事。
+
+    假 codex 必须**把收到的每一个信号都记下来**，而不是收到第一个就退出：
+    CPython 派发待处理信号是按信号编号**从小到大**扫的，SIGINT(2) 永远排在
+    SIGTERM(15) 前面。所以「收到第一个就退出」的写法在 codex 同时挨了 TERM 和
+    INT 时照样只记到 INT——测试会在 start_new_session 被删掉时照样绿。
+    实测过：那样写的版本，去掉 start_new_session 和改成转发 TERM 两个突变都杀不掉。
+    """
+
+    FAKE_CODEX = (
+        "import signal,sys,time\n"
+        "mark = sys.argv[1]\n"
+        "got = []\n"
+        "def record(signum, frame):\n"
+        "    got.append(signal.Signals(signum).name)\n"
+        "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+        "    signal.signal(s, record)\n"
+        "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n')\n"
+        "sys.stdout.flush()\n"
+        "deadline = time.time() + 30\n"
+        "while time.time() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "    if got:\n"
+        "        time.sleep(0.5)\n"           # 等一等，把同一发组信号里的其它信号收全
+        "        open(mark, 'w').write(','.join(sorted(set(got))))\n"
+        "        sys.exit(0)\n"
+        "open(mark, 'w').write('(超时：什么信号都没收到)')\n"
+    )
+
+    def test_向包装器的进程组发TERM_codex只会收到INT(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        mark = d / "codex收到的信号.txt"
+        driver = (
+            "import os,pathlib,sys\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import codex_agent as ca\n"
+            f"ca.run_codex([sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}],"
+            f" dict(os.environ), pathlib.Path({str(d)!r}), 't', 'run', {_full_meta('t')!r})\n"
+        )
+        # 包装器自己起在独立会话里，这样 killpg 只打到它那一组，不会波及测试进程
+        proc = subprocess.Popen([sys.executable, "-c", driver],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                f = d / "tasks" / "t.json"
+                if f.exists() and json.loads(f.read_text())["session_id"]:
+                    break
+                if proc.poll() is not None:
+                    self.fail(f"包装器提前退出：{proc.stderr.read().decode()}")
+                time.sleep(0.05)
+            else:
+                self.fail("假 codex 没起来，本测试无法验证信号，不能算通过")
+
+            # harness 停掉后台 Bash 任务就是这么干的：向整个进程组发 TERM
+            os.killpg(proc.pid, signal.SIGTERM)
+
+            deadline = time.time() + 10
+            while time.time() < deadline and not mark.exists():
+                time.sleep(0.05)
+            self.assertTrue(mark.exists(), "假 codex 什么信号都没收到——转发没装上")
+            self.assertEqual(mark.read_text(), "SIGINT",
+                             "codex 收到了 INT 以外的信号——会话会被永久锁死")
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            proc.stderr.close()
