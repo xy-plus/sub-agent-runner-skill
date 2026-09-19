@@ -1,0 +1,1416 @@
+"""codex-agent 的全部单测 —— 也是这个项目的**维护者入口**。
+
+怎么跑：
+
+    python3 -m unittest test_codex_agent -v
+
+（零依赖、零 codex token。纯函数和护栏全在这里，不花钱。）
+
+这套测试被三轮突变验过，第一轮 78 个突变杀掉 57，存活的逐条补齐。
+下面这些**承重约束**的突变**全部被杀**，动它们之前先想清楚你在拆什么：
+
+    信号安全（start_new_session + 统一转发 INT + 用完还原）
+    进程反查的三道过滤（uid / comm / argv 元素精确相等）
+    开跑前三件事的顺序（落元数据、清旧报告、写轮次分隔符，全在 spawn 之前）
+    防陈旧报告（clear_report）、日志追加而非覆盖、按轮次切分日志
+    三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
+    退出码四态的绝对值、严重度排序、元数据字段清单
+    read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
+    resume 的三处 flag 差异、任务名字符集、兜底句两条路都真的加上
+
+总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
+凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
+地绿。这条是三次踩出来的，三次还都是同一个病——断言的两边一起动：
+
+    1. 陪练进程写成 `sleep 5 <mark>`，而 sleep 收到多余参数会立刻退出。
+       进程根本不存在，于是把承重的 comm 过滤整个删掉，测试照样绿。
+    2. `assertEqual(cmd_status(...), ca.EXIT["running"])`。
+       把 EXIT["running"] 改成 0，两边一起动，测试照样绿——而那正是它号称
+       要防的「status && deploy 在任务还在跑的时候提前部署」。
+    3. `assertEqual(set(new_meta(...)), set(REQUIRED_META_KEYS))`，而后者是从
+       前者派生的。构造器少一个字段，校验面跟着少，测试照样绿。
+
+    解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
+    suspect:3, running:4}，字段清单钉那六个名字，别只钉「两边相等」。
+
+还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
+**「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
+行数（现在 55 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以要 resume、
+退出码怎么读），正好把这次重写的目的做反。
+这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
+"""
+import argparse
+import contextlib
+import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from unittest import mock
+
+import codex_agent as ca
+
+# 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
+ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
+ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
+               "\x1b[2mcodex_models_manager::manager\x1b[0m\x1b[2m:\x1b[0m "
+               "failed to refresh available models: timeout waiting for child process to exit")
+ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-17T14:35:32.578919Z\x1b[0m \x1b[31mERROR\x1b[0m "
+                       "\x1b[2mcodex_core::session\x1b[0m\x1b[2m:\x1b[0m Failed to create session: "
+                       "thread-store conflict: thread already has an active writer")
+ERR_FATAL = "Error: thread/resume: thread 01a0… already has an active writer (code -32600)"
+ERR_TRACING_ROUTER = ("2026-09-18T16:49:02.380969Z ERROR codex_core::tools::router: "
+                      "apply_patch failed: file changed on disk")
+ERR_TRACING_WS = ("2026-09-18T16:49:02.380969Z ERROR codex_api::endpoint::responses_websocket: "
+                  "websocket closed unexpectedly")
+HEADER = ("Reading additional input from stdin...\n"
+          "OpenAI Codex v0.154.0\n"
+          "--------\n"
+          "\x1b[1mworkdir:\x1b[0m /home/xy/repo\n"
+          "\x1b[1msession id:\x1b[0m 01a0b408-f718-7ff3-8123-d5202551acba\n"
+          "--------\n")
+
+
+@contextlib.contextmanager
+def _no_codex():
+    """把 spawn 换成一个立刻 EOF 的假进程。
+
+    run_codex 的真实逻辑（落元数据、清报告、写分隔符、tee、还原信号）照跑，
+    但不真的把 codex 叫起来——单测绝不能真的发网络请求。
+    这里刻意 patch 的是 subprocess.Popen 而不是 run_codex 本身：清报告和写分隔符
+    就住在 run_codex 里，把它整个 mock 掉，要验的行为就一起没了。
+    """
+    with mock.patch.object(ca.subprocess, "Popen") as popen:
+        popen.return_value.stdout.read1.return_value = b""
+        popen.return_value.wait.return_value = 0
+        yield popen
+
+
+def _full_meta(task, **over):
+    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
+    meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
+            "session_id": None, "started_at": "2026-09-19T00:00:00"}
+    meta.update(over)
+    return meta
+
+
+class _HomeSandbox(unittest.TestCase):
+    """把 HOME 整个搬进临时目录。
+
+    两个 patch 缺一不可：`Path.home()` 和 `Path.expanduser()` 是两条路——
+    后者走 os.path.expanduser 读 $HOME，不受 Path.home 的 patch 影响，
+    而 cmd_run 里就有 .expanduser()。
+    """
+
+    def setUp(self):
+        self.home = pathlib.Path(tempfile.mkdtemp())
+        self.patches = [
+            mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home)),
+            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+        ]
+        for q in self.patches:
+            q.start()
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}")
+
+    def tearDown(self):
+        for q in reversed(self.patches):
+            q.stop()
+
+
+class TestStripAnsi(unittest.TestCase):
+    def test_去掉颜色码只留文字(self):
+        self.assertEqual(ca.strip_ansi(ERR_RECONNECT), "ERROR: Reconnecting... 2/5")
+
+
+class TestRuntimeErrorLines(unittest.TestCase):
+    def test_形式A用户层ERROR行被识别(self):
+        got = ca.runtime_error_lines(ERR_USER_LAYER)
+        self.assertEqual(len(got), 1)
+        self.assertIn("usage limit", got[0])
+
+    def test_形式B按target分类_未知target计入(self):
+        # 行首是时间戳不是 ERROR：只按行首匹配会把整类结构化日志漏掉
+        got = ca.runtime_error_lines(ERR_TRACING_UNKNOWN)
+        self.assertEqual(len(got), 1)
+        self.assertIn("thread-store conflict", got[0])
+
+    def test_形式C顶层致命Error大写E也要认_它正是写锁那条(self):
+        # `^ERROR:` 大小写敏感，匹配不到 `Error:`——而形式 C 正是最该报的那条
+        got = ca.runtime_error_lines(ERR_FATAL)
+        self.assertEqual(len(got), 1)
+        self.assertIn("already has an active writer", got[0])
+
+    def test_良性target被过滤(self):
+        for benign in (ERR_TRACING, ERR_TRACING_ROUTER, ERR_TRACING_WS):
+            with self.subTest(line=benign[:60]):
+                self.assertEqual(ca.runtime_error_lines(benign), [])
+
+    def test_Reconnecting按前缀过滤_后缀有多种写整行会漏(self):
+        for suffix in ("2/5", "5/5", "waiting for network"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(ca.runtime_error_lines(f"ERROR: Reconnecting... {suffix}"), [])
+        self.assertEqual(ca.runtime_error_lines(ERR_RECONNECT), [])
+
+    def test_codex_core_session不是良性_它是最该报的那类(self):
+        self.assertEqual(len(ca.runtime_error_lines(ERR_TRACING_UNKNOWN)), 1)
+
+    def test_子进程输出和brief原文不算运行时ERROR(self):
+        noise = "\n".join([
+            "error[E0599]: no method named `cols_at` found for struct `Arc<Broker>`",
+            "E   KeyError: ('2026-07-28', '1min/feature/ewm_std_hl120')",
+            "**Test errors?** Fix error, re-run until it fails correctly.",
+            "## Warning Signs",
+            "error: test failed, to rerun pass `--lib`",
+            "Error handling is covered in section 3.",   # 形式 C 要 `Error:` 才算
+        ])
+        self.assertEqual(ca.runtime_error_lines(noise), [])
+
+
+class TestCurrentRound(unittest.TestCase):
+    def test_只扫最后一个分隔符之后_上一轮的错误不算这一轮的(self):
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n" + ERR_FATAL + "\n"
+               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n干净收尾\n")
+        self.assertEqual(ca.runtime_error_lines(log), [])
+
+    def test_本轮自己的错误照样认(self):
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n干净\n"
+               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n" + ERR_FATAL + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
+
+    def test_没有分隔符时扫全文_老日志和半路接手都还能判(self):
+        self.assertEqual(len(ca.runtime_error_lines(ERR_FATAL)), 1)
+
+
+class TestExtractSessionId(unittest.TestCase):
+    def test_从带ANSI的日志头提取(self):
+        self.assertEqual(ca.extract_session_id(HEADER),
+                         "01a0b408-f718-7ff3-8123-d5202551acba")
+
+    def test_还没打出来时返回None(self):
+        self.assertIsNone(ca.extract_session_id("OpenAI Codex v0.154.0\n"))
+
+
+class TestJudge(unittest.TestCase):
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp())
+        self.report = self.d / "t.md"
+        self.log = self.d / "t.log"
+        self.log.write_text("正常收尾\n")
+
+    def test_PID还活着就是running_不看产物(self):
+        v = ca.judge(self.report, self.log, 12345)
+        self.assertEqual(v.state, "running")
+
+    def test_报告缺失是failed(self):
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+
+    def test_报告为空也是failed(self):
+        self.report.write_text("")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+
+    def test_报告缺失且撞额度上限_reason要点名(self):
+        self.log.write_text("\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://x")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("额度", v.reason)
+
+    def test_报告是散文也算success_并预览前几行(self):
+        # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
+        # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事，不是工具层的。
+        self.report.write_text("干完了，见分支 feat/x\n改了 3 个文件\n测试全绿\n")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(v.detail[0], "干完了，见分支 feat/x")
+
+    def test_预览最多几行_长报告不刷屏(self):
+        self.report.write_text("\n".join(f"第 {i} 行" for i in range(50)))
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(len(v.detail), ca.REPORT_PREVIEW_LINES)
+        self.assertLess(len(v.detail), 50)   # 钉住「确实截断了」，不随常量一起动
+
+    def test_报告在但本轮日志有未分类错误是suspect(self):
+        self.report.write_text("干完了")
+        self.log.write_text("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                            "Failed to create session: thread-store conflict")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "suspect")
+        self.assertEqual(len(v.detail), 1)
+
+    def test_撞上写锁_reason要点名(self):
+        self.log.write_text(ERR_FATAL)
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("锁", v.reason)
+
+    def test_清报告之后旧内容不会被当成本轮产物(self):
+        # codex 只在正常收尾时写 -o、启动时不 truncate。不清掉的话，一次秒死于
+        # 写锁的 resume 会读到上一轮的报告并被判成 success——工具在说谎。
+        self.report.write_text("上一轮的报告")
+        ca.clear_report(self.report)
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "failed")
+
+    def test_清报告对还没有报告的任务也成立(self):
+        ca.clear_report(self.report)   # 不存在也不许抛
+
+    def test_被INT打断的那轮_reason要告诉人可以resume(self):
+        """2026-09-19 真机复现：`stop t` 刚打印完「上下文保留，可 resume」，
+        紧接着 `status t` 就说 `failed —— 报告缺失或为空＝没正常收尾`，退出码 1。
+        两句话自相矛盾，而调用方拿不到那条唯一有用的信息：这轮是被打断的，
+        接着 resume 就行，不用重跑。
+        """
+        self.log.write_text(ca.INTERRUPT_MARK + "\n")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")     # 产物确实没出来，状态不变
+        self.assertIn("resume", v.reason)       # 但处置得说清楚
+
+    def test_打断标记不能被当成新一轮的开始(self):
+        # 它要是以 ROUND_MARK 开头，current_round 就会从它这里切开，
+        # 本轮前面的错误全被丢掉——判据当场失明
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
+               + ERR_FATAL + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
+        self.assertFalse(ca.INTERRUPT_MARK.startswith(ca.ROUND_MARK))
+
+    def test_撞额度上限比被打断更该被说出来(self):
+        # 两个都命中时，「换账号」比「可以 resume」更接近真正的处置
+        self.log.write_text(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertIn("额度", ca.judge(self.report, self.log, None).reason)
+
+    def test_非UTF8的日志不许把判据打崩(self):
+        # codex 被 INT 打断时可能只写出半截多字节字符
+        self.report.write_text("干完了")
+        self.log.write_bytes(b"\xff\xfe" + "正常收尾".encode())
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
+
+    def test_非UTF8的报告不许把判据打崩(self):
+        # codex 被 SIGINT 打断时可能只写出半截字节
+        self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
+
+
+class TestIsolation(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+
+    def test_账号可选项来自实际目录扫描(self):
+        self.assertEqual(ca.account_choices(), ["default", "acct2"])
+
+    def test_default账号映射到不带后缀的隔离目录(self):
+        self.assertEqual(ca.isolation_home("default"), self.home / ".codex-subagent")
+        self.assertEqual(ca.isolation_home("acct2"), self.home / ".codex-subagent-acct2")
+
+    def test_首次使用自动建齐目录与配置(self):
+        d = ca.ensure_isolation("acct2")
+        for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+            with self.subTest(sub=sub):
+                self.assertTrue((d / sub).is_dir())
+        self.assertTrue((d / "config.toml").is_file())
+        self.assertTrue((d / "auth.json").is_symlink())
+
+    def test_生成的config不写模型与沙箱_那些由CLI每次显式传(self):
+        # 写进 config 就是同一条事实有两个家，还是个会被静默覆盖的缺省值
+        d = ca.ensure_isolation("acct2")
+        text = (d / "config.toml").read_text()
+        for key in ("model", "model_reasoning_effort", "sandbox_mode", "approval_policy"):
+            with self.subTest(key=key):
+                self.assertNotIn(f"{key} =", text)
+
+    def test_config被codex追加过内容也不重写_那是它的trust状态(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").write_text(ca.CONFIG_NOTE + '\n[projects."/x"]\ntrust_level = "trusted"\n')
+        ca.ensure_isolation("default")
+        self.assertIn("trust_level", (d / "config.toml").read_text())
+
+    def test_共享扫描根非空就拒跑_CODEX_HOME管不到它(self):
+        (self.home / ".agents" / "skills" / "某个skill").mkdir(parents=True)
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.ensure_isolation("default")
+        self.assertIn("某个skill", cm.exception.message)
+
+    def test_auth指错账号时被改回来(self):
+        d = ca.ensure_isolation("default")
+        (d / "auth.json").unlink()
+        (d / "auth.json").symlink_to(self.home / ".codex-accounts" / "acct2" / "auth.json")
+        ca.ensure_isolation("default")
+        self.assertEqual(os.readlink(d / "auth.json"), str(self.home / ".codex" / "auth.json"))
+
+    def test_config是软链就拒跑_隔离会失效(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.ensure_isolation("default")
+        self.assertIn("软链", cm.exception.message)
+
+    def test_已有的config不被覆盖(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").write_text('model = "自定义"\n')
+        ca.ensure_isolation("default")
+        self.assertIn("自定义", (d / "config.toml").read_text())
+
+    def test_账号没登录态就拒跑(self):
+        (self.home / ".codex-accounts" / "acct3").mkdir()
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.ensure_isolation("acct3")
+        self.assertIn("登录", cm.exception.message)
+
+
+class TestArgv(unittest.TestCase):
+    def test_兜底句被前置且只加一次(self):
+        once = ca.prepend_skill_guard("干活")
+        self.assertTrue(once.startswith(ca.SKILL_GUARD))
+        self.assertEqual(ca.prepend_skill_guard(once), once)
+
+    def test_run参数完整(self):
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief")
+        self.assertEqual(argv[:3], ["codex", "exec", "--cd"])
+        self.assertEqual(argv[3], "/abs/repo")
+        self.assertIn("--sandbox", argv)
+        self.assertIn("danger-full-access", argv)
+        self.assertIn('model_reasoning_effort="low"', " ".join(argv))
+        self.assertEqual(argv[-1], "brief")
+        self.assertEqual(argv[argv.index("-o") + 1], "/d/reports/t.md")
+
+    def test_resume的cd在resume之前_否则clap直接拒收(self):
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.md", "再来一轮")
+        self.assertLess(argv.index("--cd"), argv.index("resume"))
+        self.assertEqual(argv[argv.index("resume") + 1], "sess-1")
+
+    def test_resume不许出现sandbox长选项_它不认(self):
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.md", "x")
+        self.assertNotIn("--sandbox", argv)
+        self.assertIn('sandbox_mode="danger-full-access"', " ".join(argv))
+
+    def test_主线从源头关掉颜色(self):
+        # --color auto（默认）在输出被重定向时并不关颜色，106 份日志无一例外含 ANSI
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b")
+        self.assertEqual(argv[argv.index("--color") + 1], "never")
+
+    def test_resume不许出现color_它也不认(self):
+        # 2026-09-19 端到端冒烟实测：resume 见到 --color 直接
+        # `error: unexpected argument '--color' found`，整轮当场死掉。
+        # 而且 codex 没有对应的 config 键（--strict-config 探测：
+        # unknown configuration field `color`），所以 resume 这条路关不掉颜色，
+        # 只能靠解析侧的 strip_ansi 兜——它在 resume 这条路上是承重的。
+        argv = ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")
+        self.assertNotIn("--color", argv)
+
+    def test_环境变量把会话索引留在主目录_resume才找得到(self):
+        env = ca.codex_env(pathlib.Path("/d"))
+        self.assertEqual(env["CODEX_HOME"], "/d")
+        self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
+
+
+class TestFixedArgs(unittest.TestCase):
+    """两条命令都必须带上的固定参数。
+
+    这些是「调用方碰不到、也就不可能漏掉」的那一批，但没人测就等于没锁：
+    审查实测把 approval_policy / project_doc_max_bytes / --disable plugins /
+    --skip-git-repo-check 逐个删掉，测试一个都不响。
+    主线和 resume **各跑一遍**——两条命令的参数集不一样，只测一条会漏。
+    """
+
+    CASES = {
+        "run": lambda: ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief"),
+        "resume": lambda: ca.build_resume_argv("/abs/repo", "s1", "low", "/d/reports/t.md", "brief"),
+    }
+
+    def test_批准策略永远是never_否则会停下来等人点确认(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn('approval_policy="never"', build())
+
+    def test_不读仓库的AGENTS_md_那是隔离的一部分(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn("project_doc_max_bytes=0", build())
+
+    def test_plugins被禁掉(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                argv = build()
+                self.assertEqual(argv[argv.index("--disable") + 1], "plugins")
+
+    def test_跳过git仓库检查_否则非仓库目录起不来(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn("--skip-git-repo-check", build())
+
+    def test_模型固定且就是这一个(self):
+        # 绝对值：写成 `== ca.MODEL` 的话，改掉 MODEL 两边一起动，等于没测
+        self.assertEqual(ca.MODEL, "gpt-6-astra")
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                argv = build()
+                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-astra")
+
+    def test_难度分档如实传给codex(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn('model_reasoning_effort="low"', build())
+
+
+class TestMeta(_HomeSandbox):
+    def test_元数据写入后能跨隔离目录查回来_home走返回值不是魔法键(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t1", _full_meta("t1", dir="/abs/x"))
+        home, meta = ca.find_meta("t1")
+        self.assertEqual(meta["dir"], "/abs/x")
+        self.assertEqual(home, d)
+        # 魔法键意味着每个写回元数据的地方都得记得剥掉它
+        self.assertNotIn("_home", meta)
+
+    def test_查不到返回一对None(self):
+        self.assertEqual(ca.find_meta("不存在的任务"), (None, None))
+
+    def test_元数据缺字段就拒绝_不给默认值圆场(self):
+        d = ca.ensure_isolation("default")
+        ca.meta_path(d, "broken").write_text('{"task": "broken"}')
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.find_meta("broken")
+        self.assertIn("缺字段", cm.exception.message)
+
+    def test_同名任务出现在两个隔离目录就拒绝_不许猜(self):
+        # 这条路很好走：撞额度上限 → 换账号重跑同名任务
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+        for account in ("default", "acct2"):
+            ca.write_meta(ca.ensure_isolation(account), "clash", _full_meta("clash", account=account))
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.find_meta("clash")
+        self.assertIn("多个隔离目录", cm.exception.message)
+
+    def test_列出全部任务(self):
+        d = ca.ensure_isolation("default")
+        for name in ("a", "b"):
+            ca.write_meta(d, name, _full_meta(name))
+        self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
+
+
+class TestMetaShape(_HomeSandbox):
+    """元数据的形状只许有一个家。
+
+    突变掉 `cmd_run` 手拼字典里的一个 `effort` 之后的真实后果：run 照常报成败，
+    但那个任务从此 status/resume/stop **全够不着**（`_load_meta` 一律拒绝），
+    而工具给出的唯一建议「删掉它重新 run」会把会话**彻底弄丢**。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
+    # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
+    # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
+    FIELDS = {"task", "account", "dir", "effort", "session_id", "started_at"}
+
+    def test_字段清单的绝对值(self):
+        self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
+        # resume 要回到同一个目录、同一个会话，这两个字段是它的命根子
+        self.assertIn("dir", self.FIELDS)
+        self.assertIn("session_id", self.FIELDS)
+        # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
+        self.assertNotIn("pid", self.FIELDS)
+
+    def test_构造器的键集就是校验面(self):
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low")),
+                         set(ca.REQUIRED_META_KEYS))
+
+    def test_run落盘的元数据键集与校验面相等_不多不少(self):
+        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 pid 又会破坏
+        # 「存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        d = ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        with _no_codex():
+            ca.cmd_run(args)
+        self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
+                         set(ca.REQUIRED_META_KEYS))
+
+
+class TestPid(unittest.TestCase):
+    def test_自己的进程判定为存活(self):
+        self.assertTrue(ca.pid_alive(os.getpid()))
+
+    def test_不存在的进程判定为已退出(self):
+        self.assertFalse(ca.pid_alive(2 ** 22))
+
+    def test_没权限发信号意味着进程存在_不是已退出(self):
+        # EPERM 是「有这个进程但不归你管」，只有 ESRCH 才是已退出。
+        # 把 EPERM 当死，就会误判「已结束」而去 resume 一个还在跑的会话。
+        with mock.patch.object(ca.os, "kill", side_effect=PermissionError):
+            self.assertTrue(ca.pid_alive(1))
+
+    def test_只看当前用户的进程_别人的codex不进候选集(self):
+        # 本机有别的用户同时在跑 codex，不限用户的话 stop 会把 SIGINT 打到别人身上。
+        # 没法真拿别人的账号起进程，就反过来做：把「当前用户」换成别人，
+        # 我们自己这个 comm=codex、argv 对得上的进程就该落选。
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        pathlib.Path(mark).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, mark)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid)   # 前提：本来找得到
+            with mock.patch.object(ca.os, "getuid", return_value=os.getuid() + 12345):
+                self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    @staticmethod
+    def _argv_of(pid):
+        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
+
+    def _wait_argv(self, proc, needle):
+        """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                if needle in self._argv_of(proc.pid):
+                    return
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            time.sleep(0.05)
+        self.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
+
+    @staticmethod
+    def _fake_codex(tmp):
+        """把一个真二进制命名成 codex —— comm 就会报 codex。"""
+        fake = tmp / "codex"
+        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
+        fake.chmod(0o755)
+        return fake
+
+    def test_只认comm是codex的进程_别的进程不算(self):
+        # 2026-09-19 实测：按报告路径反查会命中发命令的 bash 自己（comm=bash），
+        # comm 过滤是承重的，不是保险。
+        # 陪练进程把报告路径作为 argv 里**独立一项**传进去，和 codex 的 `-o <路径>`
+        # 形状一致——否则测到的只是「没匹配上」，不是「comm 把它挡住了」。
+        mark = "/tmp/codex-agent-selftest-不存在的报告.md"
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
+        try:
+            self._wait_argv(proc, mark)
+            self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_comm真是codex的进程会被找到_反向也要成立(self):
+        # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        pathlib.Path(mark).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, mark)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_报告路径必须是argv里独立一项_出现在brief正文里不算(self):
+        """brief 是 codex argv 里的最后一项，正文里完全可能提到别的任务的报告路径。
+
+        按子串匹配的话那就成了误命中：这个进程干的根本不是那个任务，
+        却会被 status 报成 running、被 stop 打中、让 run 以「还在跑」误拒。
+        报告路径在 codex 的 argv 里正好是独立一项（`-o <路径>`），
+        所以比对必须是**元素相等**，不是子串包含。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mine = str(tmp / "reports" / "mine.md")
+        others = str(tmp / "reports" / "others.md")
+        pathlib.Path(mine).write_text("")
+        brief = f"请参考 {others} 里的结论再动手"      # 别的任务的报告路径只出现在正文里
+        proc = subprocess.Popen([str(fake), "-f", mine, brief], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, brief)
+            self.assertEqual(ca.find_codex_pid(mine), proc.pid)   # 前提：自己找得到自己
+            self.assertIsNone(ca.find_codex_pid(others))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_任务名里的点不是通配符_不许命中别的任务(self):
+        """任务名里的 `.` 绝不能被当成通配符。
+
+        旧实现用 `pgrep -f <报告路径>`，而那是**正则**：任务名 `a` 的
+        `…/reports/a.md` 会命中任务 `aXmd` 的 `…/reports/aXmd.md`
+        （`a` + 任意字符 + `md`）——2026-09-19 实测 `pgrep -f …/a.md` 确实
+        返回了 aXmd 那个进程的 pid。
+        后果是实打实的：`codex-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
+        而 `run --task a` 会被「还在跑」误拒。
+        所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        victim = str(tmp / "reports" / "aXmd.md")   # 任务 aXmd 的报告路径
+        hunter = str(tmp / "reports" / "a.md")      # 任务 a 的报告路径
+        pathlib.Path(victim).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", victim], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, victim)
+            # 前提：它找得到自己，否则下面那条断言是空的
+            self.assertEqual(ca.find_codex_pid(victim), proc.pid)
+            self.assertIsNone(ca.find_codex_pid(hunter))
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
+    """SKILL.md 的验收判据：已由代码保证的约束，一条都不许在文档里再说一遍。
+
+    把文档约定变成硬约束，正是这个项目的主张本身——所以这条判据自己也得是
+    一条测试，而不是又一句靠人记住的约定。
+    每多说一遍就是第二个家：改了代码忘了改文档，文档就开始说假话，
+    而读文档的人没有任何办法发现。
+    """
+
+    # 左边是模式，右边是「这条约束现在住在代码的哪儿」
+    OWNED_BY_CODE = {
+        r"--cd": "build_run_argv / build_resume_argv",
+        r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
+        r"/proc|pgrep|pkill": "find_codex_pid",
+        r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
+        r"mkdir -p": "ensure_isolation",
+        r"--color": "build_run_argv（resume 不认它）",
+        r"CODEX_HOME|CODEX_SQLITE_HOME": "codex_env",
+        r"--sandbox|sandbox_mode": "build_run_argv / build_resume_argv",
+        r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
+        r"session id|session_id": "extract_session_id / 元数据",
+        r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
+    }
+
+    def test_没有一条代码级约束泄漏进文档(self):
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        leaked = {pat: owner for pat, owner in self.OWNED_BY_CODE.items()
+                  if re.search(pat, skill)}
+        self.assertEqual(leaked, {},
+                         "这些约束已经由代码保证，文档里不该再说一遍："
+                         + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
+
+    def test_文档仍然保留代码替不了的那部分(self):
+        """反向守一道：别为了让上面那条变绿，把该留的也删了。
+
+        断言的是**具体内容**，不是「某个词出现过」——后者近乎空测试：
+        把 effort 分档表整张删掉，`--effort low` 那行还在，`effort` 这个词
+        照样搜得到（实测这条突变存活过）。
+        """
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        # 五个难度档位一个都不能少：派什么活用哪档，是判断力，代码替不了
+        for tier in ca.EFFORTS:
+            with self.subTest(tier=tier):
+                self.assertIn(tier, skill)
+        # 四条命令都得在，否则调用方不知道有这些能力
+        for cmd in ("run", "status", "resume", "stop"):
+            with self.subTest(cmd=cmd):
+                self.assertIn(f"codex-agent {cmd}", skill)
+        # 三件代码保证不了、只能靠调用方知道的事
+        self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
+        self.assertIn("brief", skill)               # brief 只收文件路径
+        for code in ("0", "1", "3", "4"):           # 退出码是对外契约
+            with self.subTest(code=code):
+                self.assertIn(f"`{code}`", skill)
+
+
+class TestTaskName(unittest.TestCase):
+    def test_收正常任务名(self):
+        for good in ("smoke-2026-09-19", "a.b_c", "T1"):
+            with self.subTest(good=good):
+                self.assertEqual(ca.task_name(good), good)
+
+    def test_拒会咬到文件系统的字符(self):
+        # 任务名会被直接拼成三个文件名：`a/b` 写不出文件、`../x` 写到 tasks/ 外面。
+        # （`a|b` 这类正则元字符曾经还会咬反查，那条已经由 /proc 精确匹配解决，
+        #   但限制保留——文件名这条理由依然成立。）
+        for bad in ("../escape", "a/b", "a|b", "fix(api)", "", "a b"):
+            with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
+                ca.task_name(bad)
+
+
+class TestParser(_HomeSandbox):
+    def test_run的五个参数一个都不能少(self):
+        parser = ca.build_parser()
+        for missing in ["--task", "--dir", "--brief", "--effort", "--account"]:
+            argv = ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
+                    "--effort", "low", "--account", "default"]
+            i = argv.index(missing)
+            del argv[i:i + 2]
+            with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_effort五个档位都收(self):
+        parser = ca.build_parser()
+        for e in ca.EFFORTS:
+            with self.subTest(effort=e):
+                args = parser.parse_args(["run", "--task", "t", "--dir", "/tmp",
+                                          "--brief", "b.md", "--effort", e, "--account", "default"])
+                self.assertEqual(args.effort, e)
+
+    def test_effort只收这五个档位(self):
+        parser = ca.build_parser()
+        # codex 对 `-c model_reasoning_effort=bogus` 静默接受、banner 照打，
+        # argparse 的 choices 是唯一守门员
+        for bad in ("中等", "ultra", "minimal"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
+                                   "--effort", bad, "--account", "default"])
+
+    def test_任务名校验挂在四个子命令上_结构上绕不过(self):
+        parser = ca.build_parser()
+        for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
+                      "--effort", "low", "--account", "default"],
+                     ["status", "a|b"], ["resume", "a|b", "--brief", "b.md", "--effort", "low"],
+                     ["stop", "a|b"]):
+            with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_resume和stop不收account_账号是查出来的(self):
+        parser = ca.build_parser()
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "low",
+                               "--account", "default"])
+
+    def test_不提供会造成误用的参数(self):
+        """这六个参数是**刻意不提供**的，各有各的理由：
+
+        | 参数 | 为什么不给 |
+        |---|---|
+        | `--timeout` | 会误杀正当的长任务。codex 动辄跑几十分钟，没有一个安全的默认值 |
+        | `--background` | 后台与否由调用方的 `Bash(run_in_background)` 决定，工具自己加只会变成孤儿进程 |
+        | `-o` | 报告路径由工具派生（`<隔离目录>/reports/<任务>.md`）。让调用方指定就会落进仓库、被 `git add -A` 收走 |
+        | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
+        | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
+        | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
+
+        前两个是「会造成误用」，后四个是「由工具派生」。
+        """
+        parser = ca.build_parser()
+        for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
+                                   "--effort", "low", "--account", "default", bad, "x"])
+
+
+class TestRunGuards(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    def _args(self, **over):
+        argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
+                "--brief", over.get("brief", str(self.brief)), "--effort", "low", "--account", "default"]
+        return ca.build_parser().parse_args(argv)
+
+    def test_dir不是目录就拒跑(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(dir=str(self.home / "没有这个目录")))
+        self.assertIn("不是目录", cm.exception.message)
+
+    def test_护栏拒绝的退出码和codex失败不同码(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(dir=str(self.home / "没有这个目录")))
+        self.assertEqual(cm.exception.code, ca.USAGE_ERROR)
+        self.assertNotEqual(cm.exception.code, ca.EXIT["failed"])
+
+    def test_brief不是文件就拒跑(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(brief=str(self.home / "没有这个文件.md")))
+        self.assertIn("brief", cm.exception.message)
+
+    def test_同名任务还在跑就拒绝(self):
+        ca.write_meta(ca.ensure_isolation("default"), "t", _full_meta("t"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_run(self._args(task="t"))
+        self.assertIn("还在跑", cm.exception.message)
+
+    def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+        ca.write_meta(ca.ensure_isolation("acct2"), "t", _full_meta("t", account="acct2"))
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(task="t"))
+        self.assertIn("acct2", cm.exception.message)
+
+    def test_开跑前删掉上一轮的报告_否则旧报告会被判成本轮成功(self):
+        d = ca.ensure_isolation("default")
+        (d / "reports" / "t.md").write_text("上一轮的报告")
+        with _no_codex() as popen:
+            ca.cmd_run(self._args(task="t"))
+        self.assertTrue(popen.called)
+        self.assertFalse((d / "reports" / "t.md").exists())
+
+    def test_dir相对路径被转成绝对_相对路径启动即崩(self):
+        # --cd 给相对路径，codex 启动即崩（log 无 banner + os error 2）。
+        # 转绝对这一步要是没了，工具就把这个坑原样传给了 codex。
+        ca.ensure_isolation("default")
+        seen = {}
+        os.chdir(self.home)
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        def grab(*a, **k):
+            seen["argv"] = a[0]
+            return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
+
+        with _no_codex() as popen:
+            popen.side_effect = grab
+            ca.cmd_run(args)
+        cd = seen["argv"][seen["argv"].index("--cd") + 1]
+        self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
+        self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
+
+    def test_run也要校验隔离不变量_resume那一半补过了这一半漏了(self):
+        # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
+        # 这条没人守的话，config.toml 被软链回主配置、auth.json 指错账号，
+        # 主路径上全查不出来——而主路径才是绝大多数运行走的那条。
+        d = ca.ensure_isolation("default")
+        (d / "config.toml").unlink()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(task="t"))
+        self.assertIn("软链", cm.exception.message)
+
+    def test_同账号已结束的同名任务允许复用_只提示不拒绝(self):
+        # 刻意不一律拒绝：工具没有清理命令，一律拒绝等于任务名一次性，
+        # tasks/ 只能手工去删。已结束 + 同账号这一格是安全的——报告会被清掉、
+        # 日志是追加的，历史不丢。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex() as popen:
+            ca.cmd_run(self._args(task="t"))
+        self.assertTrue(popen.called, "同账号、已结束的同名任务被拒了，它应该允许复用")
+
+    def test_开跑前三件事全在spawn之前做完(self):
+        # 顺序反了每一件都会坏事：
+        #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
+        #   写元数据在 spawn 之后 -> 中途炸了就留下一个没人管的孤儿 codex
+        #   写分隔符在 spawn 之后 -> 同上，而且判据会把上一轮的错误算到这一轮头上
+        d = ca.ensure_isolation("default")
+        (d / "reports" / "t.md").write_text("上一轮的报告")
+        (d / "logs" / "t.log").write_text("上一轮的日志\n")
+        seen = {}
+
+        def snapshot(*a, **k):
+            seen["旧报告还在"] = (d / "reports" / "t.md").exists()
+            seen["元数据已落盘"] = ca.meta_path(d, "t").exists()
+            seen["分隔符已写入"] = ca.ROUND_MARK in (d / "logs" / "t.log").read_text()
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = snapshot
+            ca.cmd_run(self._args(task="t"))
+        self.assertEqual(seen, {"旧报告还在": False, "元数据已落盘": True, "分隔符已写入": True})
+
+    def test_日志是追加的_上一轮的内容不会被冲掉(self):
+        d = ca.ensure_isolation("default")
+        (d / "logs" / "t.log").write_text("上一轮的日志\n")
+        with _no_codex():
+            ca.cmd_run(self._args(task="t"))
+        text = (d / "logs" / "t.log").read_text()
+        self.assertIn("上一轮的日志", text)
+        self.assertIn(ca.ROUND_MARK, text)
+
+
+class TestResumeGuards(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        self.brief = self.home / "b.md"
+        self.brief.write_text("再来")
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+
+    def _args(self, task):
+        return ca.build_parser().parse_args(
+            ["resume", task, "--brief", str(self.brief), "--effort", "low"])
+
+    def test_任务不存在就报错(self):
+        # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
+        # 否则测到的是 argparse 的拒绝，不是 cmd_resume 的
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_resume(self._args("no-such-task"))
+        self.assertIn("没有这个任务", cm.exception.message)
+
+    def test_还在跑就拒绝resume_写锁冲突和SIGTERM锁死长得一样(self):
+        ca.write_meta(ca.ensure_isolation("default"), "t",
+                      _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_resume(self._args("t"))
+        self.assertIn("还在跑", cm.exception.message)
+
+    def test_没有session_id就拒绝(self):
+        ca.write_meta(ca.ensure_isolation("default"), "t2",
+                      _full_meta("t2", dir=str(self.workdir)))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_resume(self._args("t2"))
+        self.assertIn("session id", cm.exception.message)
+
+    def test_工作目录没了就拒绝_run校验了resume也得校验(self):
+        # worktree 被删后照样拼命令，codex 会以 os error 2 当场崩——
+        # 和 `--cd` 给相对路径同款症状，而 run 那条路是被人话拒绝的
+        ca.write_meta(ca.ensure_isolation("default"), "t4",
+                      _full_meta("t4", session_id="s1", dir=str(self.home / "已经删了的worktree")))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_resume(self._args("t4"))
+        self.assertIn("不在了", cm.exception.message)
+
+    def test_resume也要校验隔离不变量(self):
+        # 隔离不变量**每次 run 和 resume 都要校验**，两条路缺一条洞就还在。
+        # resume 这条路上不查的话，config.toml 被软链回主配置、auth.json 指错
+        # 账号，全都查不出来——而这种失效是静默的：跑起来一切正常，
+        # 只是 codex 看得见它不该看见的东西。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
+        (d / "config.toml").unlink()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_resume(self._args("t5"))
+        self.assertIn("软链", cm.exception.message)
+
+    def test_resume会刷新started_at_元数据描述的是最后一次调用(self):
+        # 完整的轮次历史在日志的分隔符里，元数据只描述最后一次
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t6", _full_meta("t6", session_id="s1", dir=str(self.workdir),
+                                          started_at="2020-01-01T00:00:00"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+            ca.cmd_resume(self._args("t6"))
+        meta = json.loads(ca.meta_path(d, "t6").read_text())
+        self.assertNotEqual(meta["started_at"], "2020-01-01T00:00:00")
+
+    def test_resume开跑前也要删报告_秒死于写锁时才不会误判成功(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
+        (d / "reports" / "t3.md").write_text("上一轮的报告")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+            ca.cmd_resume(self._args("t3"))
+        self.assertFalse((d / "reports" / "t3.md").exists())
+
+
+class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
+    """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
+
+    `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
+    不证明「run 和 resume 真的调了它」。把两处都换成裸 `read_text()` 的突变
+    曾经**全部存活**——一条印出去的承诺，没有任何东西守着。
+
+    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），
+    这句是内容层的第二道：万一哪天隔离被绕开，brief 里这句还在。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    @staticmethod
+    def _brief_codex_actually_got(run_it):
+        """codex argv 的最后一项就是 brief 正文。"""
+        seen = {}
+
+        def grab(*a, **k):
+            seen["argv"] = a[0]
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = grab
+            run_it()
+        return seen["argv"][-1]
+
+    def test_run这条路(self):
+        ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
+
+    def test_resume这条路(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
+
+
+class TestExitCodeContract(_HomeSandbox):
+    """退出码是这个工具相对旧 skill 的最大增量，也是 SKILL.md 印出去的对外契约。
+
+    这里断言的全是**绝对值**。写成 `assertEqual(cmd(...), ca.EXIT["running"])`
+    是空测试：常量一改两边一起动，`EXIT["running"] = 0` 这种突变照样绿——
+    而那正是「还在跑」被当成功、`status && deploy` 提前部署的那个 bug。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    def _run_args(self):
+        return ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+
+    def _resume_args(self):
+        return ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+
+    def _spawner(self, d, report_text, log_extra):
+        """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
+        def spawn(*a, **k):
+            if report_text is not None:
+                (d / "reports" / "t.md").write_text(report_text)
+            if log_extra:
+                with open(d / "logs" / "t.log", "a") as f:
+                    f.write(log_extra + "\n")
+            return mock.DEFAULT
+        return spawn
+
+    def _run(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_run(self._run_args())
+
+    def _resume(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_resume(self._resume_args())
+
+    UNCLASSIFIED = ("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                    "Failed to create session: thread-store conflict")
+
+    def test_退出码的绝对值是对外契约(self):
+        self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3, "running": 4})
+        self.assertEqual(ca.USAGE_ERROR, 2)
+        # 护栏拒绝必须和四个判据结论都区分得开
+        self.assertNotIn(ca.USAGE_ERROR, ca.EXIT.values())
+
+    def test_run_正常收尾退出0(self):
+        self.assertEqual(self._run("干完了"), 0)
+
+    def test_run_没留下报告退出1(self):
+        self.assertEqual(self._run(None), 1)
+
+    def test_run_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._run("干完了", self.UNCLASSIFIED), 3)
+
+    def test_resume_正常收尾退出0(self):
+        self.assertEqual(self._resume("干完了"), 0)
+
+    def test_resume_没留下报告退出1(self):
+        self.assertEqual(self._resume(None), 1)
+
+    def test_resume_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._resume("干完了", self.UNCLASSIFIED), 3)
+
+    def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        args = ca.build_parser().parse_args(["status", "t"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+            self.assertEqual(ca.cmd_status(args), 4)
+
+    def test_status_一个任务都没有时退出0_查询没查到不是失败(self):
+        args = ca.build_parser().parse_args(["status"])
+        self.assertEqual(ca.cmd_status(args), 0)
+
+    def test_多任务取最该拦住调用方的那个(self):
+        # 四个状态的相对顺序全部钉死：少钉一对，_SEVERITY 就能被悄悄重排。
+        # failed 排在最后＝最该拦住调用方：它需要人现在就看，而 running 只需要等。
+        self.assertEqual(ca._worse("suspect", "failed"), "failed")
+        self.assertEqual(ca._worse("failed", "suspect"), "failed")
+        self.assertEqual(ca._worse("running", "failed"), "failed")
+        self.assertEqual(ca._worse("suspect", "running"), "suspect")
+        self.assertEqual(ca._worse("success", "running"), "running")
+        self.assertEqual(ca._worse("success", "success"), "success")
+
+
+class TestRunCodexOwnsReportPath(unittest.TestCase):
+    """`run_codex` 自己拥有报告路径，不接受调用方算好的 argv。
+
+    原签名是 `run_codex(argv, env, home, task, kind, meta)`：argv 由调用方拼，
+    而 run_codex 又自己重新推导报告路径去删。三条「必须记得对齐」没有任何东西
+    保证——argv 里的 `-o`、被删的那个文件、元数据的文件名。三条一起违反时它
+    一声不吭：clear_report 删了别的文件（防陈旧报告这条 P0 静默失效）、
+    日志分隔符说谎、元数据内容和文件名对不上。
+    改成回传报告路径之后，这三条在结构上就违反不了了。
+    """
+
+    def _dir(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        return d
+
+    def test_拼命令用的报告路径就是它要删的那一个(self):
+        d = self._dir()
+        seen = {}
+
+        def make_argv(report_path):
+            seen["给调用方的"] = report_path
+            return ["codex"]
+
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), make_argv)
+        self.assertEqual(seen["给调用方的"], str(ca._report_path(d, "t")))
+
+    def test_跑完之后信号处置被还原(self):
+        """改全局信号处置而不还原，等于把本函数的副作用留给整个进程的余生。
+
+        审查认为「CLI 里跑完就退出，不可达，按奥卡姆可议」——那只看了 CLI 那条路。
+        单测是在进程内**直接调** run_codex 的第二个调用方：不还原的话，测试进程
+        余生都带着指向一个已死 Popen 的 handler，再也响应不了 Ctrl-C。
+        """
+        d = self._dir()
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        before = {s: signal.getsignal(s) for s in watched}
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual({s: signal.getsignal(s) for s in watched}, before)
+
+    def test_环境变量由home派生_调用方传不进一个对不上的(self):
+        d = self._dir()
+        with _no_codex() as popen:
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(d))
+
+
+class TestSignalSafety(unittest.TestCase):
+    """codex 只能死于 INT——这是整个工具最不能出错的一条保证。"""
+
+    def _run_once(self, popen):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        popen.return_value.stdout.read1.return_value = b""
+        popen.return_value.wait.return_value = 0
+        ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+
+    def test_codex起在独立会话里_组信号打不到它(self):
+        with mock.patch.object(ca.subprocess, "Popen") as popen:
+            self._run_once(popen)
+        self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+
+    def test_stdin接DEVNULL_否则codex等stdin永久挂死(self):
+        # 日志只剩 "Reading additional input from stdin" + 进程 0% CPU，
+        # 而那种 log 和「还在思考」长得一模一样，判不出来。
+        with mock.patch.object(ca.subprocess, "Popen") as popen:
+            self._run_once(popen)
+        self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_包装器收到SIGTERM时向codex转发的是SIGINT(self):
+        with mock.patch.object(ca.subprocess, "Popen") as popen, \
+             mock.patch.object(ca.signal, "signal") as sigsig:
+            self._run_once(popen)
+            handled = {c.args[0] for c in sigsig.call_args_list}
+            self.assertEqual(handled, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
+            sigsig.call_args_list[0].args[1](signal.SIGTERM, None)
+        popen.return_value.send_signal.assert_called_with(signal.SIGINT)
+
+
+class TestRunCodexStreaming(unittest.TestCase):
+    def test_banner一出来就把session_id落盘_不等攒满缓冲区(self):
+        """假 codex 只打一行 banner（约 50 字节）然后睡 30 秒，不到 EOF。
+
+        用 `read(1024)` 的话父进程会一直阻塞到凑满 1024 字节或 EOF，这一行永远
+        到不了元数据——实测子进程 t=0 就 flush 了 172 字节，父进程 4.06 秒（EOF
+        时）才看到。后果连锁：屏幕不刷新 → 日志全程 0 字节（status 的日志判据在
+        运行期完全失效）→ session_id 从来没写进元数据 → 包装进程一被杀，
+        cmd_resume 只能报「没记到 session id」，上下文全丢。
+        `run_codex` 在这里必须跑在**子进程的主线程**里：它要装信号 handler，
+        而 signal.signal 在非主线程会直接 ValueError。
+        """
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        fake_codex = ("import sys,time;"
+                      "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n');"
+                      "sys.stdout.flush();time.sleep(30)")
+        driver = (
+            "import json,os,pathlib,sys;"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r});"
+            "import codex_agent as ca;"
+            f"d = pathlib.Path({str(d)!r});"
+            f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
+            f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
+        )
+        # 屏幕这一路也接到文件上一起验。接的是文件不是 tty，Python 默认块缓冲，
+        # 所以「这行现在就能读到」只可能来自 sys.stdout.buffer.flush()——
+        # 而 SKILL.md 承诺的「面板可监控」全靠它。
+        screen = d / "screen.out"
+        with open(screen, "wb") as out:
+            proc = subprocess.Popen([sys.executable, "-c", driver],
+                                    stdout=out, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 8
+            got = None
+            while time.time() < deadline:
+                meta_file = d / "tasks" / "t.json"
+                if meta_file.exists():
+                    got = json.loads(meta_file.read_text())["session_id"]
+                    if got:
+                        break
+                if proc.poll() is not None:
+                    self.fail(f"驱动进程提前退出：{proc.stderr.read().decode()}")
+                time.sleep(0.05)
+            self.assertEqual(got, "01a0b408-f718-7ff3-8123-d5202551acba")
+            # 假 codex 还睡着、远没到 EOF，此刻日志和屏幕都必须已经有内容
+            self.assertIsNone(proc.poll(), "驱动进程已经退出了，那这条测的就不是实时性")
+            self.assertIn("session id", (d / "logs" / "t.log").read_text())
+            self.assertIn("session id", screen.read_text())
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stderr.close()
+
+
+class TestStop(_HomeSandbox):
+    def test_只发SIGINT_绝不发SIGTERM(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        args = ca.build_parser().parse_args(["stop", "t"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca.os, "kill") as k:
+            ca.cmd_stop(args)
+        k.assert_called_once_with(4242, signal.SIGINT)
+
+
+class TestSignalSafetyRealProcesses(unittest.TestCase):
+    """用真进程、真信号验证整个工具最不能出错的那条保证：
+
+    **无论谁用什么信号停包装器，codex 收到的永远只有 INT。**
+    这条保证由两件事合起来兑现，缺一个洞就还在：
+      ① `start_new_session=True` 把 codex 挡在组信号之外
+      ② 包装器给 TERM／INT／HUP 都装 handler，统一转发 INT
+    它之所以是死线：SIGTERM 之后 codex 的 thread 会被**永久锁死**，
+    之后 resume 永远报 thread-store conflict，等多久都不释放，上下文全丢。
+    上面 TestSignalSafety 用 mock 验的是「参数传对了没」，这里验的是
+    「传对了之后，内核那一层真的照做了没」——这两件事不是一回事。
+
+    假 codex 必须**把收到的每一个信号都记下来**，而不是收到第一个就退出：
+    CPython 派发待处理信号是按信号编号**从小到大**扫的，SIGINT(2) 永远排在
+    SIGTERM(15) 前面。所以「收到第一个就退出」的写法在 codex 同时挨了 TERM 和
+    INT 时照样只记到 INT——测试会在 start_new_session 被删掉时照样绿。
+    实测过：那样写的版本，去掉 start_new_session 和改成转发 TERM 两个突变都杀不掉。
+    """
+
+    FAKE_CODEX = (
+        "import signal,sys,time\n"
+        "mark = sys.argv[1]\n"
+        "got = []\n"
+        "def record(signum, frame):\n"
+        "    got.append(signal.Signals(signum).name)\n"
+        "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
+        "    signal.signal(s, record)\n"
+        "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n')\n"
+        "sys.stdout.flush()\n"
+        "deadline = time.time() + 30\n"
+        "while time.time() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "    if got:\n"
+        "        time.sleep(0.5)\n"           # 等一等，把同一发组信号里的其它信号收全
+        "        open(mark, 'w').write(','.join(sorted(set(got))))\n"
+        "        sys.exit(0)\n"
+        "open(mark, 'w').write('(超时：什么信号都没收到)')\n"
+    )
+
+    def test_向包装器的进程组发TERM_codex只会收到INT(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        mark = d / "codex收到的信号.txt"
+        driver = (
+            "import os,pathlib,sys\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import codex_agent as ca\n"
+            f"ca.run_codex('run', pathlib.Path({str(d)!r}), 't', {_full_meta('t')!r},"
+            f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}])\n"
+        )
+        # 包装器自己起在独立会话里，这样 killpg 只打到它那一组，不会波及测试进程
+        proc = subprocess.Popen([sys.executable, "-c", driver],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                f = d / "tasks" / "t.json"
+                if f.exists() and json.loads(f.read_text())["session_id"]:
+                    break
+                if proc.poll() is not None:
+                    self.fail(f"包装器提前退出：{proc.stderr.read().decode()}")
+                time.sleep(0.05)
+            else:
+                self.fail("假 codex 没起来，本测试无法验证信号，不能算通过")
+
+            # harness 停掉后台 Bash 任务就是这么干的：向整个进程组发 TERM
+            os.killpg(proc.pid, signal.SIGTERM)
+
+            deadline = time.time() + 10
+            while time.time() < deadline and not mark.exists():
+                time.sleep(0.05)
+            self.assertTrue(mark.exists(), "假 codex 什么信号都没收到——转发没装上")
+            self.assertEqual(mark.read_text(), "SIGINT",
+                             "codex 收到了 INT 以外的信号——会话会被永久锁死")
+            # 转发的同时要在日志里留下痕迹，否则下一个读判据的人只会看到
+            # 「报告缺失＝没正常收尾」，而正确处置其实是 resume
+            deadline = time.time() + 5
+            log = d / "logs" / "t.log"
+            while time.time() < deadline and ca.INTERRUPT_MARK not in log.read_text():
+                time.sleep(0.05)
+            self.assertIn(ca.INTERRUPT_MARK, log.read_text())
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+            proc.stderr.close()
