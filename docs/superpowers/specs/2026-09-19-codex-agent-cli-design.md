@@ -319,10 +319,24 @@ codex 填的字段。而且实测 156 份真实报告只有 4 份能解析成 JS
 
 ## 10. 测试
 
-| 层 | 内容 | 成本 |
-|---|---|---|
-| 单测（stdlib `unittest`） | 参数校验、隔离目录不变量（含 config.toml 软链拒绝）、判据函数（用真实 log 片段做 fixture：cargo error／pytest E／markdown 标题 **不得**判成 ERROR；`ERROR: Reconnecting` 判良性；`ERROR: You've hit your usage limit` 判 reason）、argv 组装、session id 提取（带 ANSI） | 零 token |
-| 端到端冒烟 | 一次 `--effort low` 的真任务，验证起→收尾→判据→resume 全链路 | 一次低档调用 |
+纯函数与护栏全部单测覆盖（stdlib `unittest`，零依赖、零 token）：
+
+| 测什么 | 关键点 |
+|---|---|
+| 三种错误形式 | 形式 A/B/C 各认得出；cargo 的 `error[E0599]`、pytest 的 `E   KeyError`、markdown 的 `## Warning Signs`、brief 里的 `**Test errors?**` **一个都不许命中**；良性 target 白名单生效；`Error:` 大写那条不能漏 |
+| 报告防陈旧 | 预置一份旧报告 → 跑 → 断言旧内容没了 |
+| 任务名字符集 | `../escape`、`a/b`、`a\|b`、`fix(api)` 四个全被拒 |
+| 信号 | `start_new_session=True` 传了；SIGTERM 进来转发出去的是 **SIGINT** |
+| tee 实时性 | 子进程一输出就落盘，不等凑满缓冲（否则 session id 写不进元数据） |
+| PID 反查 | 用**真的活着**、argv 含报告路径的进程验 `comm` 过滤；**先断言 pgrep 确实命中了它**，否则这个测试是空的 |
+| 隔离不变量 | config.toml 软链拒跑、已有 config 不被覆盖、auth.json 指错账号会被改回来、`~/.agents/skills/` 非空拒跑 |
+| 参数强制显式 | `run` 五个参数少一个就退出；effort 五档正反都验；六个「不提供的参数」逐个被拒 |
+
+**空测试比没测试更糟。** 凡是依赖外部进程／文件的测试，都要先断言前提成立
+（2026-09-19 的教训：`sleep 5 <mark>` 里 sleep 收到多余参数会立即退出，
+于是那个测试把承重的 `comm` 过滤整个删掉都照样绿）。
+
+端到端冒烟：一次 `--effort low` 的真任务，验证起→收尾→判据→resume 全链路。
 
 ## 11. 迁移
 
@@ -334,4 +348,6 @@ codex 填的字段。而且实测 156 份真实报告只有 4 份能解析成 JS
    顺序不能倒：软链指向工作树的话，工作树一删命令就断。
    脚本需 `#!/usr/bin/env python3` 且有可执行位，这两样都显式做，不靠默认。
    端到端冒烟在改名前用 `python3 <绝对路径>/codex_agent.py` 调用，验的是同一份代码。
-4. 端到端冒烟通过后，删除本 spec 与计划文档。
+4. 端到端冒烟通过后，先由子代理核对 **spec／plan／code／doc 四者对齐**且
+   **每一项真的做完了**，确认后再把知识内化进代码注释与 `SKILL.md`，最后删除本 spec 与计划文档。
+   判据是「事情真的做完了」，不是「我认为内化完了」——文档一删，连「还差什么」都查不回来。
