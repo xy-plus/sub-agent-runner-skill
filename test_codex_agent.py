@@ -1,8 +1,12 @@
+import argparse
+import json
 import os
 import pathlib
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -29,6 +33,38 @@ HEADER = ("Reading additional input from stdin...\n"
           "\x1b[1mworkdir:\x1b[0m /home/xy/repo\n"
           "\x1b[1msession id:\x1b[0m 01a0b408-f718-7ff3-8123-d5202551acba\n"
           "--------\n")
+
+
+def _full_meta(task, **over):
+    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
+    meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
+            "session_id": None, "started_at": "2026-09-19T00:00:00"}
+    meta.update(over)
+    return meta
+
+
+class _HomeSandbox(unittest.TestCase):
+    """把 HOME 整个搬进临时目录。
+
+    两个 patch 缺一不可：`Path.home()` 和 `Path.expanduser()` 是两条路——
+    后者走 os.path.expanduser 读 $HOME，不受 Path.home 的 patch 影响，
+    而 cmd_run 里就有 .expanduser()。
+    """
+
+    def setUp(self):
+        self.home = pathlib.Path(tempfile.mkdtemp())
+        self.patches = [
+            mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home)),
+            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+        ]
+        for q in self.patches:
+            q.start()
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}")
+
+    def tearDown(self):
+        for q in reversed(self.patches):
+            q.stop()
 
 
 class TestStripAnsi(unittest.TestCase):
@@ -168,19 +204,17 @@ class TestJudge(unittest.TestCase):
     def test_清报告对还没有报告的任务也成立(self):
         ca.clear_report(self.report)   # 不存在也不许抛
 
+    def test_非UTF8的报告不许把判据打崩(self):
+        # codex 被 SIGINT 打断时可能只写出半截字节
+        self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
 
-class TestIsolation(unittest.TestCase):
+
+class TestIsolation(_HomeSandbox):
     def setUp(self):
-        self.home = pathlib.Path(tempfile.mkdtemp())
-        self.p = mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home))
-        self.p.start()
-        (self.home / ".codex").mkdir()
-        (self.home / ".codex" / "auth.json").write_text("{}")
+        super().setUp()
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
-
-    def tearDown(self):
-        self.p.stop()
 
     def test_账号可选项来自实际目录扫描(self):
         self.assertEqual(ca.account_choices(), ["default", "acct2"])
@@ -214,17 +248,24 @@ class TestIsolation(unittest.TestCase):
 
     def test_共享扫描根非空就拒跑_CODEX_HOME管不到它(self):
         (self.home / ".agents" / "skills" / "某个skill").mkdir(parents=True)
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(ca.Rejected) as cm:
             ca.ensure_isolation("default")
-        self.assertIn("某个skill", str(cm.exception))
+        self.assertIn("某个skill", cm.exception.message)
+
+    def test_auth指错账号时被改回来(self):
+        d = ca.ensure_isolation("default")
+        (d / "auth.json").unlink()
+        (d / "auth.json").symlink_to(self.home / ".codex-accounts" / "acct2" / "auth.json")
+        ca.ensure_isolation("default")
+        self.assertEqual(os.readlink(d / "auth.json"), str(self.home / ".codex" / "auth.json"))
 
     def test_config是软链就拒跑_隔离会失效(self):
         d = self.home / ".codex-subagent"
         d.mkdir()
         (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(ca.Rejected) as cm:
             ca.ensure_isolation("default")
-        self.assertIn("软链", str(cm.exception))
+        self.assertIn("软链", cm.exception.message)
 
     def test_已有的config不被覆盖(self):
         d = self.home / ".codex-subagent"
@@ -235,9 +276,9 @@ class TestIsolation(unittest.TestCase):
 
     def test_账号没登录态就拒跑(self):
         (self.home / ".codex-accounts" / "acct3").mkdir()
-        with self.assertRaises(SystemExit) as cm:
+        with self.assertRaises(ca.Rejected) as cm:
             ca.ensure_isolation("acct3")
-        self.assertIn("登录", str(cm.exception))
+        self.assertIn("登录", cm.exception.message)
 
 
 class TestArgv(unittest.TestCase):
@@ -279,32 +320,41 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
 
 
-class TestMeta(unittest.TestCase):
-    def setUp(self):
-        self.home = pathlib.Path(tempfile.mkdtemp())
-        self.p = mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home))
-        self.p.start()
-        (self.home / ".codex").mkdir()
-        (self.home / ".codex" / "auth.json").write_text("{}")
-
-    def tearDown(self):
-        self.p.stop()
-
-    def test_元数据写入后能跨隔离目录查回来(self):
+class TestMeta(_HomeSandbox):
+    def test_元数据写入后能跨隔离目录查回来_home走返回值不是魔法键(self):
         d = ca.ensure_isolation("default")
-        ca.write_meta(d, "t1", {"task": "t1", "account": "default", "dir": "/abs/x", "effort": "low"})
-        got = ca.find_meta("t1")
-        self.assertEqual(got["dir"], "/abs/x")
-        self.assertEqual(got["_home"], str(d))
+        ca.write_meta(d, "t1", _full_meta("t1", dir="/abs/x"))
+        home, meta = ca.find_meta("t1")
+        self.assertEqual(meta["dir"], "/abs/x")
+        self.assertEqual(home, d)
+        # 魔法键意味着每个写回元数据的地方都得记得剥掉它
+        self.assertNotIn("_home", meta)
 
-    def test_查不到返回None(self):
-        self.assertIsNone(ca.find_meta("不存在的任务"))
+    def test_查不到返回一对None(self):
+        self.assertEqual(ca.find_meta("不存在的任务"), (None, None))
+
+    def test_元数据缺字段就拒绝_不给默认值圆场(self):
+        d = ca.ensure_isolation("default")
+        ca.meta_path(d, "坏的").write_text('{"task": "坏的"}')
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.find_meta("坏的")
+        self.assertIn("缺字段", cm.exception.message)
+
+    def test_同名任务出现在两个隔离目录就拒绝_不许猜(self):
+        # 这条路很好走：撞额度上限 → 换账号重跑同名任务
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+        for account in ("default", "acct2"):
+            ca.write_meta(ca.ensure_isolation(account), "撞名", _full_meta("撞名", account=account))
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.find_meta("撞名")
+        self.assertIn("多个隔离目录", cm.exception.message)
 
     def test_列出全部任务(self):
         d = ca.ensure_isolation("default")
-        ca.write_meta(d, "a", {"task": "a"})
-        ca.write_meta(d, "b", {"task": "b"})
-        self.assertEqual(sorted(m["task"] for m in ca.all_metas()), ["a", "b"])
+        for name in ("a", "b"):
+            ca.write_meta(d, name, _full_meta(name))
+        self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
 
 
 class TestPid(unittest.TestCase):
@@ -346,6 +396,27 @@ class TestPid(unittest.TestCase):
             else:
                 self.fail("pgrep 没命中陪练进程，本测试无法验证 comm 过滤，不能算通过")
             self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_comm真是codex的进程会被找到_反向也要成立(self):
+        # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
+        # 把一个真二进制命名成 codex，ps -o comm= 就会报 codex。
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = tmp / "codex"
+        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
+        fake.chmod(0o755)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        (tmp / "reports" / "t.md").write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and ca.find_codex_pid(mark) is None:
+                time.sleep(0.05)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid)
         finally:
             proc.kill()
             proc.wait()

@@ -5,12 +5,50 @@
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
 """
+import argparse
+import datetime
 import json
 import os
 import pathlib
 import re
+import signal
 import subprocess
+import sys
 from typing import NamedTuple
+
+# 护栏拒绝走独立退出码。裸 `raise SystemExit("人话")` 的退出码是 1，和
+# EXIT["failed"] 撞码——调用方就分不清「--dir 写错了」和「codex 真的失败了」。
+# 用 2 是因为它已经是 argparse 的参数错误码：参数写错和被护栏拒绝本来就是一类事。
+USAGE_ERROR = 2
+
+
+class Rejected(SystemExit):
+    """护栏拒绝。把「人话」和「退出码」绑在一起，让人不可能只写对一半。"""
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(USAGE_ERROR)
+
+
+def reject(message):
+    raise Rejected(message)
+
+
+# 任务名同时是文件名和 pgrep 的匹配模式，两边都会被奇怪字符咬：
+#   `a/b`   写不出文件（裸 FileNotFoundError）
+#   `../x`  写到 tasks/ 外面去
+#   `a|b`   在 `pgrep -f` 里是**正则的或**，会命中任意含 `b` 的进程——
+#           于是 stop 把 SIGINT 发到别人的 codex 上，正是 spec §9 发誓要避免的事
+# 放在 argparse 的 type= 上，四个子命令一个都绕不过去。
+_TASK_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def task_name(value):
+    if not _TASK_NAME.match(value):
+        raise argparse.ArgumentTypeError(
+            "只允许字母、数字、点、下划线、连字符（任务名既是文件名，也是 pgrep 的匹配模式）")
+    return value
+
 
 USAGE_LIMIT_MARK = "You've hit your usage limit"
 THREAD_LOCK_MARK = "already has an active writer"
@@ -127,11 +165,14 @@ def judge(report_path, log_path, pid):
     log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
     round_text = current_round(log_text)
     errors = runtime_error_lines(log_text)
+    # errors="replace"：codex 被 SIGINT 打断时可能只写出半截字节，
+    # 裸 read_text 会 UnicodeDecodeError 把判据整个打崩。
+    report_text = report_path.read_text(errors="replace") if report_path.exists() else ""
 
     # “报告没出现＝没正常收尾”——这是 codex 写 -o 的唯一时机。
     # 前提是每轮开跑前把上一轮的报告删掉（见 clear_report），否则旧报告会被
     # 当成本轮的产物，一次失败的运行会被判成 success。
-    if not report_path.exists() or not report_path.read_text().strip():
+    if not report_text.strip():
         # 两种特判只改 reason、不新增状态：补救手段不同（换账号／新起任务），
         # 但都属于「没正常收尾」这一种事实，状态机不该为此变复杂。
         if USAGE_LIMIT_MARK in round_text:
@@ -149,7 +190,7 @@ def judge(report_path, log_path, pid):
     # 只预览前几行，让调用方自己核对 brief 要的东西在不在——不解析 JSON：实测
     # 156 份真实报告只有 4 份是 JSON，`-o` 写的是 agent 的最后一条消息，通常是
     # markdown 散文。要结构化输出那是 --output-schema 的事。
-    preview = [l for l in report_path.read_text().splitlines() if l.strip()][:REPORT_PREVIEW_LINES]
+    preview = [l for l in report_text.splitlines() if l.strip()][:REPORT_PREVIEW_LINES]
     return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
@@ -206,7 +247,7 @@ def ensure_isolation(account):
     # 而警告会被淹没在几千行 codex 输出里没人看见。
     intruders = sorted(q.name for q in shared_skill_root().iterdir()) if shared_skill_root().is_dir() else []
     if intruders:
-        raise SystemExit(
+        reject(
             f"{shared_skill_root()} 非空：{'、'.join(intruders)}\n"
             f"那是 CODEX_HOME 管不到的共享扫描根，放了东西 codex 就看得见，隔离不成立。清空它再跑。")
 
@@ -216,15 +257,14 @@ def ensure_isolation(account):
     # ~/.codex-subagent 已累积 19 段——校验内容则第二次 run 就失败，重写则抹掉
     # codex 自己的 trust 状态。
     if config.is_symlink():
-        raise SystemExit(
-            f"{config} 是软链——隔离会失效（软链主配置会把 MCP/plugins/hooks 全带回来）。\n"
-            f"请删掉它，重跑本命令会生成一份新的。")
+        reject(f"{config} 是软链——隔离会失效（软链主配置会把 MCP/plugins/hooks 全带回来）。\n"
+               f"请删掉它，重跑本命令会生成一份新的。")
     if not config.exists():
         config.write_text(CONFIG_NOTE)
 
     src = auth_source(account)
     if not src.exists():
-        raise SystemExit(f"账号 {account} 没有登录态（{src} 不存在）。先跑 `codex-acct login {account}`。")
+        reject(f"账号 {account} 没有登录态（{src} 不存在）。先跑 `codex-acct login {account}`。")
     auth = d / "auth.json"
     if not (auth.is_symlink() and auth.resolve() == src.resolve()):
         if auth.exists() or auth.is_symlink():
@@ -288,15 +328,43 @@ def write_meta(home, task, meta):
     meta_path(home, task).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
+# 元数据的形状只在这里定义一次。读回来就校验，之后所有地方放心裸下标——
+# `.get(键, 默认值)` 是默认缺省值，正是本工具要消灭的东西。
+# 刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
+# 留着它只会诱导别人犯这个设计本来要防的错。
+REQUIRED_META_KEYS = ("task", "account", "dir", "effort", "session_id", "started_at")
+
+
+def _load_meta(path):
+    meta = json.loads(path.read_text())
+    missing = [k for k in REQUIRED_META_KEYS if k not in meta]
+    if missing:
+        reject(f"{path} 缺字段 {missing}，元数据坏了——删掉它重新 run")
+    return meta
+
+
 def find_meta(task):
-    """跨所有隔离目录按任务名找。账号是查出来的，不是让调用方再报一遍的。"""
+    """跨所有隔离目录按任务名找，返回 (home, meta)；查不到返回 (None, None)。
+
+    账号是查出来的，不是让调用方再报一遍的。
+    home 走返回值，不塞进 meta 里当 `_home` 魔法键：魔法键意味着每个写回元数据
+    的地方都得记得把它剥掉，而「必须记得」正是这个工具存在的理由本身。
+
+    查到多份就拒绝，不"取第一个"：那会让 status/resume/stop 静默作用到扫描顺序
+    更靠前的那个会话上。而任务名撞车这条路很好走——撞额度上限就该换账号重跑。
+    cmd_run 已经不让这个状态建起来，这里是第二道。
+    """
+    found = []
     for account in account_choices():
-        p = meta_path(isolation_home(account), task)
+        home = isolation_home(account)
+        p = meta_path(home, task)
         if p.exists():
-            meta = json.loads(p.read_text())
-            meta["_home"] = str(isolation_home(account))
-            return meta
-    return None
+            found.append((home, _load_meta(p)))
+    if len(found) > 1:
+        reject(f"任务名 {task} 在多个隔离目录里都有："
+               + "、".join(str(h) for h, _ in found)
+               + "\n无法确定该操作哪一个，删掉不要的那份元数据再来。")
+    return found[0] if found else (None, None)
 
 
 def all_metas():
@@ -307,9 +375,7 @@ def all_metas():
         if not tasks_dir.is_dir():
             continue
         for p in sorted(tasks_dir.glob("*.json")):
-            meta = json.loads(p.read_text())
-            meta["_home"] = str(home)
-            out.append(meta)
+            out.append((home, _load_meta(p)))
     return out
 
 
