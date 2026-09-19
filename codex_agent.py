@@ -93,7 +93,12 @@ _SESSION_ID = re.compile(r"session id:\s*([0-9a-f-]{36})")
 
 
 def strip_ansi(text):
-    """防御性剥离。有了 `--color never`，日志本来就是纯文本，这里不再承重。"""
+    """剥掉颜色码。
+
+    主线带了 `--color never`，日志本来就是纯文本；但 **resume 不认 --color、
+    codex 也没有对应的 config 键**，resume 那一轮的日志照样带 ANSI。
+    所以这个函数在 resume 这条路上是承重的，删不得。
+    """
     return _ANSI.sub("", text)
 
 
@@ -276,11 +281,10 @@ def ensure_isolation(account):
 SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
 
 # 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
-# --color never：实测 --color auto（默认）在输出被重定向时**并不**关颜色，106 份
-# 日志无一例外含 ANSI，于是提 session id 和跑判据要各自剥一遍。从源头关掉之后，
-# 两个消费方都不再依赖剥离器（strip_ansi 保留作防御，但不再承重）。
+# 主线和 resume 都收的参数。调用方碰不到它们，也就不可能漏掉。
+# `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
 _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
-           "--skip-git-repo-check", "--disable", "plugins", "--color", "never"]
+           "--skip-git-repo-check", "--disable", "plugins"]
 
 
 def prepend_skill_guard(brief_text):
@@ -295,16 +299,24 @@ def build_run_argv(dir_abs, effort, report_path, brief):
     # -o 也必须绝对路径：相对路径按「发命令那个 shell 的 cwd」解析、不按 --cd，
     # 实测在 --cd 的 worktree 里怎么找都没有，一度误判成「没正常收尾」。
     # 两条都由调用方传绝对路径进来（cmd_run 里 resolve），这里不做兜底猜测。
+    # --color never：实测 --color auto（默认）在输出被重定向时**并不**关颜色，
+    # 106 份日志无一例外含 ANSI。主线能从源头关掉，resume 关不掉（见下）。
     return (["codex", "exec", "--cd", dir_abs, "-m", MODEL,
              "-c", f'model_reasoning_effort="{effort}"',
-             "--sandbox", "danger-full-access"] + _COMMON +
+             "--sandbox", "danger-full-access", "--color", "never"] + _COMMON +
             ["-o", report_path, brief])
 
 
 def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
-    # 两处和主线不同，都是实测撞出来的：
+    # 三处和主线不同，都是实测撞出来的：
     #   1. --cd 必须放在 resume 之前，放后面 clap 直接拒收
     #   2. resume 不认 --sandbox（error: unexpected argument，退出码 2），走 -c sandbox_mode
+    #   3. resume 也不认 --color（2026-09-19 端到端冒烟：`error: unexpected argument
+    #      '--color' found`，整轮当场死掉）。而 codex 没有对应的 config 键
+    #      （--strict-config 探测回 `unknown configuration field \`color\``），
+    #      所以 resume 这条路**关不掉颜色**——它的日志会带 ANSI，解析侧的
+    #      strip_ansi 在这条路上是承重的，不是防御。
+    # resume 收的参数集比主线小一圈，加参数前先 `codex exec resume --help` 对一遍。
     # 另：resume 总用 --cd／当前目录覆盖 workdir，不还原会话原目录，所以 --cd 必带。
     return (["codex", "exec", "--cd", dir_abs, "resume", session_id, "-m", MODEL,
              "-c", f'model_reasoning_effort="{effort}"',

@@ -323,12 +323,19 @@ class TestArgv(unittest.TestCase):
         self.assertNotIn("--sandbox", argv)
         self.assertIn('sandbox_mode="danger-full-access"', " ".join(argv))
 
-    def test_两条命令都从源头关掉颜色(self):
+    def test_主线从源头关掉颜色(self):
         # --color auto（默认）在输出被重定向时并不关颜色，106 份日志无一例外含 ANSI
-        for argv in (ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b"),
-                     ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")):
-            with self.subTest(argv=argv[2]):
-                self.assertEqual(argv[argv.index("--color") + 1], "never")
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b")
+        self.assertEqual(argv[argv.index("--color") + 1], "never")
+
+    def test_resume不许出现color_它也不认(self):
+        # 2026-09-19 端到端冒烟实测：resume 见到 --color 直接
+        # `error: unexpected argument '--color' found`，整轮当场死掉。
+        # 而且 codex 没有对应的 config 键（--strict-config 探测：
+        # unknown configuration field `color`），所以 resume 这条路关不掉颜色，
+        # 只能靠解析侧的 strip_ansi 兜——它在 resume 这条路上是承重的。
+        argv = ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")
+        self.assertNotIn("--color", argv)
 
     def test_环境变量把会话索引留在主目录_resume才找得到(self):
         env = ca.codex_env(pathlib.Path("/d"))
