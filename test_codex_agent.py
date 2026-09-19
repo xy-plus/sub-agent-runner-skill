@@ -70,6 +70,7 @@ ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
 ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-17T14:35:32.578919Z\x1b[0m \x1b[31mERROR\x1b[0m "
                        "\x1b[2mcodex_core::session\x1b[0m\x1b[2m:\x1b[0m Failed to create session: "
                        "thread-store conflict: thread already has an active writer")
+ROUND_SEP_SAMPLE = "===== codex-agent run t 2026-09-19T10:00:00 ====="
 ERR_FATAL = "Error: thread/resume: thread 01a0… already has an active writer (code -32600)"
 # 被 INT 打断几乎必然留下这一行。它的 target 是 codex_core::session，而那个
 # target 刻意不在良性白名单里（非打断场景下它仍该被看见），所以它会照常进 detail。
@@ -1902,9 +1903,29 @@ class TestInterruptCodex(unittest.TestCase):
         日志里 INTERRUPT_MARK 计数: 0
     """
 
+    # 日志**刻意非空**，而且头部就是真实日志的头部（分隔符行 + session id 行）。
+    # 在空日志上测留痕是模块 docstring 点名的第 1 类空测试：**前提本身不成立**
+    # ——空文件上「从 0 覆盖写」和「O_APPEND 追加」结果一模一样，于是把
+    # interrupt_codex 的 O_APPEND 去掉这个突变**全绿存活**。实际后果两条：
+    #   痕迹落在 start_offset 之前 → read_round 看不到 → 判 failed
+    #     （interrupted 这个分支存在的理由被静默重新引入）
+    #   日志头部的分隔符和 session id 被覆盖 → resume 再也回不来
+    # docstring 把「日志追加而非覆盖」列在「已全部被杀」里，那条只覆盖了
+    # run_codex 的 "ab"，**没覆盖 interrupt_codex**。
+    HEAD = (ROUND_SEP_SAMPLE + "\n"
+            + "session id: 01a0b408-f718-7ff3-8123-d5202551acba\n")
+
     def setUp(self):
         self.log = pathlib.Path(tempfile.mkdtemp()) / "t.log"
-        self.log.write_text("")
+        self.log.write_text(self.HEAD)
+
+    def _assert_appended(self, 说明):
+        """痕迹必须**追加在头部之后**，头部原样还在。"""
+        text = self.log.read_text()
+        self.assertTrue(text.startswith(self.HEAD), f"{说明}：日志头部被覆盖了")
+        self.assertIn("session id:", text, f"{说明}：session id 没了，resume 再也回不来")
+        self.assertGreater(text.index(ca.INTERRUPT_MARK), len(self.HEAD) - 1,
+                           f"{说明}：痕迹落在了头部之前")
 
     def test_发出信号的同时一定留痕(self):
         # 陪练进程必须**先报到再挨打**：Popen 一返回就发 INT 的话，信号会落在
@@ -1927,6 +1948,7 @@ class TestInterruptCodex(unittest.TestCase):
             self.assertTrue(ca.pid_alive(proc.pid), "前提不成立：陪练进程没起来")
             ca.interrupt_codex(proc.pid, self.log)
             self.assertIn(ca.INTERRUPT_MARK, self.log.read_text())
+            self._assert_appended("发信号留痕")
             proc.wait(timeout=5)
             self.assertEqual(proc.returncode, 0, "它该是被 INT 正常收走的")
         finally:
@@ -1942,7 +1964,7 @@ class TestInterruptCodex(unittest.TestCase):
         self.assertFalse(ca.pid_alive(dead.pid),
                          "前提不成立：陪练进程还活着，这条测的就不是「已退出」")
         ca.interrupt_codex(dead.pid, self.log)
-        self.assertEqual(self.log.read_text(), "")
+        self.assertEqual(self.log.read_text(), self.HEAD, "没送出信号却动了日志")
 
     def test_只发INT绝不发TERM(self):
         # SIGTERM 会让 thread 永久锁死，之后 resume 永远报 thread-store conflict，
@@ -1950,6 +1972,7 @@ class TestInterruptCodex(unittest.TestCase):
         with mock.patch.object(ca.os, "kill") as k:
             ca.interrupt_codex(4242, self.log)
         k.assert_called_once_with(4242, signal.SIGINT)
+        self._assert_appended("只发 INT 这条路")
 
     def test_刻意不给返回值(self):
         """「它本来就没在跑」由调用方在**调用之前**用 find_codex_pid 判，
@@ -2009,14 +2032,18 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
-        log.write_text("")
+        # 非空日志，理由见 TestInterruptCodex.HEAD 上面那段
+        head = ROUND_SEP_SAMPLE + "\nsession id: 01a0b408-f718-7ff3-8123-d5202551acba\n"
+        log.write_text(head)
         args = ca.build_parser().parse_args(["stop", "t"])
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
         k.assert_called_once_with(4242, signal.SIGINT)
-        self.assertIn(ca.INTERRUPT_MARK, log.read_text(),
+        text = log.read_text()
+        self.assertIn(ca.INTERRUPT_MARK, text,
                       "stop 只发信号不留痕 → status 会把被打断的轮次报成 failed")
+        self.assertTrue(text.startswith(head), "stop 这条路把日志头部覆盖了")
 
 
 class TestWrapperSpeaksImmediately(unittest.TestCase):
@@ -2154,7 +2181,15 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
             log = d / "logs" / "t.log"
             while time.time() < deadline and ca.INTERRUPT_MARK not in log.read_text():
                 time.sleep(0.05)
-            self.assertIn(ca.INTERRUPT_MARK, log.read_text())
+            text = log.read_text()
+            self.assertIn(ca.INTERRUPT_MARK, text)
+            # 痕迹必须**追加**：这条路的日志此刻已经有分隔符和 banner 了，
+            # 去掉 O_APPEND 会从 0 覆盖写，把它们抹掉（session id 一没，
+            # resume 再也回不来），而只断言「痕迹在里面」的话照样绿。
+            self.assertTrue(text.startswith(ca.ROUND_MARK), "日志头部的分隔符被覆盖了")
+            self.assertIn("session id:", text, "session id 被覆盖了，resume 再也回不来")
+            self.assertGreater(text.index(ca.INTERRUPT_MARK), text.index("session id:"),
+                               "痕迹落在了 banner 之前")
         finally:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
