@@ -12,15 +12,15 @@
     信号安全（start_new_session + 统一转发 INT + 用完还原）
     进程反查的三道过滤（uid / comm / argv 元素精确相等）
     开跑前三件事的顺序（落元数据、清旧报告、写轮次分隔符，全在 spawn 之前）
-    防陈旧报告（clear_report）、日志追加而非覆盖、按轮次切分日志
+    防陈旧报告（clear_report）、日志追加而非覆盖、**轮次边界由拥有者记下而非推测**
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
-    退出码四态的绝对值、严重度排序、元数据字段清单
+    退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
     resume 的三处 flag 差异、任务名字符集、兜底句两条路都真的加上
 
 总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
 凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
-地绿。这条是三次踩出来的，三次还都是同一个病——断言的两边一起动：
+地绿。这条是四次踩出来的，四次还都是同一个病——断言的两边一起动：
 
     1. 陪练进程写成 `sleep 5 <mark>`，而 sleep 收到多余参数会立刻退出。
        进程根本不存在，于是把承重的 comm 过滤整个删掉，测试照样绿。
@@ -29,15 +29,20 @@
        要防的「status && deploy 在任务还在跑的时候提前部署」。
     3. `assertEqual(set(new_meta(...)), set(REQUIRED_META_KEYS))`，而后者是从
        前者派生的。构造器少一个字段，校验面跟着少，测试照样绿。
+    4. `assertEqual(ca.judge(report, log, None).state, "failed")` 只钉状态，不钉
+       「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，判据
+       被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
+       （见 TestRoundBoundary：正面钉拥有者的偏移，反面钉「猜边界当场失明」）。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
-    suspect:3, running:4}，字段清单钉那六个名字，别只钉「两边相等」。
+    suspect:3, running:4, interrupted:5}，字段清单钉那六个名字，
+    边界钉「这段文本从哪来」，别只钉「两边相等」。
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
-行数（现在 55 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
-删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以要 resume、
-退出码怎么读），正好把这次重写的目的做反。
+行数（现在 61 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以只能
+interrupt-and-resume、退出码怎么读），正好把这次重写的目的做反。
 这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
 """
 import argparse
@@ -990,16 +995,19 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         for tier in ca.EFFORTS:
             with self.subTest(tier=tier):
                 self.assertIn(tier, skill)
-        # 四条命令都得在，否则调用方不知道有这些能力
-        for cmd in ("run", "status", "resume", "stop"):
+        # 五条命令都得在，否则调用方不知道有这些能力
+        for cmd in ("run", "status", "resume", "stop", "interrupt-and-resume"):
             with self.subTest(cmd=cmd):
                 self.assertIn(f"codex-agent {cmd}", skill)
         # 三件代码保证不了、只能靠调用方知道的事
         self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
         self.assertIn("brief", skill)               # brief 只收文件路径
-        for code in ("0", "1", "3", "4"):           # 退出码是对外契约
+        for code in ("0", "1", "3", "4", "5"):      # 退出码是对外契约
             with self.subTest(code=code):
                 self.assertIn(f"`{code}`", skill)
+        # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
+        # 在途工作损失多少，后者在 codex 里根本不可观测
+        self.assertIn("值不值", skill)
 
 
 class TestTaskName(unittest.TestCase):
