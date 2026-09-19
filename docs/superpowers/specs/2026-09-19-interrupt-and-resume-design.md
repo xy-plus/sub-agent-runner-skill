@@ -44,6 +44,35 @@
 `note_interrupt` 函数本身是对的（O_APPEND + 单次 `os.write`，跨进程原子），
 它的 docstring 里甚至原样记着这个症状。**病在调用点缺了一个，不在函数。**
 
+### 坑二只修一半是不够的：退出码也在说谎
+
+`judge` 认出 `INTERRUPT_MARK` 之后返回的仍然是 `Verdict("failed", ...)`，
+于是退出码是 `1`。修好标记只让**文字**变对，**退出码还在说「我失败了，重跑吧」**——
+而 `SKILL.md` 把退出码印成了对外契约，agent 正是照它做决定的。
+
+按四态自己的组织原则想一遍：这四个状态回答的是「**接下来该干什么**」。
+
+| 状态 | 该干什么 |
+|---|---|
+| `success` | 不用干什么 |
+| `suspect` | 去看一眼 |
+| `failed` | 查原因，**重跑** |
+| `running` | 等 |
+| **被打断** | **`resume`** ←和以上四个都不同 |
+
+所以它是**第五个状态**，不是 `failed` 下的一个理由：
+
+```
+EXIT = {"success": 0, "failed": 1, "suspect": 3, "running": 4, "interrupted": 5}
+_SEVERITY = ["success", "interrupted", "running", "suspect", "failed"]
+```
+
+严重度排在 `running` 之前：被打断的任务是**等着你续跑**，比「还在跑」更不该拦住调用方，
+但比 `success` 更需要你做点什么。
+
+**不加这一态的代价是具体的**：agent 拿到 `failed` 会从头重跑，把保着的上下文和已花的
+token 一起扔掉。这不是洁癖，是一次真实的浪费。
+
 ### 所以这个命令不是语法糖
 
 它把两个**已知会踩、且踩了判不出来**的坑焊死在一个动作里。这是铁律 2
@@ -97,7 +126,7 @@ codex-agent interrupt-and-resume <任务名> --brief msg.md --effort {low|medium
 
 ### 退出码
 
-沿用现有契约：`0` success、`1` failed、`3` suspect、`4` running、`2` 护栏拒绝。
+`0` success、`1` failed、`2` 护栏拒绝、`3` suspect、`4` running、**`5` interrupted**（新增，见 §1）。
 命令的退出码是**续跑那一轮的判据结论**（与 `resume` 一致）。
 
 ## 4. 同一改动里修掉的 bug
@@ -124,7 +153,8 @@ interrupt_codex(pid, log_path) -> bool      # 发 INT；成功则写 INTERRUPT_M
 | 测什么 | 关键点 |
 |---|---|
 | 三条路都留痕 | 突变：任一调用点改回裸 `os.kill` → 必须红 |
-| `stop` 之后判据说什么 | 构造「有 INTERRUPT_MARK、无报告」的日志，断言 `judge` 说「被 INT 打断，可 resume」而不是 `failed —— 没正常收尾` |
+| `stop` 之后判据说什么 | 构造「有 INTERRUPT_MARK、无报告」的日志，断言 `judge` 的 **state 是 `interrupted`**（不是 `failed`），且退出码是 `5`（不是 `1`） |
+| 五态的绝对值 | `assertEqual(EXIT, {...})` 把五个数字钉死；断言 `USAGE_ERROR`(2) 不在其中；断言 `_SEVERITY` 恰好覆盖五态（教训：派生出来的键集两边一起动＝空测试，这个仓库栽过） |
 | 三种入场情况 | 在跑 / 已结束 / 没 session id，各自走对分支且打印对 |
 | 等待退出 | 进程迟迟不退 → 超时后**拒绝 resume**、退出码 2、**且没有发出第二个信号**（突变：加一发 TERM → 必须红） |
 | 参数一致性 | 与 `resume` 同一张断言表（`type=task_name`、`--brief` 必填、`--effort` 必填且五档） |
