@@ -1,5 +1,9 @@
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -194,3 +198,62 @@ class TestArgv(unittest.TestCase):
         env = ca.codex_env(pathlib.Path("/d"))
         self.assertEqual(env["CODEX_HOME"], "/d")
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
+
+
+class TestMeta(unittest.TestCase):
+    def setUp(self):
+        self.home = pathlib.Path(tempfile.mkdtemp())
+        self.p = mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home))
+        self.p.start()
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}")
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_元数据写入后能跨隔离目录查回来(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t1", {"task": "t1", "account": "default", "dir": "/abs/x", "effort": "low"})
+        got = ca.find_meta("t1")
+        self.assertEqual(got["dir"], "/abs/x")
+        self.assertEqual(got["_home"], str(d))
+
+    def test_查不到返回None(self):
+        self.assertIsNone(ca.find_meta("不存在的任务"))
+
+    def test_列出全部任务(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "a", {"task": "a"})
+        ca.write_meta(d, "b", {"task": "b"})
+        self.assertEqual(sorted(m["task"] for m in ca.all_metas()), ["a", "b"])
+
+
+class TestPid(unittest.TestCase):
+    def test_自己的进程判定为存活(self):
+        self.assertTrue(ca.pid_alive(os.getpid()))
+
+    def test_不存在的进程判定为已退出(self):
+        self.assertFalse(ca.pid_alive(2 ** 22))
+
+    def test_只认comm是codex的进程_shell自己不算(self):
+        # 2026-09-19 实测：pgrep -f <报告路径> 会命中发命令的 bash 自己（comm=bash），
+        # comm 过滤是承重的，不是保险。
+        # 这里起一个 argv 里含该路径、comm 绝不是 codex 的活进程来验证它被排除。
+        # （计划原稿用 `sleep 5 <mark>`，实测 sleep 会立刻以 "invalid time interval"
+        #   退出——进程根本不存在，测试变成空转。所以先断言前提成立再断言结论。）
+        mark = "/tmp/codex-agent-selftest-不存在的报告.json"
+        proc = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep(30)  # {mark}"])
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                hit = subprocess.run(["pgrep", "-f", mark],
+                                     capture_output=True, text=True).stdout.split()
+                if str(proc.pid) in hit:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("pgrep 没命中陪练进程，本测试无法验证 comm 过滤，不能算通过")
+            self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()

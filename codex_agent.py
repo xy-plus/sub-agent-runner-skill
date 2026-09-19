@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import subprocess
 from typing import NamedTuple
 
 TAIL_LINES = 50  # 判据只看日志末尾这么多行：中途已恢复的错误不该算失败
@@ -196,3 +197,66 @@ def codex_env(home):
     # 会话索引留在主目录，resume 才找得到（隔离的是 skill/plugin，不是会话历史）
     env["CODEX_SQLITE_HOME"] = str(pathlib.Path.home() / ".codex")
     return env
+
+
+def meta_path(home, task):
+    return home / "tasks" / f"{task}.json"
+
+
+def write_meta(home, task, meta):
+    meta_path(home, task).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+
+
+def find_meta(task):
+    """跨所有隔离目录按任务名找。账号是查出来的，不是让调用方再报一遍的。"""
+    for account in account_choices():
+        p = meta_path(isolation_home(account), task)
+        if p.exists():
+            meta = json.loads(p.read_text())
+            meta["_home"] = str(isolation_home(account))
+            return meta
+    return None
+
+
+def all_metas():
+    out = []
+    for account in account_choices():
+        home = isolation_home(account)
+        tasks_dir = home / "tasks"
+        if not tasks_dir.is_dir():
+            continue
+        for p in sorted(tasks_dir.glob("*.json")):
+            meta = json.loads(p.read_text())
+            meta["_home"] = str(home)
+            out.append(meta)
+    return out
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def find_codex_pid(report_path):
+    """存活判定只有一个可靠判据：真实 PID。日志判不了，$! 给不出。
+
+    回合用尽的 codex 留下的 log 和还在跑的长得一模一样（末尾都是正常输出、
+    没有收尾标记），所以 tail 日志只能看它在干什么，判不了存活。
+    $! 拿到的是包装链最外层（2026-09-17 实测：$! 是 254151，codex 是 254153），
+    据此判"已退出"再 resume，会撞上它自己的写锁。
+    报告路径在 codex 的 argv 里且按任务唯一，所以反查从它入手；
+    再按 comm 收窄——pgrep -f 会命中发命令的 shell 自己（2026-09-19 实测，
+    comm=bash），少了这道过滤会把 shell 当成 codex。
+    """
+    r = subprocess.run(["pgrep", "-f", report_path], capture_output=True, text=True)
+    for pid_str in r.stdout.split():
+        comm = subprocess.run(["ps", "-o", "comm=", "-p", pid_str],
+                              capture_output=True, text=True).stdout.strip()
+        if comm == "codex" and pid_alive(int(pid_str)):
+            return int(pid_str)
+    return None
