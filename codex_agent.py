@@ -112,7 +112,7 @@ def clear_report(report_path):
 class Verdict(NamedTuple):
     state: str   # running / success / suspect / failed
     reason: str  # 一行人话
-    detail: list # suspect：出事的那几行；success：报告顶层 key
+    detail: list # suspect／failed：出事的那几行；success：报告前几行
 
 
 def judge(report_path, log_path, pid):
@@ -132,8 +132,14 @@ def judge(report_path, log_path, pid):
     # 前提是每轮开跑前把上一轮的报告删掉（见 clear_report），否则旧报告会被
     # 当成本轮的产物，一次失败的运行会被判成 success。
     if not report_path.exists() or not report_path.read_text().strip():
+        # 两种特判只改 reason、不新增状态：补救手段不同（换账号／新起任务），
+        # 但都属于「没正常收尾」这一种事实，状态机不该为此变复杂。
         if USAGE_LIMIT_MARK in round_text:
             return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
+        if THREAD_LOCK_MARK in round_text:
+            return Verdict("failed",
+                           "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
+                           errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
