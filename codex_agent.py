@@ -1241,6 +1241,32 @@ def cmd_stop(args):
     return EXIT["success"]
 
 
+def _add_prompt_round_args(sub):
+    """带 prompt 的三条命令共用的「本轮 skill 白名单」。**二选一必填，没有默认值。**
+
+    白名单是**每一轮**的事，不是任务的事——resume 换一轮活，能用的 skill 就该
+    跟着换，所以三条命令各收一份，而不是在 run 时定死。
+
+    为什么 `--no-skill` 必须显式写：这个工具要交给其他 agent 用。省略时分不清
+    「调用方决定不给」和「调用方根本不知道有这个参数」，而 argparse 的
+    `required=True` 能把后者变成 exit 2 当场报错。代价很小——这个拒绝是即时且
+    完全可恢复的（加个参数重跑，零损失），不像 --effort/--account 写错要花钱
+    才发现。
+
+    **刻意不把 skill 软链进隔离目录**，理由是可观测性：路径在 brief 里，
+    「codex 到底读没读」在日志里看得见（就是那一行 `cat <路径>`）；软链成能力
+    之后，用没用由它决定、**不可观测**。对一个主张「不骗调用方」的工具，这条是
+    决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
+    一个」，isolation_home／find_meta／account_choices／ensure_isolation 全线
+    要改，换来的保证是零。
+    """
+    g = sub.add_mutually_exclusive_group(required=True)
+    g.add_argument("--skill", action="append", dest="skills", type=skill_path,
+                   metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
+    g.add_argument("--no-skill", action="store_const", const=[], dest="skills",
+                   help="本轮一个 skill 都不给")
+
+
 def build_parser():
     """命令行契约。
 
@@ -1254,14 +1280,16 @@ def build_parser():
         description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    # 五个参数全必填：不设默认值，因为隐式选中的账号／难度是最容易被误用的地方
+    # 五个带值参数全必填，外加 --skill/--no-skill 二选一：不设默认值，因为隐式
+    # 选中的账号／难度／白名单都是最容易被误用的地方
     r = sub.add_parser("run", help="起一个新任务")
     r.add_argument("--task", required=True, type=task_name,
                    help="任务名，全局唯一（PID 反查和产物命名都靠它）")
-    r.add_argument("--dir", required=True, help="codex 的工作目录，自动转绝对路径")
+    r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
     r.add_argument("--account", required=True, choices=account_choices(), help="codex 账号")
+    _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("status", help="看任务状态；省略任务名则列出全部")
@@ -1273,6 +1301,7 @@ def build_parser():
     m.add_argument("task", type=task_name)
     m.add_argument("--brief", required=True)
     m.add_argument("--effort", required=True, choices=EFFORTS)
+    _add_prompt_round_args(m)
     m.set_defaults(func=cmd_resume)
 
     # 名字刻意长而直白：它会**截断当前轮**，这个代价必须写在脸上。
@@ -1287,6 +1316,7 @@ def build_parser():
     j.add_argument("task", type=task_name)
     j.add_argument("--brief", required=True)
     j.add_argument("--effort", required=True, choices=EFFORTS)
+    _add_prompt_round_args(j)
     j.set_defaults(func=cmd_interrupt_and_resume)
 
     k = sub.add_parser("stop", help="停一个任务（只发 SIGINT）")

@@ -489,7 +489,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
@@ -502,7 +502,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_codex_pid", return_value=None), \
@@ -964,7 +964,7 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
@@ -1303,8 +1303,10 @@ class TestParser(_HomeSandbox):
     def test_run的五个参数一个都不能少(self):
         parser = ca.build_parser()
         for missing in ["--task", "--dir", "--brief", "--effort", "--account"]:
+            # --no-skill 不加的话这条就静默退化成同义反复：缺 --skill/--no-skill
+            # 照样 SystemExit，于是不管 --task/--dir/… 还必不必填，它都绿。
             argv = ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                    "--effort", "low", "--account", "default"]
+                    "--effort", "low", "--account", "default", "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -1315,7 +1317,8 @@ class TestParser(_HomeSandbox):
         for e in ca.EFFORTS:
             with self.subTest(effort=e):
                 args = parser.parse_args(["run", "--task", "t", "--dir", "/tmp",
-                                          "--brief", "b.md", "--effort", e, "--account", "default"])
+                                          "--brief", "b.md", "--effort", e,
+                                          "--account", "default", "--no-skill"])
                 self.assertEqual(args.effort, e)
 
     def test_effort只收这五个档位(self):
@@ -1325,15 +1328,17 @@ class TestParser(_HomeSandbox):
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", bad, "--account", "default"])
+                                   "--effort", bad, "--account", "default", "--no-skill"])
 
     def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
         for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
-                      "--effort", "low", "--account", "default"],
-                     ["status", "a|b"], ["resume", "a|b", "--brief", "b.md", "--effort", "low"],
+                      "--effort", "low", "--account", "default", "--no-skill"],
+                     ["status", "a|b"],
+                     ["resume", "a|b", "--brief", "b.md", "--effort", "low", "--no-skill"],
                      ["stop", "a|b"],
-                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low"]):
+                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low",
+                      "--no-skill"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
 
@@ -1341,7 +1346,7 @@ class TestParser(_HomeSandbox):
         parser = ca.build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "low",
-                               "--account", "default"])
+                               "--no-skill", "--account", "default"])
 
     def test_不提供会造成误用的参数(self):
         """这六个参数是**刻意不提供**的，各有各的理由：
@@ -1361,7 +1366,8 @@ class TestParser(_HomeSandbox):
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", "low", "--account", "default", bad, "x"])
+                                   "--effort", "low", "--account", "default", "--no-skill",
+                                   bad, "x"])
 
 
 class TestInterruptAndResumeParser(_HomeSandbox):
@@ -1372,7 +1378,8 @@ class TestInterruptAndResumeParser(_HomeSandbox):
     def test_与resume同一张参数表_少一个都不收(self):
         parser = ca.build_parser()
         for missing in ["--brief", "--effort"]:
-            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"]
+            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low",
+                    "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -1382,18 +1389,19 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         parser = ca.build_parser()
         for e in ca.EFFORTS:
             with self.subTest(effort=e):
-                args = parser.parse_args(["interrupt-and-resume", "t",
-                                          "--brief", "b.md", "--effort", e])
+                args = parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
+                                          "--effort", e, "--no-skill"])
                 self.assertEqual(args.effort, e)
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", bad])
+                                   "--effort", bad, "--no-skill"])
 
     def test_不收account_账号是查出来的(self):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                          "--effort", "low", "--account", "default"])
+                                          "--effort", "low", "--no-skill",
+                                          "--account", "default"])
 
     def test_不提供任何旋钮_没有第二种正确行为(self):
         # 每个旋钮都是一个让调用方做错的机会：
@@ -1406,15 +1414,107 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         for bad in ["--now", "--wait", "--force", "--timeout", "--message", "--account"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", "low", bad, "x"])
+                                   "--effort", "low", "--no-skill", bad, "x"])
 
     def test_子命令接到的确实是这条命令的实现(self):
         # Task 5 的测试是直接拿 Namespace 调命令体的，接错了函数它测不出来。
         # 这里是命令行到实现之间唯一那根线。
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"])
+            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low", "--no-skill"])
         self.assertIs(args.func, ca.cmd_interrupt_and_resume)
         self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "low"))
+
+
+class TestSkillWhitelistFlags(_HomeSandbox):
+    """白名单是**每一轮**的事，不是任务的事——所以三条带 prompt 的命令各收一份。
+
+    二选一**必填**而不是缺省成空白名单：这个工具要交给其他 agent 用，省略时
+    分不清「调用方决定不给」和「调用方根本不知道有这个参数」。强制显式把
+    「没想过」变成 exit 2 当场报错，而这个拒绝是即时且完全可恢复的
+    （加个参数重跑，零损失），不像 --effort/--account 写错要花钱才发现。
+    """
+
+    PROMPT_CMDS = ("run", "resume", "interrupt-and-resume")
+
+    def setUp(self):
+        super().setUp()
+        self.skill_a = self.home / "a_SKILL.md"
+        self.skill_b = self.home / "b_SKILL.md"
+        for q in (self.skill_a, self.skill_b):
+            q.write_text("---\nname: x\n---\n")
+
+    def _argv(self, cmd, *tail):
+        base = {"run": ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
+                        "--effort", "low", "--account", "default"],
+                "resume": ["resume", "t", "--brief", "b.md", "--effort", "low"],
+                "interrupt-and-resume": ["interrupt-and-resume", "t", "--brief", "b.md",
+                                         "--effort", "low"]}[cmd]
+        return base + list(tail)
+
+    def test_三条带prompt的命令都必须二选一_都不给就拒(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd), self.assertRaises(SystemExit):
+                parser.parse_args(self._argv(cmd))
+
+    def test_三条命令都不许同时给(self):
+        # 正面控制是**必须的**：单给任一个都过得去，下面那个拒绝才确实来自互斥。
+        # 少了它，在参数还不存在的版本上这条也绿（两个都 unrecognized），
+        # 是条永远不会红的空测试。
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, [])
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(self._argv(cmd, "--skill", str(self.skill_a), "--no-skill"))
+
+    def test_no_skill解析成空白名单(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, [])
+
+    def test_skill可重复且保持给定顺序(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                args = parser.parse_args(self._argv(
+                    cmd, "--skill", str(self.skill_a), "--skill", str(self.skill_b)))
+                self.assertEqual(args.skills, [str(self.skill_a), str(self.skill_b)])
+
+    def test_status和stop不收这两个参数_它们不带prompt(self):
+        # 这条**前后都绿**，它守的是「别顺手给 status 也加上」：白名单是发 prompt
+        # 那一刻的事，status/stop 根本不发 prompt，多一个参数就多一个误用机会。
+        # 正面控制钉住「不带这两个参数时它们是收的」，否则整条是空的。
+        parser = ca.build_parser()
+        for cmd in ("status", "stop"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(parser.parse_args([cmd, "t"]).task, "t")
+                for flag in ("--no-skill", "--skill"):
+                    with self.subTest(flag=flag), self.assertRaises(SystemExit):
+                        parser.parse_args([cmd, "t", flag, str(self.skill_a)])
+
+    def test_dir的控制字符校验真的挂在命令行上(self):
+        # 纯函数写对、parser 没挂 type= 的话，bug 原样还在——这是唯一那根线。
+        # 正面控制是**必须的**：只钉「坏值被拒」的话，在 --no-skill 还不存在的
+        # 版本上这条也绿（整条命令本来就被拒），永远不会红。
+        parser = ca.build_parser()
+        good = self._argv("run", "--no-skill")
+        self.assertEqual(parser.parse_args(good).dir, "/tmp", "前提不成立：好的那条都过不去")
+        bad = list(good)
+        bad[bad.index("--dir") + 1] = "/tmp/a\tb"
+        with self.assertRaises(SystemExit):
+            parser.parse_args(bad)
+
+    def test_skill的路径校验真的挂在命令行上(self):
+        parser = ca.build_parser()
+        for cmd in self.PROMPT_CMDS:
+            with self.subTest(cmd=cmd):
+                good = self._argv(cmd, "--skill", str(self.skill_a))
+                self.assertEqual(parser.parse_args(good).skills, [str(self.skill_a)],
+                                 "前提不成立：好的那条都过不去，坏的被拒就说明不了任何事")
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(self._argv(cmd, "--skill", "relative/SKILL.md"))
 
 
 class TestRunGuards(_HomeSandbox):
@@ -1427,7 +1527,8 @@ class TestRunGuards(_HomeSandbox):
 
     def _args(self, **over):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
-                "--brief", over.get("brief", str(self.brief)), "--effort", "low", "--account", "default"]
+                "--brief", over.get("brief", str(self.brief)), "--effort", "low",
+                "--account", "default", "--no-skill"]
         return ca.build_parser().parse_args(argv)
 
     def test_dir不是目录就拒跑(self):
@@ -1477,7 +1578,7 @@ class TestRunGuards(_HomeSandbox):
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         def grab(*a, **k):
             seen["argv"] = a[0]
             return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
@@ -1551,7 +1652,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def _args(self, task):
         return ca.build_parser().parse_args(
-            ["resume", task, "--brief", str(self.brief), "--effort", "low"])
+            ["resume", task, "--brief", str(self.brief), "--effort", "low", "--no-skill"])
 
     def test_任务不存在就报错(self):
         # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
@@ -1818,7 +1919,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
@@ -1827,7 +1928,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
         self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
@@ -1852,11 +1953,11 @@ class TestExitCodeContract(_HomeSandbox):
     def _run_args(self):
         return ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default"])
+             "--effort", "low", "--account", "default", "--no-skill"])
 
     def _resume_args(self):
         return ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
 
     def _spawner(self, d, report_text, log_extra):
         """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
@@ -1914,7 +2015,8 @@ class TestExitCodeContract(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low"])
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--no-skill"])
         # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
         with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
