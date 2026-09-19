@@ -416,6 +416,33 @@ class TestRoundBoundary(unittest.TestCase):
                             "前提不成立：日志里没有多字节字符，这条测不到错位")
         self.assertEqual(text, "本轮第一行\n")
 
+    def test_非法kind当场被挡住_而且什么副作用都没产生(self):
+        # 校验排在 write_meta／clear_report／spawn **全部之前**：
+        # 任何一件先发生，失败就会留下半个状态。
+        d = self._home()
+        for bad in ("interrupt and resume", "run\nx", None, "", "瞎写的"):
+            with self.subTest(bad=bad):
+                with _no_codex() as popen:
+                    with self.assertRaises(ValueError):
+                        ca.run_codex(bad, d, "t", _full_meta("t"), lambda r: ["codex"])
+                    popen.assert_not_called()
+                self.assertFalse(ca.meta_path(d, "t").exists(), "元数据已经落盘了")
+                self.assertFalse(ca._log_path(d, "t").exists(), "日志已经写了")
+
+    def test_非法kind若被放过会怎样_这是上面那条为什么承重(self):
+        """kind 带空格 → `_ROUND_LINE` 整行认不出 → 两轮被并成一轮，
+        上一轮的 `Error:` 算进本轮。
+
+        `_ROUND_LINE` 那段注释说「三段都不含空格」，而任务名由 _TASK_NAME 管着、
+        时间戳由 isoformat 结构保证——**只有 kind 是空头支票**，所以它必须是枚举。
+        """
+        p = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        坏分隔符 = ca.round_separator("interrupt and resume", "t", "2026-09-19T00:00:01")
+        p.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
+                     + ERR_FATAL + "\n" + 坏分隔符 + "\n干净收尾\n")
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(p))), 1,
+                         "前提变了：带空格的分隔符居然被认出来了，那 kind 就不用是枚举了")
+
     def test_日志还没有时读回空串_不许抛(self):
         d = self._home()
         missing = ca._log_path(d, "从来没写过")
@@ -2064,6 +2091,40 @@ class TestInterruptCodex(unittest.TestCase):
                 # 带了来源也仍然是合法痕迹：判据不受影响
                 self.assertTrue(ca.has_interrupt_mark(self.log.read_text()),
                                 f"带上 [{cause}] 之后判据认不出这是打断了")
+
+    def test_非法cause当场被挡住_而且信号还没发出去(self):
+        """docstring 里写「cause ∈ {…}」挡不住任何东西，散文不是约束。
+
+        校验必须排在 `os.kill` **之前**：INT 发出去收不回来，先打断再发现
+        cause 写错，那一轮白毁。
+        """
+        for bad in ("a\nb", None, "", "随便写的"):
+            with self.subTest(bad=bad):
+                self.log.write_text(self.HEAD)
+                with mock.patch.object(ca.os, "kill") as k:
+                    with self.assertRaises(ValueError):
+                        ca.interrupt_codex(4242, self.log, bad)
+                k.assert_not_called()
+                self.assertEqual(self.log.read_text(), self.HEAD, "日志被动过了")
+
+    def test_三个合法cause都收(self):
+        for good in ca._CAUSES:
+            with self.subTest(good=good):
+                self.log.write_text(self.HEAD)
+                with mock.patch.object(ca.os, "kill"):
+                    ca.interrupt_codex(4242, self.log, good)
+                self.assertTrue(ca.has_interrupt_mark(self.log.read_text()))
+
+    def test_非法cause若被放过会怎样_这是上面那条为什么承重(self):
+        """不测生产代码，钉的是**因果**。
+
+        cause 里带换行的话，痕迹被劈成两行，`_MARK_LINE` 整行匹配当场认不出，
+        judge 从 interrupted(130) 退回 failed(1)——这个分支存在的理由当场复活。
+        """
+        劈开的 = "\n" + ca.INTERRUPT_MARK + " [a\nb]\n"
+        self.assertIn(ca.INTERRUPT_MARK, 劈开的, "前提不成立：样本里没有痕迹前缀")
+        self.assertFalse(ca.has_interrupt_mark(劈开的),
+                         "前提变了：痕迹被劈开之后居然还认得出，那上面那条校验就不承重了")
 
     def test_只发INT绝不发TERM(self):
         # SIGTERM 会让 thread 永久锁死，之后 resume 永远报 thread-store conflict，

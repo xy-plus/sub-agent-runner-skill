@@ -72,6 +72,31 @@ ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前
 INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断，上下文保留，可 resume -----"
 
 
+# `cause` 和 `kind` 必须是**枚举**，不是自由字符串。
+# docstring 里写「∈ {…}」挡不住任何东西——散文不是约束（铁律 2）。
+# 两条实测后果，都是静默说谎而不是崩：
+#   cause="a\nb"                 痕迹被换行劈成两行 → _MARK_LINE 整行认不出
+#                                → judge 从 interrupted(130) 退回 failed(1)，
+#                                  这个分支存在的理由当场复活
+#   kind="interrupt and resume"  _ROUND_LINE 整行认不出 → 两轮被并成一轮，
+#                                上一轮的 `Error:` 算进本轮
+# _ROUND_LINE 那段注释说「三段都不含空格」：任务名由 _TASK_NAME 管着、
+# 时间戳由 isoformat 结构保证，**只有 kind 一直是空头支票**，这里把它兑现。
+#
+# 校验用 ValueError 而不是 reject：写错的是**内部调用方**，不是用户。
+# reject 走退出码 2（「参数写错或被护栏拒绝」）且只打一行人话，用在这里会让
+# 那个对外契约说假话，还把一个程序 bug 伪装成用户输入问题。
+# 也不用 assert：`python3 -O` 会把它整个抹掉，而这两条是承重的。
+_CAUSES = ("stop", "interrupt-and-resume", "外部信号转发")
+_KINDS = ("run", "resume", "interrupt-and-resume")
+
+
+def _require_enum(value, allowed, name):
+    """内部调用方传错枚举就当场炸，不静默、不可被 -O 关掉。"""
+    if value not in allowed:
+        raise ValueError(f"{name} 必须是 {allowed} 之一，收到 {value!r}")
+
+
 def round_separator(kind, task, when_iso):
     return f"{ROUND_MARK}{kind} {task} {when_iso} ====="
 
@@ -153,6 +178,9 @@ def interrupt_codex(pid, log_path, cause):
     它的 write 中间。写不进去就算了（吞掉 OSError）：INT 已经发出去了，保住
     codex 的上下文优先于留痕。这个降级方向正是「可观测的失效不许拖垮存活」。
     """
+    # 校验必须排在 os.kill **之前**：INT 发出去收不回来，先打断再发现 cause
+    # 写错，那一轮白毁——和四道闸同一条道理。
+    _require_enum(cause, _CAUSES, "cause")
     try:
         os.kill(pid, signal.SIGINT)
     except ProcessLookupError:
@@ -792,6 +820,9 @@ def run_codex(kind, home, task, meta, make_argv):
 
     （stdin／timeout／start_new_session 各自的理由写在它们那一行旁边。）
     """
+    # 校验排在 write_meta／clear_report／spawn **全部之前**：任何一件先发生，
+    # 失败就会留下半个状态（元数据落了盘、上一轮报告被删掉，而 codex 没起来）。
+    _require_enum(kind, _KINDS, "kind")
     report = _report_path(home, task)
     argv = make_argv(str(report))
     env = codex_env(home)
