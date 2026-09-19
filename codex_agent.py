@@ -195,7 +195,7 @@ def read_last_round(log_path):
     """最后一轮。**只给外部观察者用**（`status`）——它手里没有偏移。
 
     这是它诚实的上界：它本来就只能看到最后一轮，说不出更多。
-    本轮的拥有者（cmd_run / _resume_with）绝不该用它：拥有者手里有事实，
+    本轮的拥有者（cmd_run / _resume_round）绝不该用它：拥有者手里有事实，
     用这个就等于把事实换回推测。
     """
     if not log_path.exists():
@@ -563,7 +563,10 @@ def find_codex_pid(report_path):
     顺带省掉每次 1+N 次子进程（一个 pgrep 加每个候选一个 ps）。
     """
     me = os.getuid()
-    needle = report_path.encode()
+    # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点。
+    # 不做这一下，wait_for_exit 就会变成全模块唯一收 str 的函数——同一个东西两种
+    # 传法，正是「好 API 难被误用」要消掉的那种缝。
+    needle = str(report_path).encode()
     for entry in pathlib.Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -597,6 +600,8 @@ INTERRUPT_POLL_INTERVAL = 0.2
 
 def wait_for_exit(report_path, timeout, poll_interval):
     """轮询真实 PID 直到它真的退出。返回是否在 timeout 之内退出。
+
+    `report_path` 是 `pathlib.Path`，和本模块其它地方一致（见 find_codex_pid）。
 
     这是 `interrupt-and-resume` **唯一独有的收益**：护栏只会拒绝，不会替你等。
     `cmd_resume` 早就拦住了「对还在跑的会话 resume」（实测 stop 之后 0.164 秒
@@ -791,7 +796,7 @@ def cmd_run(args):
         if old_home != home:
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
-        if find_codex_pid(str(_report_path(home, args.task))) is not None:
+        if find_codex_pid(_report_path(home, args.task)) is not None:
             reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-agent stop {args.task}`")
         print(f"[codex-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
 
@@ -827,7 +832,7 @@ def cmd_status(args):
     for home, meta in rows:
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
         # 外部观察者：它手里没有偏移，只能看最后一轮，也只该看最后一轮。
-        verdict = judge(report, read_last_round(log), find_codex_pid(str(report)))
+        verdict = judge(report, read_last_round(log), find_codex_pid(report))
         print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
               f"{verdict.reason}  {meta['dir']}")
         for line in verdict.detail:
@@ -845,7 +850,7 @@ def check_can_resume(task, meta, brief_path):
     codex 第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起
     那几秒正是最可能被打断的时候（刚发现 brief 写错）。
 
-    `_resume_with` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
+    `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
     """
     if not meta["session_id"]:
@@ -858,8 +863,11 @@ def check_can_resume(task, meta, brief_path):
         reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
 
 
-def _resume_with(kind, home, meta, task, brief_path, effort):
+def _resume_round(kind, home, meta, task, brief_path, effort):
     """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
+
+    名字是 `_resume_round` 不是 `_resume_with`：`with` 没说清 with 什么，
+    而它做的事就是「续跑一轮」（仓库规范第 2 条：不清晰的词换成清晰的词组）。
 
     它只管「已经确定停了之后怎么续」，**不判断该不该停**——`cmd_resume` 在调它
     之前拒绝还在跑的任务，`cmd_interrupt_and_resume` 在调它之前把它打断并确认
@@ -893,10 +901,15 @@ def cmd_resume(args):
     # 一模一样（thread-store conflict），而处置完全相反——一个该等，一个该弃。
     # 本命令刻意**不替调用方打断**：要打断请用 interrupt-and-resume，
     # 那个名字把代价写在脸上。
-    if find_codex_pid(str(_report_path(home, args.task))) is not None:
+    #
+    # 这里 PID 检查排在 check_can_resume **之前**，和 interrupt-and-resume 的闸序
+    # 相反，是**刻意的**：「拒绝必须在动手之前」约束的是**副作用**，而这条路一个
+    # 副作用都没有，闸序只决定人先看到哪句话——「还在跑」是这里最可操作的那句。
+    # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
+    if find_codex_pid(_report_path(home, args.task)) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `codex-agent interrupt-and-resume {args.task}`。")
-    return _resume_with("resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("resume", home, meta, args.task, args.brief, args.effort)
 
 
 def cmd_interrupt_and_resume(args):
@@ -921,8 +934,11 @@ def cmd_interrupt_and_resume(args):
     check_can_resume(args.task, meta, args.brief)          # 2/3/4. session id / 目录 / brief
     # ────── 以上全过，才允许动手 ──────
 
+    # meta 在这里读一次就一直用到 _resume_round。wait_for_exit 之后它已经旧于
+    # 磁盘上那份（被打断的那一轮会在收尾时写元数据），但无损：差异字段只有
+    # session_id（为空早被上面的闸拒了）和 effort／started_at（本来就要刷新）。
     report, log = _report_path(home, args.task), _log_path(home, args.task)
-    pid = find_codex_pid(str(report))
+    pid = find_codex_pid(report)
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
@@ -940,19 +956,19 @@ def cmd_interrupt_and_resume(args):
         else:
             interrupt_codex(pid, log)
             print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
-        if not wait_for_exit(str(report), INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
+        if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
             reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
                    f"还在收尾。稍后重跑这条命令即可——它不会再发第二发 INT。"
                    f"绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。")
         print("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
-    return _resume_with("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
 
 
 def cmd_stop(args):
     home, meta = find_meta(args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    pid = find_codex_pid(str(_report_path(home, args.task)))
+    pid = find_codex_pid(_report_path(home, args.task))
     if pid is None:
         print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]
@@ -1002,8 +1018,11 @@ def build_parser():
     # 仓库规范第 2 条说「不清晰的单词全部换为简单清晰的词组」——
     # `interject` 是个不清晰的单词，`interrupt-and-resume` 是个清晰的词组。
     # 参数表与 resume 逐条一致：同一个工具里 prompt 只有一种传法。
-    j = sub.add_parser("interrupt-and-resume",
-                       help="打断当前轮并用新消息续跑（会截断当前轮，上下文保留）")
+    # help= 进父 parser 的子命令列表，description= 进它自己的 --help。
+    # 只传 help= 的话 `interrupt-and-resume --help` 里看不到「会截断当前轮」
+    # （实测 grep -c 截断 = 0），而那正是这条命令最该被看见的代价。
+    _iar_help = "打断当前轮并用新消息续跑（会截断当前轮，上下文保留）"
+    j = sub.add_parser("interrupt-and-resume", help=_iar_help, description=_iar_help)
     j.add_argument("task", type=task_name)
     j.add_argument("--brief", required=True)
     j.add_argument("--effort", required=True, choices=EFFORTS)

@@ -1380,7 +1380,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
                                side_effect=lambda *a: order.append("打断")), \
              mock.patch.object(ca, "wait_for_exit",
                                side_effect=lambda *a: order.append("等退出") or True), \
-             mock.patch.object(ca, "_resume_with",
+             mock.patch.object(ca, "_resume_round",
                                side_effect=lambda *a: order.append("续跑") or 0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         self.assertEqual(order, ["打断", "等退出", "续跑"], "顺序反了就会撞写锁")
@@ -1389,7 +1389,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
         with mock.patch.object(ca, "find_codex_pid", return_value=None), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
 
@@ -1439,7 +1439,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex"), \
              mock.patch.object(ca, "wait_for_exit", return_value=False), \
-             mock.patch.object(ca, "_resume_with") as rw:
+             mock.patch.object(ca, "_resume_round") as rw:
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_interrupt_and_resume(self._args())
         rw.assert_not_called()
@@ -1458,7 +1458,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
         w.assert_called_once()   # 不发信号，但照样要等
@@ -1473,7 +1473,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca, "wait_for_exit", return_value=True), \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
         ic.assert_called_once()
 
