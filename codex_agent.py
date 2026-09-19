@@ -998,6 +998,17 @@ def build_parser():
     m.add_argument("--effort", required=True, choices=EFFORTS)
     m.set_defaults(func=cmd_resume)
 
+    # 名字刻意长而直白：它会**截断当前轮**，这个代价必须写在脸上。
+    # 仓库规范第 2 条说「不清晰的单词全部换为简单清晰的词组」——
+    # `interject` 是个不清晰的单词，`interrupt-and-resume` 是个清晰的词组。
+    # 参数表与 resume 逐条一致：同一个工具里 prompt 只有一种传法。
+    j = sub.add_parser("interrupt-and-resume",
+                       help="打断当前轮并用新消息续跑（会截断当前轮，上下文保留）")
+    j.add_argument("task", type=task_name)
+    j.add_argument("--brief", required=True)
+    j.add_argument("--effort", required=True, choices=EFFORTS)
+    j.set_defaults(func=cmd_interrupt_and_resume)
+
     k = sub.add_parser("stop", help="停一个任务（只发 SIGINT）")
     k.add_argument("task", type=task_name)
     k.set_defaults(func=cmd_stop)

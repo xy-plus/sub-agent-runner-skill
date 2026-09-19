@@ -1045,12 +1045,13 @@ class TestParser(_HomeSandbox):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
                                    "--effort", bad, "--account", "default"])
 
-    def test_任务名校验挂在四个子命令上_结构上绕不过(self):
+    def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
         for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
                       "--effort", "low", "--account", "default"],
                      ["status", "a|b"], ["resume", "a|b", "--brief", "b.md", "--effort", "low"],
-                     ["stop", "a|b"]):
+                     ["stop", "a|b"],
+                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
 
@@ -1079,6 +1080,59 @@ class TestParser(_HomeSandbox):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
                                    "--effort", "low", "--account", "default", bad, "x"])
+
+
+class TestInterruptAndResumeParser(_HomeSandbox):
+    """参数规则与 resume **逐条一致**：任务名走 type=task_name、--brief 只收文件
+    路径、--effort 必填无默认、不收 --account。同一个工具里 prompt 只有一种传法。
+    """
+
+    def test_与resume同一张参数表_少一个都不收(self):
+        parser = ca.build_parser()
+        for missing in ["--brief", "--effort"]:
+            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"]
+            i = argv.index(missing)
+            del argv[i:i + 2]
+            with self.subTest(missing=missing), self.assertRaises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_effort五档正反都验(self):
+        parser = ca.build_parser()
+        for e in ca.EFFORTS:
+            with self.subTest(effort=e):
+                args = parser.parse_args(["interrupt-and-resume", "t",
+                                          "--brief", "b.md", "--effort", e])
+                self.assertEqual(args.effort, e)
+        for bad in ("中等", "ultra", "minimal"):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
+                                   "--effort", bad])
+
+    def test_不收account_账号是查出来的(self):
+        with self.assertRaises(SystemExit):
+            ca.build_parser().parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
+                                          "--effort", "low", "--account", "default"])
+
+    def test_不提供任何旋钮_没有第二种正确行为(self):
+        # 每个旋钮都是一个让调用方做错的机会：
+        #   --now/--wait   等不等不是选项，不等就会撞写锁
+        #   --force        没有「强行续跑」这种正确行为
+        #   --timeout      上界是实测锚定的，调它只会把自己挂死或误杀正常收尾
+        #   --message      prompt 只有一种传法，就是 --brief 文件
+        #   --account      账号从元数据查出来，不可能指错
+        parser = ca.build_parser()
+        for bad in ["--now", "--wait", "--force", "--timeout", "--message", "--account"]:
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
+                                   "--effort", "low", bad, "x"])
+
+    def test_子命令接到的确实是这条命令的实现(self):
+        # Task 5 的测试是直接拿 Namespace 调命令体的，接错了函数它测不出来。
+        # 这里是命令行到实现之间唯一那根线。
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low"])
+        self.assertIs(args.func, ca.cmd_interrupt_and_resume)
+        self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "low"))
 
 
 class TestRunGuards(_HomeSandbox):
