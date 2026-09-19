@@ -195,6 +195,7 @@ class TestJudge(unittest.TestCase):
         self.report.write_text("\n".join(f"第 {i} 行" for i in range(50)))
         v = ca.judge(self.report, self.log, None)
         self.assertEqual(len(v.detail), ca.REPORT_PREVIEW_LINES)
+        self.assertLess(len(v.detail), 50)   # 钉住「确实截断了」，不随常量一起动
 
     def test_报告在但本轮日志有未分类错误是suspect(self):
         self.report.write_text("干完了")
@@ -648,13 +649,91 @@ class TestResumeGuards(_HomeSandbox):
         self.assertFalse((d / "reports" / "t3.md").exists())
 
 
-class TestStatusExitCode(_HomeSandbox):
-    def test_还在跑时退出码不是0_否则status_and_deploy会提前部署(self):
+class TestExitCodeContract(_HomeSandbox):
+    """退出码是这个工具相对旧 skill 的最大增量，也是 SKILL.md 印出去的对外契约。
+
+    这里断言的全是**绝对值**。写成 `assertEqual(cmd(...), ca.EXIT["running"])`
+    是空测试：常量一改两边一起动，`EXIT["running"] = 0` 这种突变照样绿——
+    而那正是「还在跑」被当成功、`status && deploy` 提前部署的那个 bug。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    def _run_args(self):
+        return ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+
+    def _resume_args(self):
+        return ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+
+    def _spawner(self, d, report_text, log_extra):
+        """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
+        def spawn(*a, **k):
+            if report_text is not None:
+                (d / "reports" / "t.md").write_text(report_text)
+            if log_extra:
+                with open(d / "logs" / "t.log", "a") as f:
+                    f.write(log_extra + "\n")
+            return mock.DEFAULT
+        return spawn
+
+    def _run(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_run(self._run_args())
+
+    def _resume(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_resume(self._resume_args())
+
+    UNCLASSIFIED = ("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                    "Failed to create session: thread-store conflict")
+
+    def test_退出码的绝对值是对外契约(self):
+        self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3, "running": 4})
+        self.assertEqual(ca.USAGE_ERROR, 2)
+        # 护栏拒绝必须和四个判据结论都区分得开
+        self.assertNotIn(ca.USAGE_ERROR, ca.EXIT.values())
+
+    def test_run_正常收尾退出0(self):
+        self.assertEqual(self._run("干完了"), 0)
+
+    def test_run_没留下报告退出1(self):
+        self.assertEqual(self._run(None), 1)
+
+    def test_run_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._run("干完了", self.UNCLASSIFIED), 3)
+
+    def test_resume_正常收尾退出0(self):
+        self.assertEqual(self._resume("干完了"), 0)
+
+    def test_resume_没留下报告退出1(self):
+        self.assertEqual(self._resume(None), 1)
+
+    def test_resume_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._resume("干完了", self.UNCLASSIFIED), 3)
+
+    def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t"))
         args = ca.build_parser().parse_args(["status", "t"])
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
-            self.assertEqual(ca.cmd_status(args), ca.EXIT["running"])
+            self.assertEqual(ca.cmd_status(args), 4)
+
+    def test_status_一个任务都没有时退出0_查询没查到不是失败(self):
+        args = ca.build_parser().parse_args(["status"])
+        self.assertEqual(ca.cmd_status(args), 0)
 
     def test_多任务取最该拦住调用方的那个(self):
         # 四个状态的相对顺序全部钉死：少钉一对，_SEVERITY 就能被悄悄重排。

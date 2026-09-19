@@ -27,6 +27,37 @@
 - **护栏拒绝一律用 `reject()`，退出码 2**，不用裸 `raise SystemExit("人话")`——后者的
   退出码是 1，和 `EXIT["failed"]` 撞码，调用方分不清「`--dir` 写错了」和「codex 真的失败了」。
 
+
+## 第三轮：代码审查（78 个突变，杀 57 存活 21）的处置
+
+审查确认承重约束的突变全部被杀（信号安全、`comm`/`-u` 过滤、防陈旧报告、三种错误形式、
+target 白名单、开跑前三件事的顺序、`read1` 实时性、EPERM、`strip_ansi`、severity 排序、
+resume 三处 flag 差异、任务名字符集、四个子命令的 `type=`）。存活的 21 个集中在下面几块。
+
+| 编号 | 问题 | 处置 |
+|---|---|---|
+| C1 | 退出码契约**零覆盖**，且 `test_还在跑时退出码不是0` 断言的是 `EXIT["running"] == EXIT["running"]`，两边一起动，名字在说谎 | 钉死 `EXIT` 的**绝对值**；`cmd_run`／`cmd_resume` 各补 success／failed／suspect 三态退出码测试；全文件扫一遍同类空断言 |
+| I1 | `_TASK_NAME` 允许 `.`，而 `.` 是 `pgrep -f` 的正则元字符：任务名 `a` 会命中 `aXmd` 的 codex，`stop a` 把 SIGINT 发给别人 | **不转义，治本**：`find_codex_pid` 改成扫 `/proc/*/cmdline` 做 **argv 精确元素匹配** + 读 `comm` + `st_uid`。一次干掉正则语义、`-u`、`comm` 三件事，还省掉每次 1+N 个子进程 |
+| I2 | `run_codex` 收现成的 `argv`，却自己重新推导报告路径去删——三条「必须记得对齐」无人保证 | `run_codex(kind, home, task, meta, make_argv)`，报告路径由它拥有并回传给 `make_argv`；`env` 也由 `home` 内部派生。三条契约变成结构上不可违反 |
+| I3 | `REQUIRED_META_KEYS` 号称「形状只定义一次」，`cmd_run` 却另起炉灶拼字典；少一个字段 → 任务从此 status/resume/stop 全够不着，而工具建议「删掉重来」会**弄丢会话** | 唯一构造器 `new_meta()`，`REQUIRED_META_KEYS` **由它派生**；测试断言落盘 meta 的键集**相等** |
+| I4 | 七条硬约束无测试：`approval_policy`／`project_doc_max_bytes`／`--disable plugins`／`--skip-git-repo-check`／`--dir` 不再 resolve／`stdin=DEVNULL`／`cmd_resume` 的 `ensure_isolation` | 一张参数断言表对两条 argv **各跑一遍**（含 m10 的 `MODEL`）；补 resolve、stdin、resume 隔离校验三条测试 |
+| I5 | 被 INT 打断的任务判据报 `failed`，而正确处置是 `resume`——「`run_in_background` 编不进去」那条缓解措施自己的缺口 | `forward_as_sigint` 往日志追一行打断标记，`judge` 在「报告缺失」分支特判，**只改 reason 不新增状态** |
+| I6 | 「SIGINT 之后仍可 resume」是 2026-09-08 的旧结论，而同类假设本分支已漂移过一次（`--color`） | 真机 `run → stop → resume` 复验一次 `--effort low` |
+| m11 | `finally` 还原信号处置被判「不可达」 | **不接受**：单测是在进程内直调 `run_codex` 的第二调用方，不还原则测试进程余生响应不了 Ctrl-C。代码保留，**补测试钉住还原** |
+
+**I4 最后一条的更正（实测）**：审查说「`cmd_resume` 不调 `ensure_isolation`，是实现违反 spec §6」。
+实测不成立——`cmd_resume` 第 627 行就有这一句，删掉它 80 个测试照样全绿。
+所以这是**测试缺口，不是代码缺陷**，只补测试，不改代码。
+
+**m4**（`status` 无任务返回 0）：保持 0——查询没查到不是失败——但补测试钉住，别让它是「碰巧」。
+**m9**（`SKILL.md` 55 行 > 计划写的 ≤50）：**行数不是验收判据**，真判据是「已进代码的约束在文档里泄漏数 = 0」（实测为 0）。
+不为凑数字删内容，下面 Task 7 的验收条件按真判据改写。
+
+**一条不能只住在 spec 里的知识**：实测前台与后台的 Bash 环境**逐字节相同**
+（14 个 `CLAUDE_*` 变量、父进程、tty 状态全一样），所以「必须用 `run_in_background`」
+**无法编码成硬约束**。这条连同它的缓解措施（信号转发保住上下文）写进代码注释——spec 要删，
+知识得有个家。
+
 ---
 
 ### Task 1: log 解析纯函数（ANSI／运行时 ERROR／session id）
