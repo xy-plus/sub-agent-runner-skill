@@ -255,7 +255,7 @@ class TestRoundBoundary(unittest.TestCase):
         log.write_bytes("上一轮的尾巴\n".encode())
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         self.assertEqual(text, "本轮的内容\n")
 
     def test_后来的轮次不能把前一轮判瞎_这是P1的回归锁(self):
@@ -268,12 +268,13 @@ class TestRoundBoundary(unittest.TestCase):
                 log, ca.INTERRUPT_MARK + "\n",
                 ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
                 + "\n干净收尾\n")
-            round_text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
 
-        self.assertEqual(ca.judge(report, round_text).state, "interrupted")
+        self.assertEqual(ca.judge(rd).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotEqual(ca.judge(report, ca.read_last_round(log)).state, "interrupted")
+        self.assertNotEqual(ca.judge(ca.Round(report, ca.read_last_round(log))).state,
+                            "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
         d = self._home()
@@ -283,7 +284,7 @@ class TestRoundBoundary(unittest.TestCase):
                 log, "本轮干净\n",
                 ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n",
                 ERR_FATAL + "\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         self.assertEqual(text, "本轮干净\n")
         self.assertEqual(ca.runtime_error_lines(text), [],
                          "后一轮的致命错误被算到了前一轮头上")
@@ -296,7 +297,7 @@ class TestRoundBoundary(unittest.TestCase):
         log.write_bytes("上一轮写了很多中文内容\n".encode())
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮第一行\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         raw = log.read_bytes()
         self.assertNotEqual(len(raw), len(raw.decode()),
                             "前提不成立：日志里没有多字节字符，这条测不到错位")
@@ -398,9 +399,9 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         args = ca.build_parser().parse_args(["status", "t"])
         seen, texts, real_judge = [], [], ca.judge
 
-        def spy(report_path, round_text):
-            texts.append(round_text)
-            v = real_judge(report_path, round_text)
+        def spy(rd):
+            texts.append(rd.text)
+            v = real_judge(rd)
             seen.append(v)
             return v
 
@@ -431,7 +432,7 @@ class TestJudge(unittest.TestCase):
         self.report = self.d / "t.md"
 
     def _judge(self, round_text="正常收尾\n"):
-        return ca.judge(self.report, round_text)
+        return ca.judge(ca.Round(self.report, round_text))
 
     def test_报告缺失是failed(self):
         v = self._judge()
@@ -551,7 +552,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
 
     def test_有打断标记且无报告时状态是interrupted(self):
-        v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n")
+        v = ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n"))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
@@ -560,7 +561,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
         for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             with self.subTest(mark=mark):
-                v = ca.judge(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n")
+                v = ca.judge(ca.Round(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -575,7 +576,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
                              "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
-        v = ca.judge(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n")
+        v = ca.judge(ca.Round(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n"))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])

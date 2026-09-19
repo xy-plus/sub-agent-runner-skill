@@ -256,18 +256,37 @@ def clear_report(report_path):
     report_path.unlink(missing_ok=True)
 
 
+class Round(NamedTuple):
+    """一轮的两件产物：报告文件路径 + 本轮的日志文本。**成对，不拆开传。**
+
+    拆开传时 `run_codex` 声称消灭掉的那类「必须记得对齐」只是上移了一层：
+    它的 docstring 写着「报告路径由本函数拥有……这三条在结构上就违反不了了」，
+    而调用方随后又自己算一遍同一个路径喂给 judge。更糟的是
+    `judge(report, <任意 str>)` 传错文本是**静默算对**的——拿另一个任务的日志
+    去判这个任务的报告，不报错，只给一个假结论。
+    成对之后，「哪份报告配哪段文本」在拥有者那条路上写不错：`run_codex` 自己
+    把两样一起交出来。外部观察者（status）没有本轮文本可用，只能显式构造
+    `Round(report, read_last_round(log))`——显式，所以看得见它在用推测。
+    """
+    report_path: object   # pathlib.Path
+    text: str             # 本轮的日志文本（已 strip_ansi、已切好边界）
+
+
 class Verdict(NamedTuple):
     state: str   # success / running / interrupted / suspect / failed
     reason: str  # 一行人话
     detail: list # suspect／failed：出事的那几行；success：报告前几行
 
 
-def judge(report_path, round_text):
+def judge(round):
     """唯一的成败判据——**只看产物和本轮日志**。`run`／`resume` 收尾和 `status`
     共用它，避免两处判据漂移。
 
+    收的是一个 `Round`（报告路径 + 本轮文本）而不是两个参数：那两样必须配套，
+    而拆开传时配错是**静默算对**的。理由写在 `Round` 上。
+
     **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
-    不一样：本轮的拥有者拿 `run_codex` 回传的本轮文本，外部观察者只能看最后
+    不一样：本轮的拥有者拿 `run_codex` 回传的 `Round`，外部观察者只能看最后
     一轮（`read_last_round`）。把这件事塞回 judge 里，就只剩「猜」一种做法，
     而那正是这次要修掉的整类 bug。
 
@@ -280,6 +299,7 @@ def judge(report_path, round_text):
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
     """
+    report_path, round_text = round.report_path, round.text
     errors = runtime_error_lines(round_text)
     # errors="replace"：codex 被 SIGINT 打断时可能只写出半截字节，
     # 裸 read_text 会 UnicodeDecodeError 把判据整个打崩。
@@ -696,7 +716,8 @@ def _log_path(home, task):
 
 
 def run_codex(kind, home, task, meta, make_argv):
-    """唯一的 spawn 入口。**返回本轮的日志文本**（codex 退出那一刻的快照）。
+    """唯一的 spawn 入口。**返回一个 `Round`**：报告路径 + 本轮日志文本
+    （codex 退出那一刻的快照）。
 
     开跑前必须做的三件事全在这里，调用方不需要记住顺序：
     ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
@@ -763,11 +784,13 @@ def run_codex(kind, home, task, meta, make_argv):
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
-    # 回传**本轮的日志文本**而不是偏移。偏移是可以被悄悄丢掉的：调用方忘了接，
-    # 唯一还能拿到本轮文本的路就是 read_last_round——正好是这次要修的那个 bug。
-    # 文本丢不掉，它就是 judge 的参数（铁律 2：把约束做进签名本身）。
+    # 回传**报告路径 + 本轮日志文本**这一对，而不是偏移。
+    # 偏移是可以被悄悄丢掉的：调用方忘了接，唯一还能拿到本轮文本的路就是
+    # read_last_round——正好是这次要修的那个 bug。文本丢不掉，它就是 judge 的参数。
+    # 成对回传是因为报告路径本来就归本函数所有（见上），调用方再算一遍同一个
+    # 路径就又冒出一条「必须记得对齐」；而配错是静默算对的（理由见 Round）。
     # 副带好处：快照在 codex 退出那一刻取走，比「调用方稍后自己读」窗口更小。
-    return read_round(_log_path(home, task), start_offset)
+    return Round(report, read_round(_log_path(home, task), start_offset))
 
 
 def _tee_until_exit(proc, log, home, task, meta):
@@ -839,10 +862,9 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text())
     _say(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
-    # 本轮的拥有者：judge 收的就是 run_codex 回传的本轮文本，**不用 read_last_round**
+    # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    verdict = judge(report,
-                    run_codex("run", home, args.task,
+    verdict = judge(run_codex("run", home, args.task,
                               new_meta(args.task, args.account, str(workdir), args.effort),
                               lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
@@ -868,9 +890,10 @@ def cmd_status(args):
         # 还在跑就**不读日志**：判据在这一支根本用不到它，而 status 是轮询用的
         # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
         # 列全部任务还要乘任务数。
-        # 不在跑时它是外部观察者：手里没有本轮文本，只能看最后一轮，也只该看最后一轮。
+        # 不在跑时它是外部观察者：手里没有本轮文本，只能看最后一轮，也只该看
+        # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
-                   else judge(report, read_last_round(log)))
+                   else judge(Round(report, read_last_round(log))))
         _say(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
               f"{verdict.reason}  {meta['dir']}")
         for line in verdict.detail:
@@ -923,8 +946,7 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
     meta["started_at"] = _now_iso()
-    verdict = judge(_report_path(home, task),
-                    run_codex(kind, home, task, meta,
+    verdict = judge(run_codex(kind, home, task, meta,
                               lambda r: build_resume_argv(meta["dir"], meta["session_id"],
                                                           effort, r, brief)))
     _print_verdict(task, verdict)
