@@ -525,10 +525,29 @@ CONFIG_NOTE = '''# codex-agent 的隔离配置。
 '''
 
 
+# 账号名里不许有空白或控制字符。它会进 status 数据行的第二列，而那一列是
+# `split(maxsplit=4)` 的切分边界之一（见 status_row）。和任务名限字符集同一条
+# 理由：这个值会进入按空白切分的输出，**约束必须在入口**——而扫描就是它进入
+# 系统的唯一入口。刻意只拒空白和控制字符、不照搬 _TASK_NAME 的字符集：
+# `工作` 这种账号名一点问题都没有，按任务名的白名单会把它一起误伤。
+_BAD_IN_ACCOUNT = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
 def account_choices():
-    """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。"""
+    """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。
+
+    扫到坏名字就**拒跑**，不静默跳过：跳过的话这个账号的隔离目录对
+    `find_meta`／`all_metas` 也一起消失，住在里面的任务从此 status 看不见、
+    而同名 run 又会当它不存在——正是这次改动要消灭的那种静默失效。
+    """
     accounts_dir = pathlib.Path.home() / ".codex-accounts"
-    extra = sorted(p.name for p in accounts_dir.iterdir() if p.is_dir()) if accounts_dir.is_dir() else []
+    extra = sorted(q.name for q in accounts_dir.iterdir() if q.is_dir()) if accounts_dir.is_dir() else []
+    for name in extra:
+        hit = _BAD_IN_ACCOUNT.search(name)
+        if hit:
+            reject(f"账号目录名 {accounts_dir / name} 含空白或控制字符 {hit.group()!r}"
+                   f"（第 {hit.start()} 个字符）。账号名会进 status 数据行的第二列，"
+                   f"那一列是按空白切分的边界。改掉这个目录名再跑。")
     return ["default"] + extra
 
 
@@ -1056,6 +1075,55 @@ def _tee_until_exit(proc, log, home, task, meta):
     proc.wait()
 
 
+# status 数据行的列序是**机器切分的契约**：前四列无空白，所以
+# `line.split(maxsplit=4)` 精确切出它们，第五段是「工作目录 + reason」。
+# **7 个 Verdict 构造点里有 4 个的 reason 含空格**（「本轮被 INT 打断，上下文
+# 保留——接着 resume 即可，不用重跑」、「报告在，但本轮日志有 N 条未分类的
+# codex 错误」、「会话被写锁占住（……曾被 SIGTERM 杀过），只能新起一个任务」、
+# 「pid=N 存活」），所以 reason 必须排在最后——这就是这次换列序的全部理由。
+# dir 与 reason 因此不可分，可以接受：dir 早就在 tasks/<task>.json 里，
+# 调用方真正要的是 state 和退出码。
+#
+# **刻意不换格式。** 初稿的制表符方案被实测否掉：按 tabstop=8 量四行真实输出
+# 的各列屏幕起始列，[0,16,24,32,40,80] / [0,16,24,32,40,88] / [0,8,16,24,32,40]
+# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]。
+#
+# 退出码单独成列：它和 state 是同一份事实的两种编码，但**同源派生**（都来自
+# EXIT[state]），不存在漂移风险。人读词，机器读码。
+#
+# 白名单（skills）刻意**不进列**：skill 路径是任意长度的绝对路径，进数据行会
+# 把定宽撑坏。要审计就读 tasks/<task>.json，那本来就是结构化的。
+_WHITESPACE = re.compile(r"\s")
+
+
+def status_row(task, account, state, workdir, reason):
+    """拼一行数据行，**拼之前先断言它切得开**——这条不是碰巧成立的。
+
+    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。看着天生
+    无空格（任务名过 _TASK_NAME、状态是枚举、退出码是整数），但**账号不是**
+    ——它的值读自 `tasks/<task>.json`，而 `_load_meta` 只校验**键**在不在，
+    值长什么样一概不管。目录名那一侧另有 account_choices() 在入口拒，
+    两道守的是两个不同的入口，不是重复防御。
+
+    后两列断言「没有控制字符」：dir 和 reason 里空格是合法的（它们同在第五段），
+    换行和制表符不是——一个换行就让「一行一任务」不成立，任何切分方案都救不
+    回来。`--dir` 在入口已经挡过一道（见 work_dir），reason 当前也恰好不含
+    （穷举 Verdict 的 7 个构造点确认过），但那是**碰巧成立、无人守卫**。
+
+    明细行（错误行与报告预览）不走这里：它们由 cmd_status 加缩进打印，
+    首字符是空白，从而与数据行结构性可分；而它们的内容来自 splitlines()，
+    结构上不可能含换行。
+    """
+    for label, field in (("任务名", task), ("账号", account), ("状态", state)):
+        if _WHITESPACE.search(field):
+            reject(f"{label} {field!r} 含空白字符——status 的前四列就切不开了，"
+                   f"调用方再也取不出 state。")
+    for label, field in (("工作目录", workdir), ("reason", reason)):
+        if _CONTROL_CHARS.search(field):
+            reject(f"{label} {field!r} 含控制字符——「一行一任务」就不成立了。")
+    return f"{task:<24} {account:<8} {state:<8} {EXIT[state]:<4} {workdir}  {reason}"
+
+
 def _print_verdict(task, verdict):
     print(f"\n[codex-agent] {task}: {verdict.state} —— {verdict.reason}")
     for line in verdict.detail:
@@ -1122,9 +1190,10 @@ def cmd_status(args):
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
                    else judge(Round(report, read_last_round(log))))
-        print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
-              f"{verdict.reason}  {meta['dir']}")
+        print(status_row(meta["task"], meta["account"], verdict.state,
+                         meta["dir"], verdict.reason))
         for line in verdict.detail:
+            # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
             print(f"    {line}")
         worst = _worse(worst, verdict.state)
     return EXIT[worst]
@@ -1442,8 +1511,14 @@ def main():
     # 而漏一个不会报错。实测那两个突变（新加一行裸 print、把某句 _say 改回裸
     # print）在收了 _say() 的版本上**都存活**。行缓冲之后裸 print 自动正确。
     sys.stdout.reconfigure(line_buffering=True)
-    args = build_parser().parse_args()
+    # build_parser() 也在 try 里面：account_choices() 扫到坏账号目录名时会 reject，
+    # 而 Rejected 就是 SystemExit(2)——漏在 try 外面它会直接逃出去，退出码还是 2
+    # 但 message 全丢，调用方拿到一个没有任何解释的 2。对 agent 调用方，
+    # 「有码无话」是最救不回来的一种失败。
+    # argparse 自己的参数错误不是 Rejected（它自己已经把话写到 stderr 了），
+    # 照旧原样逃出去，这里不拦。
     try:
+        args = build_parser().parse_args()
         return args.func(args)
     except Rejected as e:
         print(e.message, file=sys.stderr)

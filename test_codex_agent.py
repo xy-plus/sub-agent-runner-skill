@@ -47,6 +47,7 @@ interrupt-and-resume、退出码怎么读），正好把这次重写的目的做
 """
 import argparse
 import contextlib
+import io
 import json
 import os
 import pathlib
@@ -731,6 +732,35 @@ class TestIsolation(_HomeSandbox):
 
     def test_账号可选项来自实际目录扫描(self):
         self.assertEqual(ca.account_choices(), ["default", "acct2"])
+
+    def test_账号目录名含空白或控制字符就拒跑_并点名是哪个目录(self):
+        # 这个名字会进 status 的第二列，而那一列是按空白切分的边界之一。
+        # 约束必须在**入口**：扫描是它进入系统的唯一入口。
+        for bad in ("bad acct", "bad\tacct", "bad\nacct"):
+            with self.subTest(bad=bad):
+                d = self.home / ".codex-accounts" / bad
+                d.mkdir()
+                try:
+                    self.assertTrue(d.is_dir(), "前提不成立：这种名字的目录建不起来，那就没有洞")
+                    with self.assertRaises(ca.Rejected) as cm:
+                        ca.account_choices()
+                    self.assertIn(bad, cm.exception.message)
+                finally:
+                    d.rmdir()
+        self.assertEqual(ca.account_choices(), ["default", "acct2"],
+                         "前提不成立：坏目录清掉之后它就该正常返回")
+
+    def test_扫描期的拒绝也要说人话_不能只剩一个光秃秃的退出码2(self):
+        # account_choices() 在 build_parser() 里被调用，而那一句排在 main() 的
+        # try 之外的话，Rejected 会直接当 SystemExit(2) 逃出去——message 全丢，
+        # 调用方拿到一个没有任何解释的 2。这是 agent 最救不回来的一种失败。
+        (self.home / ".codex-accounts" / "bad acct").mkdir()
+        err = io.StringIO()
+        with mock.patch.object(ca.sys, "stdout", mock.MagicMock()), \
+             mock.patch.object(ca.sys, "argv", ["codex-agent", "status"]), \
+             contextlib.redirect_stderr(err):
+            self.assertEqual(ca.main(), 2)
+        self.assertIn("bad acct", err.getvalue())
 
     def test_default账号映射到不带后缀的隔离目录(self):
         self.assertEqual(ca.isolation_home("default"), self.home / ".codex-subagent")
@@ -2068,6 +2098,119 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
+
+
+class TestStatusIsSplittable(_HomeSandbox):
+    """列表形态的 status 必须**机器切得开**。这是本改动的全部理由。
+
+    旧格式是 `f"{task:<24} {account:<8} {state:<8} {reason}  {dir}"`，而 reason
+    含空格 → 后面任何一列都取不出来。**7 个 Verdict 构造点里有 4 个的 reason
+    真的含空格**：「本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑」、
+    「报告在，但本轮日志有 N 条未分类的 codex 错误」、「会话被写锁占住（……曾被
+    SIGTERM 杀过），只能新起一个任务」、「pid=N 存活」。
+    （spec 和计划都写成「5 个」，实跑逐条数过是 4 个——它们把 suspect 那条重复
+    数了一次。另外 spec §1 举的那个例子「报告缺失或为空＝没正常收尾」**不含
+    空格**，照它写的测试测不到任何东西，所以这里一律用真的含空格的那几条。）
+
+    真正缺的只有一样：列表形态下每行的 state（单任务查询用退出码就够了，
+    dir/account/effort/session_id 早就在 tasks/<task>.json 里）。
+
+    采纳的方案是**换列序、不换格式**。初稿的制表符方案被实测否掉：按 tabstop=8
+    量四行真实 status 输出的各列屏幕起始列，[0,16,24,32,40,80] /
+    [0,16,24,32,40,88] / [0,8,16,24,32,40] / [0,32,40,56,64,80]——四行没有一列
+    对齐，而空格定宽是稳定的 [0,25,34,43]。
+    """
+
+    # 真的含空格的那一条（judge 的 interrupted 分支原文），不是造出来的例子
+    REASON_WITH_SPACES = "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑"
+
+    def test_前四列用split切得开_reason含空格也不影响(self):
+        row = ca.status_row("t1", "default", "failed", "/abs/repo", self.REASON_WITH_SPACES)
+        self.assertGreater(len(self.REASON_WITH_SPACES.split()), 1,
+                           "前提不成立：reason 不含空格的话，这条根本测不到东西")
+        self.assertEqual(row.split(maxsplit=4)[:4], ["t1", "default", "failed", "1"])
+
+    def test_第五段是工作目录加reason_dir含空格也切得开(self):
+        row = ca.status_row("t1", "default", "failed", "/abs/my repo", self.REASON_WITH_SPACES)
+        tail = row.split(maxsplit=4)[4]
+        self.assertTrue(tail.startswith("/abs/my repo"), tail)
+        self.assertTrue(tail.endswith(self.REASON_WITH_SPACES), tail)
+
+    def test_退出码那一列的绝对值_五态逐个(self):
+        # 绝对值，不写 ca.EXIT[state]：那样两边一起动，EXIT["running"]=0 这种
+        # 突变照样绿——而那正是 status && deploy 提前部署的那个 bug。
+        for state, code in (("success", "0"), ("failed", "1"), ("suspect", "3"),
+                            ("running", "4"), ("interrupted", "130")):
+            with self.subTest(state=state):
+                row = ca.status_row("t1", "default", state, "/abs/repo", "一句人话")
+                self.assertEqual(row.split(maxsplit=4)[3], code)
+
+    def test_明细行有缩进_数据行没有(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        ca._log_path(d, "t").write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00")
+                                        + "\n" + ERR_FATAL + "\n")
+        ca._report_path(d, "t").write_text("干完了\n")
+        screen = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(screen):
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        lines = [l for l in screen.getvalue().splitlines() if l]
+        data = [l for l in lines if not l[0].isspace()]
+        detail = [l for l in lines if l[0].isspace()]
+        self.assertEqual(len(data), 1, f"数据行不止一行：{lines}")
+        self.assertTrue(detail, "前提不成立：这一轮没有明细行，那这条测不到可分性")
+        self.assertEqual(data[0].split(maxsplit=4)[:3], ["t", "default", "suspect"])
+
+    def test_reason含制表符时当场拒绝(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.status_row("t1", "default", "failed", "/abs/repo", "坏\treason")
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_工作目录含换行时当场拒绝(self):
+        with self.assertRaises(ca.Rejected):
+            ca.status_row("t1", "default", "failed", "/abs/a\nb", "一句人话")
+
+    def test_账号含空白时当场拒绝_这一列的值来自元数据文件(self):
+        # 前四列「天生无空格」这句话对账号**不成立**。目录名那一侧由
+        # account_choices() 在入口拒（见 TestIsolation），而 status 第二列读的是
+        # tasks/<task>.json 里的 account 字段——_load_meta 只校验**键**在不在，
+        # 值长什么样一概不管，所以这一道是独立的第二个入口，不是重复防御。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", account="bad acct"))
+        self.assertEqual(ca._load_meta(ca.meta_path(d, "t"))["account"], "bad acct",
+                         "前提不成立：元数据这一侧居然校验了 account 的值，那就不是真的洞")
+        with self.assertRaises(ca.Rejected):
+            ca.status_row("t1", "bad acct", "failed", "/abs/repo", "一句人话")
+
+    def test_任务名和状态含空白也拒绝(self):
+        for task, state in (("t 1", "failed"), ("t1", "fai led")):
+            with self.subTest(task=task, state=state), self.assertRaises(ca.Rejected):
+                ca.status_row(task, "default", state, "/abs/repo", "一句人话")
+
+    def test_真实status输出每行一个任务_两个任务各切出四列(self):
+        # 刻意选 interrupted 这一支：它的 reason **真的含空格**，端到端走一遍才算
+        # 把「reason 排在最后」这件事钉住。选 failed 那一支测不到——它的 reason
+        # （「报告缺失或为空＝没正常收尾」）一个空格都没有。
+        d = ca.ensure_isolation("default")
+        for name in ("alpha", "beta"):
+            ca.write_meta(d, name, _full_meta(name, dir="/abs/repo"))
+            ca._log_path(d, name).write_text(
+                ca.round_separator("run", name, "2026-09-19T00:00:00") + "\n"
+                + ca.INTERRUPT_MARK + "\n")
+        screen = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(screen):
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        data = [l for l in screen.getvalue().splitlines() if l and not l[0].isspace()]
+        self.assertEqual([l.split(maxsplit=4)[0] for l in data], ["alpha", "beta"])
+        for line in data:
+            with self.subTest(line=line):
+                self.assertEqual(line.split(maxsplit=4)[1:4], ["default", "interrupted", "130"])
+                tail = line.split(maxsplit=4)[4]
+                self.assertTrue(tail.startswith("/abs/repo"), tail)
+                self.assertIn(" ", tail[len("/abs/repo"):].strip(),
+                              "前提不成立：这一支的 reason 不含空格，那就没测到列序")
 
 
 class TestExitCodeContract(_HomeSandbox):
