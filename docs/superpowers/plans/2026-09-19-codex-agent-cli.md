@@ -852,6 +852,30 @@ class TestResumeGuards(unittest.TestCase):
                 ca.cmd_resume(args)
         self.assertIn("session id", str(cm.exception))
 
+class TestSignalSafety(unittest.TestCase):
+    """codex 只能死于 INT——这是整个工具最不能出错的一条保证。"""
+
+    def _run_once(self, popen):
+        d = pathlib.Path(tempfile.mkdtemp())
+        (d / "tasks").mkdir()
+        popen.return_value.stdout.read.return_value = b""
+        popen.return_value.wait.return_value = 0
+        ca.run_codex(["codex"], {}, d / "t.log", d, "t")
+
+    def test_codex起在独立会话里_组信号打不到它(self):
+        with mock.patch.object(ca.subprocess, "Popen") as popen:
+            self._run_once(popen)
+        self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+
+    def test_包装器收到SIGTERM时向codex转发的是SIGINT(self):
+        with mock.patch.object(ca.subprocess, "Popen") as popen, \
+             mock.patch.object(ca.signal, "signal") as sigsig:
+            self._run_once(popen)
+            handled = {c.args[0] for c in sigsig.call_args_list}
+            self.assertEqual(handled, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
+            sigsig.call_args_list[0].args[1](signal.SIGTERM, None)
+        popen.return_value.send_signal.assert_called_with(signal.SIGINT)
+
 class TestStop(unittest.TestCase):
     def setUp(self):
         self.home = pathlib.Path(tempfile.mkdtemp())
@@ -929,9 +953,27 @@ def run_codex(argv, env, log_path, home, task):
     stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
     "Reading additional input from stdin" + 进程 0% CPU）。
     不设 timeout：会误杀正当的长任务。
+
+    start_new_session=True 不是为了 detach，是为了挡组信号。2026-09-19 实测：
+    codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停后台任务就是这么干的）
+    会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、再也 resume 不了。
+    隔到独立会话后，codex 收不到任何组信号，只会收到下面 handler 转发的 INT。
     """
     proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+    def forward_as_sigint(signum, frame):
+        # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
+        # 不在这里退出：让 tee 循环跑完，判据照样出、通知照样带结论。
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward_as_sigint)
+
     head, session_id = b"", None
     with open(log_path, "wb") as log:
         for chunk in iter(lambda: proc.stdout.read(1024), b""):
