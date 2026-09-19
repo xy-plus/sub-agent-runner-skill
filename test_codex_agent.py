@@ -29,7 +29,7 @@
        要防的「status && deploy 在任务还在跑的时候提前部署」。
     3. `assertEqual(set(new_meta(...)), set(REQUIRED_META_KEYS))`，而后者是从
        前者派生的。构造器少一个字段，校验面跟着少，测试照样绿。
-    4. `assertEqual(ca.judge(report, log, None).state, "failed")` 只钉状态，不钉
+    4. `assertEqual(ca.judge(report, log_text).state, "failed")` 只钉状态，不钉
        「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，判据
        被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
        （见 TestRoundBoundary：正面钉拥有者的偏移，反面钉「猜边界当场失明」）。
@@ -271,9 +271,9 @@ class TestRoundBoundary(unittest.TestCase):
             round_text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
 
-        self.assertEqual(ca.judge(report, round_text, None).state, "interrupted")
+        self.assertEqual(ca.judge(report, round_text).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotEqual(ca.judge(report, ca.read_last_round(log), None).state, "interrupted")
+        self.assertNotEqual(ca.judge(report, ca.read_last_round(log)).state, "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
         d = self._home()
@@ -369,6 +369,19 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             ca.cmd_resume(args)
         self.assertIn("resume", seen["v"].reason)
 
+    def test_还在跑时status根本不读日志_那一支用不到它(self):
+        # judge 在「还在跑」这一支根本不碰 round_text，而 status 正是轮询用的
+        # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
+        # 不带任务名时还要乘任务数——读出来再丢掉是白烧。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        ca._log_path(d, "t").write_text("随便什么\n")
+        args = ca.build_parser().parse_args(["status", "t"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "read_last_round") as r:
+            self.assertEqual(ca.cmd_status(args), 4)   # 绝对值：还在跑就是 4
+        r.assert_not_called()
+
     def test_status用的是最后一轮_外部观察者只能看最后一轮(self):
         # 反向钉一道：status 没有偏移可用，它只能看最后一轮，也**只该**看最后一轮。
         # 接成别的（比如从头扫）会把上一轮的打断标记算到这一轮头上。
@@ -385,9 +398,9 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         args = ca.build_parser().parse_args(["status", "t"])
         seen, texts, real_judge = [], [], ca.judge
 
-        def spy(report_path, round_text, pid):
+        def spy(report_path, round_text):
             texts.append(round_text)
-            v = real_judge(report_path, round_text, pid)
+            v = real_judge(report_path, round_text)
             seen.append(v)
             return v
 
@@ -417,11 +430,8 @@ class TestJudge(unittest.TestCase):
         self.d = pathlib.Path(tempfile.mkdtemp())
         self.report = self.d / "t.md"
 
-    def _judge(self, round_text="正常收尾\n", pid=None):
-        return ca.judge(self.report, round_text, pid)
-
-    def test_PID还活着就是running_不看产物(self):
-        self.assertEqual(self._judge(pid=12345).state, "running")
+    def _judge(self, round_text="正常收尾\n"):
+        return ca.judge(self.report, round_text)
 
     def test_报告缺失是failed(self):
         v = self._judge()
@@ -534,7 +544,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
 
     def test_有打断标记且无报告时状态是interrupted(self):
-        v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n", None)
+        v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 5)
         self.assertIn("resume", v.reason)
@@ -543,7 +553,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
         for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             with self.subTest(mark=mark):
-                v = ca.judge(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n", None)
+                v = ca.judge(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n")
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -558,7 +568,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
                              "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
-        v = ca.judge(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n", None)
+        v = ca.judge(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])

@@ -257,25 +257,29 @@ def clear_report(report_path):
 
 
 class Verdict(NamedTuple):
-    state: str   # running / success / suspect / failed
+    state: str   # success / running / interrupted / suspect / failed
     reason: str  # 一行人话
     detail: list # suspect／failed：出事的那几行；success：报告前几行
 
 
-def judge(report_path, round_text, pid):
-    """唯一的成败判据。`run`／`resume` 收尾和 `status` 共用它，避免两处判据漂移。
+def judge(report_path, round_text):
+    """唯一的成败判据——**只看产物和本轮日志**。`run`／`resume` 收尾和 `status`
+    共用它，避免两处判据漂移。
 
     **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
-    不一样：本轮的拥有者手里有 `run_codex` 回传的起始偏移（`read_round`），
-    外部观察者只能看最后一轮（`read_last_round`）。把这件事塞回 judge 里，
-    就只剩「猜」一种做法，而那正是这次要修掉的整类 bug。
+    不一样：本轮的拥有者拿 `run_codex` 回传的本轮文本，外部观察者只能看最后
+    一轮（`read_last_round`）。把这件事塞回 judge 里，就只剩「猜」一种做法，
+    而那正是这次要修掉的整类 bug。
+
+    **存活与否不在这里判**：那是进程的事，不是产物的事。三个调用点里有两个
+    恒传 `None`，说明 pid 本来就只属于剩下那一家（`status`）。留着它还要白烧：
+    `pid is not None` 那一支根本不碰 round_text，读出来直接丢，而 status 的
+    热路径恰恰是轮询**还在跑**的任务（实测 read_last_round：0.83MB 约 10ms、
+    8.3MB 约 100ms，不带任务名时还要乘任务数）。
 
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
     """
-    if pid is not None:
-        return Verdict("running", f"pid={pid} 存活", [])
-
     errors = runtime_error_lines(round_text)
     # errors="replace"：codex 被 SIGINT 打断时可能只写出半截字节，
     # 裸 read_text 会 UnicodeDecodeError 把判据整个打崩。
@@ -815,8 +819,7 @@ def cmd_run(args):
     verdict = judge(report,
                     run_codex("run", home, args.task,
                               new_meta(args.task, args.account, str(workdir), args.effort),
-                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)),
-                    None)
+                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
@@ -836,8 +839,13 @@ def cmd_status(args):
     worst = "success"
     for home, meta in rows:
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
-        # 外部观察者：它手里没有偏移，只能看最后一轮，也只该看最后一轮。
-        verdict = judge(report, read_last_round(log), find_codex_pid(report))
+        pid = find_codex_pid(report)
+        # 还在跑就**不读日志**：判据在这一支根本用不到它，而 status 是轮询用的
+        # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
+        # 列全部任务还要乘任务数。
+        # 不在跑时它是外部观察者：手里没有本轮文本，只能看最后一轮，也只该看最后一轮。
+        verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
+                   else judge(report, read_last_round(log)))
         print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
               f"{verdict.reason}  {meta['dir']}")
         for line in verdict.detail:
@@ -893,8 +901,7 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     verdict = judge(_report_path(home, task),
                     run_codex(kind, home, task, meta,
                               lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                          effort, r, brief)),
-                    None)
+                                                          effort, r, brief)))
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 
