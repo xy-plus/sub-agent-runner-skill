@@ -162,3 +162,35 @@ class TestIsolation(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             ca.ensure_isolation("acct3")
         self.assertIn("登录", str(cm.exception))
+
+
+class TestArgv(unittest.TestCase):
+    def test_兜底句被前置且只加一次(self):
+        once = ca.prepend_skill_guard("干活")
+        self.assertTrue(once.startswith(ca.SKILL_GUARD))
+        self.assertEqual(ca.prepend_skill_guard(once), once)
+
+    def test_run参数完整(self):
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.json", "brief")
+        self.assertEqual(argv[:3], ["codex", "exec", "--cd"])
+        self.assertEqual(argv[3], "/abs/repo")
+        self.assertIn("--sandbox", argv)
+        self.assertIn("danger-full-access", argv)
+        self.assertIn('model_reasoning_effort="low"', " ".join(argv))
+        self.assertEqual(argv[-1], "brief")
+        self.assertEqual(argv[argv.index("-o") + 1], "/d/reports/t.json")
+
+    def test_resume的cd在resume之前_否则clap直接拒收(self):
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.json", "再来一轮")
+        self.assertLess(argv.index("--cd"), argv.index("resume"))
+        self.assertEqual(argv[argv.index("resume") + 1], "sess-1")
+
+    def test_resume不许出现sandbox长选项_它不认(self):
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.json", "x")
+        self.assertNotIn("--sandbox", argv)
+        self.assertIn('sandbox_mode="danger-full-access"', " ".join(argv))
+
+    def test_环境变量把会话索引留在主目录_resume才找得到(self):
+        env = ca.codex_env(pathlib.Path("/d"))
+        self.assertEqual(env["CODEX_HOME"], "/d")
+        self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))

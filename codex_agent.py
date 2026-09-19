@@ -6,6 +6,7 @@
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
 """
 import json
+import os
 import pathlib
 import re
 from typing import NamedTuple
@@ -151,3 +152,47 @@ def ensure_isolation(account):
             auth.unlink()
         auth.symlink_to(src)
     return d
+
+
+SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
+
+# 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
+_COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
+           "--skip-git-repo-check", "--disable", "plugins"]
+
+
+def prepend_skill_guard(brief_text):
+    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。"""
+    if brief_text.startswith(SKILL_GUARD):
+        return brief_text
+    return f"{SKILL_GUARD}\n\n{brief_text}"
+
+
+def build_run_argv(dir_abs, effort, report_path, brief):
+    # --cd 必须绝对路径：相对路径启动即崩（log 无 banner + os error 2）。
+    # -o 也必须绝对路径：相对路径按「发命令那个 shell 的 cwd」解析、不按 --cd，
+    # 实测在 --cd 的 worktree 里怎么找都没有，一度误判成「没正常收尾」。
+    # 两条都由调用方传绝对路径进来（cmd_run 里 resolve），这里不做兜底猜测。
+    return (["codex", "exec", "--cd", dir_abs, "-m", MODEL,
+             "-c", f'model_reasoning_effort="{effort}"',
+             "--sandbox", "danger-full-access"] + _COMMON +
+            ["-o", report_path, brief])
+
+
+def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
+    # 两处和主线不同，都是实测撞出来的：
+    #   1. --cd 必须放在 resume 之前，放后面 clap 直接拒收
+    #   2. resume 不认 --sandbox（error: unexpected argument，退出码 2），走 -c sandbox_mode
+    # 另：resume 总用 --cd／当前目录覆盖 workdir，不还原会话原目录，所以 --cd 必带。
+    return (["codex", "exec", "--cd", dir_abs, "resume", session_id, "-m", MODEL,
+             "-c", f'model_reasoning_effort="{effort}"',
+             "-c", 'sandbox_mode="danger-full-access"'] + _COMMON +
+            ["-o", report_path, brief])
+
+
+def codex_env(home):
+    env = dict(os.environ)
+    env["CODEX_HOME"] = str(home)
+    # 会话索引留在主目录，resume 才找得到（隔离的是 skill/plugin，不是会话历史）
+    env["CODEX_SQLITE_HOME"] = str(pathlib.Path.home() / ".codex")
+    return env
