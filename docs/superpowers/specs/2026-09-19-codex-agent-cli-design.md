@@ -160,8 +160,9 @@ harness 的完成通知里直接带成败结论，happy path 下无需再敲 `st
 run:    codex exec --cd <abs> -m gpt-6-astra -c model_reasoning_effort=<E>
         --sandbox danger-full-access -c approval_policy=never -c project_doc_max_bytes=0
         --skip-git-repo-check --disable plugins --color never -o <D>/reports/<N>.md <brief>
-resume: codex exec --cd <abs> resume <session_id> …同上，但
+resume: codex exec --cd <abs> resume <session_id> …同上，但**去掉两个 flag**：
         -c sandbox_mode=danger-full-access   # resume 不认 --sandbox（退出码 2）
+        （--color never 也不能带）           # resume 不认 --color（2026-09-19 冒烟实测，整轮当场死）
 ```
 环境：`CODEX_HOME=<D>`、`CODEX_SQLITE_HOME=~/.codex`（会话索引共享，resume 才找得到）。
 `--cd` 必须在 `resume` **之前**（放后面 clap 直接拒收）。
@@ -276,12 +277,19 @@ codex 自己的错误有**三种锚定形式**，少认一种就等于判据失�
 窗口就成了它的劣化替代品，**去掉**。留着只会让下一个撞上 60 行尾部堆栈的人把 50 改成 500，
 然后每一次「已恢复的错误」都静默变成 `suspect`。
 
-### 日志从源头就该是纯文本
+### 日志的纯文本只能做到一半，所以 `strip_ansi` 是承重的
 
-固定参数里带 `--color never`。实测 `--color auto`（默认）在输出被重定向时**并不关颜色**，
-106 份日志无一例外含 ANSI 转义，于是提 session id 和跑判据要各自剥一遍。
-从源头关掉，两个消费方都不再依赖剥离器（解析侧仍保留一个 `strip_ansi` 作防御，
-但它不再是承重结构）。
+主线固定参数带 `--color never`：实测 `--color auto`（默认）在输出被重定向时**并不关颜色**，
+106 份日志无一例外含 ANSI 转义。
+
+**但 resume 这条路关不掉。** 2026-09-19 端到端冒烟实测：`resume` 不认 `--color`
+（`error: unexpected argument '--color' found`，整轮当场死掉——这是继 `--sandbox` 之后
+**第三处** resume 与主线的 flag 差异）；而 codex 也没有对应的配置键可以绕
+（`--strict-config` 探测回 `unknown configuration field \`color\``）。
+实测 resume 段日志含 44 个 ANSI 转义，而判据仍然判对了。
+
+所以 **`strip_ansi` 不是防御性的点缀，它在 resume 路上是承重结构**，不许以
+「反正 `--color never` 关掉了」为由简化掉。
 
 ### 不进判据的东西
 
