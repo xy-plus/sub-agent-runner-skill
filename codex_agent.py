@@ -831,11 +831,23 @@ def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def new_meta(task, account, workdir, effort, skills):
+def new_meta(task, account, workdir, effort, skills, writer_pid, writer_start):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
 
-    刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
-    留着它只会诱导别人犯这个设计本来要防的错。
+    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_codex_pid），
+    存下来的 PID 会过期、还会被系统复用，留着它只会诱导别人犯这个设计本来要防的错。
+
+    **writer 的身份是另一回事，所以它有自己的名字。** 写日志的是包装器自己，
+    而「它还在不在写」没有任何现场特征可查。身份是 **PID + 启动时刻**成对存
+    （只存 PID 就退回上面那条防的老毛病）。
+
+    **两个身份字段是显式参数，不在这里自己去拿。** `_resume_round` 不经过本函数
+    （它只刷 effort/skills/started_at），本函数自取身份的话，resume 那两条路会落盘
+    **上一轮的陈旧身份**。真正盖章的地方是 `run_codex`——三条路的唯一交汇点。
+    那为什么还要在这里收下它们？因为 `REQUIRED_META_KEYS` 由本函数派生：只在
+    `run_codex` 里事后塞进 dict 的话，校验面拿不到这两个键。
+    **不许给它们占位默认值**（仓库规范 6）：`cmd_run` 是唯一调用方，它传
+    `*_writer_identity()`——同进程、同值；传真的就是真的，传占位才是谎。
 
     `skills` 记的是**最后一次调用**的白名单，与 effort／started_at 同一条原则
     （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
@@ -843,7 +855,8 @@ def new_meta(task, account, workdir, effort, skills):
     """
     _require_skill_paths(skills)
     return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "skills": skills, "session_id": None, "started_at": _now_iso()}
+            "skills": skills, "session_id": None, "started_at": _now_iso(),
+            "writer_pid": writer_pid, "writer_start": writer_start}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
@@ -861,9 +874,13 @@ def new_meta(task, account, workdir, effort, skills):
 # 字段的老元数据只会建议「删掉它重新 run」，而那等于丢会话。2026-09-19 加
 # `skills` 那次实测三个隔离目录的 tasks/ 全空（各 0 个 json），所以影响为零——
 # **那是当时的事实，不是永久豁免**，下次加字段要重新确认一遍。
+# 2026-09-20 加 writer_pid／writer_start 那次同样执行了这条仪式：三个隔离目录
+# tasks/ 共 0 个 json（~/.codex-subagent 空，-acct2／-acct3 连 tasks/ 都没有），
+# 当前用户的 codex 进程无一属于本工具 → 本次爆炸半径为零。
+# 同上：**那是当时的事实，不是永久豁免**。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
+REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", (), "", "").keys())
 
 
 def _load_meta(path):
@@ -1205,6 +1222,13 @@ def run_codex(kind, home, task, meta, make_argv):
 
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
     # 不会留下一个没人管的孤儿进程。
+    # writer 身份在这里盖，**而且只在这里**：run_codex 是唯一的 spawn 入口，
+    # run / resume / interrupt-and-resume 三条路都经过它，调用方不需要记住任何事。
+    # 贴在 write_meta 正上方，是因为「落盘那一刻，writer 身份 = 落盘的这个进程」
+    # 这条不变式只有贴在这里才看得见。
+    # resume 路上的 meta 是 `_load_meta` 从磁盘读回来的，里面是**上一轮**包装器的
+    # 身份，那个进程早就死了——不盖章，下一条命令问的就是上上轮那个进程的事。
+    meta["writer_pid"], meta["writer_start"] = _writer_identity()
     write_meta(home, task, meta)
     clear_report(report)
 
@@ -1417,7 +1441,7 @@ def cmd_run(args):
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
     verdict = judge(run_codex("run", home, args.task,
                               new_meta(args.task, args.account, str(workdir),
-                                       args.effort, args.skills),
+                                       args.effort, args.skills, *_writer_identity()),
                               lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")

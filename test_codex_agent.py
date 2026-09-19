@@ -172,9 +172,14 @@ def _no_codex():
 
 
 def _full_meta(task, **over):
-    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
+    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。
+
+    writer 身份默认给一副**必定停了**的（见 GONE_PID）：绝大多数测试要的前提就是
+    「上一轮的 writer 早就不在了」。要「还在写」的那几条自己传 _live_writer(self)。
+    """
     meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00"}
+            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00",
+            "writer_pid": GONE_PID, "writer_start": GONE_START}
     meta.update(over)
     return meta
 
@@ -1241,26 +1246,35 @@ class TestMetaShape(_HomeSandbox):
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
     # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
-    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at"}
+    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at",
+              "writer_pid", "writer_start"}
 
     def test_字段清单的绝对值(self):
         self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
         # resume 要回到同一个目录、同一个会话，这两个字段是它的命根子
         self.assertIn("dir", self.FIELDS)
         self.assertIn("session_id", self.FIELDS)
-        # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
+        # **codex** 的存活必须每次现查：存下来的 PID 会过期、会被系统复用，
+        # 而且它有现场特征可查（comm=codex + argv 里的报告路径），见 find_codex_pid。
         self.assertNotIn("pid", self.FIELDS)
+        # **writer 是另一回事**，所以它有自己的名字：写日志的是包装器自己，
+        # 「它还在不在写」没有任何现场特征。身份**成对**存——只存 PID 就退回
+        # 上面那条防的老毛病了。
+        self.assertIn("writer_pid", self.FIELDS)
+        self.assertIn("writer_start", self.FIELDS)
         # 白名单是「最后一次调用给了什么」，要审计就读这个字段——它刻意不进
         # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
         self.assertIn("skills", self.FIELDS)
 
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", (),
+                                         *ca._writer_identity())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
-        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 pid 又会破坏
-        # 「存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 **codex 的** pid 又会
+        # 破坏「codex 存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        # writer 的那一对是例外，理由见 test_字段清单的绝对值。
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
@@ -1275,8 +1289,33 @@ class TestMetaShape(_HomeSandbox):
         # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
         for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                ca.new_meta("t", "default", "/abs/x", "low", bad)
-        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
+                ca.new_meta("t", "default", "/abs/x", "low", bad, *ca._writer_identity())
+        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", (),
+                                     *ca._writer_identity())["skills"], ())
+
+    def test_run落盘的writer身份就是本进程(self):
+        d = ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--no-skill"])
+        with _no_codex():
+            ca.cmd_run(args)
+        落盘 = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
+
+    def test_每一轮都重打writer身份_resume不沿用上一轮的(self):
+        """resume 那一轮的 writer 是**另一个进程**，上一轮那个早就死了。
+
+        `_resume_round` 不经过 `new_meta`，它手里那份 meta 是 `_load_meta` 从磁盘
+        读回来的——沿用的话，下一条命令一问「上一轮那个进程还在吗」，答的是**上上轮**
+        那个进程的事。所以盖章的地方必须是 `run_codex`（三条路的唯一交汇点）。
+        """
+        d = ca.ensure_isolation("default")
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        落盘 = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertNotEqual(落盘["writer_pid"], GONE_PID, "沿用了传进来那份的陈旧身份")
+        self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
 
     def test_run落盘的skills就是命令行给的那几条(self):
         d = ca.ensure_isolation("default")
@@ -1418,10 +1457,7 @@ class TestPreviousWriterAlive(_HomeSandbox):
         self.d = ca.ensure_isolation("default")
 
     def _写盘(self, **over):
-        # 两个身份键在本 Task 里由 over 显式给全（_full_meta 到 Task 2 才有默认值）
-        meta = _full_meta("t")
-        meta.update(over)
-        ca.write_meta(self.d, "t", meta)
+        ca.write_meta(self.d, "t", _full_meta("t", **over))
 
     def test_没有上一轮就判停了(self):
         self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
