@@ -245,6 +245,12 @@ class TestJudge(unittest.TestCase):
         self.log.write_text(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n")
         self.assertIn("额度", ca.judge(self.report, self.log, None).reason)
 
+    def test_非UTF8的日志不许把判据打崩(self):
+        # codex 被 INT 打断时可能只写出半截多字节字符
+        self.report.write_text("干完了")
+        self.log.write_bytes(b"\xff\xfe" + "正常收尾".encode())
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
+
     def test_非UTF8的报告不许把判据打崩(self):
         # codex 被 SIGINT 打断时可能只写出半截字节
         self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
@@ -865,6 +871,16 @@ class TestResumeGuards(_HomeSandbox):
                 ca.cmd_resume(self._args("t5"))
         self.assertIn("软链", cm.exception.message)
 
+    def test_resume会刷新started_at_元数据描述的是最后一次调用(self):
+        # 完整的轮次历史在日志的分隔符里，元数据只描述最后一次
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t6", _full_meta("t6", session_id="s1", dir=str(self.workdir),
+                                          started_at="2020-01-01T00:00:00"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+            ca.cmd_resume(self._args("t6"))
+        meta = json.loads(ca.meta_path(d, "t6").read_text())
+        self.assertNotEqual(meta["started_at"], "2020-01-01T00:00:00")
+
     def test_resume开跑前也要删报告_秒死于写锁时才不会误判成功(self):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
@@ -1000,6 +1016,20 @@ class TestRunCodexOwnsReportPath(unittest.TestCase):
             ca.run_codex("run", d, "t", _full_meta("t"), make_argv)
         self.assertEqual(seen["给调用方的"], str(ca._report_path(d, "t")))
 
+    def test_跑完之后信号处置被还原(self):
+        """改全局信号处置而不还原，等于把本函数的副作用留给整个进程的余生。
+
+        审查认为「CLI 里跑完就退出，不可达，按奥卡姆可议」——那只看了 CLI 那条路。
+        单测是在进程内**直接调** run_codex 的第二个调用方：不还原的话，测试进程
+        余生都带着指向一个已死 Popen 的 handler，再也响应不了 Ctrl-C。
+        """
+        d = self._dir()
+        watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+        before = {s: signal.getsignal(s) for s in watched}
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual({s: signal.getsignal(s) for s in watched}, before)
+
     def test_环境变量由home派生_调用方传不进一个对不上的(self):
         d = self._dir()
         with _no_codex() as popen:
@@ -1060,14 +1090,19 @@ class TestRunCodexStreaming(unittest.TestCase):
                       "sys.stdout.flush();time.sleep(30)")
         driver = (
             "import json,os,pathlib,sys;"
-            f"sys.path.insert(0, {str(pathlib.Path.cwd())!r});"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r});"
             "import codex_agent as ca;"
             f"d = pathlib.Path({str(d)!r});"
             f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
             f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
         )
-        proc = subprocess.Popen([sys.executable, "-c", driver],
-                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # 屏幕这一路也接到文件上一起验。接的是文件不是 tty，Python 默认块缓冲，
+        # 所以「这行现在就能读到」只可能来自 sys.stdout.buffer.flush()——
+        # 而 SKILL.md 承诺的「面板可监控」全靠它。
+        screen = d / "screen.out"
+        with open(screen, "wb") as out:
+            proc = subprocess.Popen([sys.executable, "-c", driver],
+                                    stdout=out, stderr=subprocess.PIPE)
         try:
             deadline = time.time() + 8
             got = None
@@ -1081,8 +1116,10 @@ class TestRunCodexStreaming(unittest.TestCase):
                     self.fail(f"驱动进程提前退出：{proc.stderr.read().decode()}")
                 time.sleep(0.05)
             self.assertEqual(got, "01a0b408-f718-7ff3-8123-d5202551acba")
-            # 日志也必须已经落盘，而不是等 EOF 才一次性刷出来
+            # 假 codex 还睡着、远没到 EOF，此刻日志和屏幕都必须已经有内容
+            self.assertIsNone(proc.poll(), "驱动进程已经退出了，那这条测的就不是实时性")
             self.assertIn("session id", (d / "logs" / "t.log").read_text())
+            self.assertIn("session id", screen.read_text())
         finally:
             proc.kill()
             proc.wait()

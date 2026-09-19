@@ -500,14 +500,16 @@ def find_codex_pid(report_path):
 # 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你。
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
-# 四个状态都在表里，取值一律 EXIT[state]，不用 .get(state, 默认值)：
-# 有默认值的话 running 会悄悄落成 0，`codex-agent status t && deploy` 就会在任务
-# 还在跑的时候部署。2 留给参数错误与护栏拒绝（见 USAGE_ERROR）。
-EXIT = {"success": 0, "failed": 1, "suspect": 3, "running": 4}
-
-# 越靠后越该拦住调用方。不能直接比退出码：suspect 的码(3)比 failed(1)大，
-# 按码取 max 会让一个 failed 被一个 suspect 盖过去。
-_SEVERITY = ["success", "running", "suspect", "failed"]
+# 四个状态，按「最该放行 → 最该拦住调用方」排序，退出码和严重度都从这**一份**
+# 派生——两份清单必然漂移。
+# 严重度不能直接拿退出码比：suspect 的码(3)比 failed(1)大，按码取 max 会让一个
+# 真失败被一个 suspect 盖过去。
+# 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
+# 悄悄落成 0，`codex-agent status t && deploy` 就会在任务还在跑的时候部署。
+# 2 不在表里，留给参数错误与护栏拒绝（见 USAGE_ERROR）。
+_STATES = (("success", 0), ("running", 4), ("suspect", 3), ("failed", 1))
+EXIT = dict(_STATES)
+_SEVERITY = [name for name, _ in _STATES]
 
 
 def _worse(a, b):
@@ -542,6 +544,8 @@ def run_codex(kind, home, task, meta, make_argv):
 
     这三件事原先还散在调用方，实测漏掉「先 write_meta」会在 codex **已经跑起来
     之后**才炸 FileNotFoundError，子进程当场变孤儿。
+
+    （stdin／timeout／start_new_session 各自的理由写在它们那一行旁边。）
     """
     report = _report_path(home, task)
     argv = make_argv(str(report))
@@ -699,7 +703,10 @@ def cmd_resume(args):
 
     ensure_isolation(meta["account"])
     brief = prepend_skill_guard(brief_file.read_text())
-    meta["effort"] = args.effort          # 元数据始终描述最后一次调用
+    # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
+    # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
+    meta["effort"] = args.effort
+    meta["started_at"] = _now_iso()
     run_codex("resume", home, args.task, meta,
               lambda r: build_resume_argv(meta["dir"], meta["session_id"], args.effort, r, brief))
     verdict = judge(report, _log_path(home, args.task), None)
@@ -756,6 +763,19 @@ def build_parser():
 
 
 def main():
+    """入口。
+
+    **「必须用 `Bash(run_in_background: true)` 启动」这一条编不进硬约束**，
+    2026-09-19 实测过为什么：前台和后台两种方式下，本进程看到的环境**逐字节相同**
+    ——14 个 `CLAUDE_*` 变量、父进程、tty 状态全一样。没有任何信号能让本进程判断
+    自己是不是跑在 harness 的追踪之下，所以这条只能留在 SKILL.md 当软约定。
+
+    能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
+    包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
+    仍可 resume，日志里还留下一行打断标记（见 note_interrupt）告诉下一个人该
+    resume 而不是重跑。于是误用的代价从「会话永久锁死、上下文全丢」降到
+    「这一轮没拿到完成通知」——可恢复，且判据会把话说清楚。
+    """
     args = build_parser().parse_args()
     try:
         return args.func(args)
