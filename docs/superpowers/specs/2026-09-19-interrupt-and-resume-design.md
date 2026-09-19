@@ -53,20 +53,43 @@ B) 新分隔符落地之后     → 报告缺失或为空＝没正常收尾     
 `run_codex` 写完分隔符时就知道自己的起始偏移（`log.tell()`）。把它显式带下去：
 
 ```
-run_codex(...) -> int                      # 返回本轮在日志中的起始偏移
-read_round(log_path, start_offset) -> str  # [start_offset, 之后第一个 ROUND_MARK)
+run_codex(...) -> Round                    # 报告路径 + 本轮日志文本，成对回传
+read_round(log_path, start_offset) -> str  # [start_offset, 之后第一个 ROUND_MARK 行)
 read_last_round(log_path) -> str           # 外部观察者用（status）
-judge(report_path, round_text, pid) -> Verdict
+judge(round) -> Verdict                    # 只收那一对，不再自己拼
 ```
 
-- **本轮的拥有者**（`cmd_run` / `_resume_with`）用 `read_round` + 自己那个偏移。
-  偏移是 codex 还没起跑之前拿到的，**后来的任何一轮都不可能把它致盲**。
-- **外部观察者**（`cmd_status`）用 `read_last_round`——它本来就只能看最后一轮，诚实。
+- **本轮的拥有者**（`cmd_run` / `_resume_round`）拿 `run_codex` 回传的 `Round`。
+  偏移是 codex 还没起跑之前拿到的，**后来的任何一轮都不可能把它致盲**；
+  偏移**不外泄**——`run_codex` 自己切好文本再回传，调用方没有把它丢掉的机会。
+- **外部观察者**（`cmd_status`）显式构造 `Round(report, read_last_round(log))`
+  ——它本来就只能看最后一轮，诚实。
 
-区间右端截到「起点之后的第一个 `ROUND_MARK`」，所以后一轮的内容也不会被吞进来。
+`Round` 是一对而不是两个参数：`run_codex` 的 docstring 声称「报告路径由本函数
+拥有，三条必须记得对齐在结构上就违反不了了」，但调用方随后又自己算一遍同一个
+路径喂给 `judge`，那条「必须记得对齐」只是上移了一层。而 `judge(report, <任意
+str>)` 传错文本是**静默算对**的。成对之后，哪份报告配哪段文本在拥有者那条路上
+写不错。
+
+**左端右端都必须是事实。** 左端是记下来的字节偏移。**右端过去是子串搜索
+`text.find(ROUND_MARK)`，那仍然是推测**——日志里混着 brief 原文和 codex 转述的
+子进程输出，而这个仓库的日常就是派 codex 来改 `codex_agent.py` 自己。源码里那行
+`ROUND_MARK = "===== codex-agent "` 一旦被转述进日志，本轮文本就在那里被切断
+（实测切剩 14 个字符），判据从 `interrupted` 翻成 `failed`。
+所以分隔符与痕迹**一律整行匹配**：
+
+```python
+_ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
+_MARK_LINE  = re.compile(r"^" + re.escape(INTERRUPT_MARK) + r"(\s\[.*\])?$", re.M)
+```
+
+`round_separator` 产出的 kind/task/when_iso 三段都不含空格（kind 是枚举、任务名
+字符集排除空格、`isoformat(timespec="seconds")` 无空格），所以 `\S+ \S+ \S+ =====$`
+精确。附带好处：「`INTERRUPT_MARK` 不许以 `ROUND_MARK` 开头」从「靠人记住前缀
+别撞」升级成**两个识别器互相不可能匹配**。
 
 **这不是给 P1 打补丁，是把「边界」从推测变成事实。** 「后来的一轮把前一轮判瞎」
-这一整类问题结构上消失。
+这一整类问题结构上消失——**两端都是**。
 
 ## 3. 改动 A-2：发 INT 与留痕焊成一个动作
 
@@ -95,6 +118,20 @@ interrupt_codex(pid, log_path) -> None
 就算了，INT 已经发出去了。而「发出 INT」和「记下它发生过」不是两个域，
 **是同一事件的两面**——拆开就是一句「记得也写一下标记」的软约定，已经漏过一次。
 
+### 痕迹要带来源
+
+```python
+interrupt_codex(pid, log_path, cause)   # cause ∈ {"stop", "interrupt-and-resume", "外部信号转发"}
+```
+
+三条路的**含义完全不同**：前两条是有人**故意**停它；第三条在 `run_in_background`
+下**根本不该发生**——它出现就等于前台误跑被 2 分钟超时杀掉了。
+不带来源的话，日志里只剩一句「被打断了」，下一个人读不出「你当时用错了启动方式」。
+
+这是把「一条编不进去的软约定（必须用 `run_in_background`）被违反了」变成
+**日志里可读的诊断**。`INTERRUPT_MARK` 仍是稳定前缀，来源以 ` [cause]` 追在行尾，
+`_MARK_LINE` 的 `(\s\[.*\])?$` 收掉，判据不受影响。
+
 ## 4. 改动 A-3：`interrupted` 是第五态
 
 ### 为什么 reason 不够，必须动退出码
@@ -117,7 +154,7 @@ harness 的完成通知**只搬退出码，不搬 stdout**。所以 `judge` 的 
 |---|---|
 | `success` 0 | 不用干什么 |
 | `running` 4 | 等 |
-| `interrupted` 5 | **接着 resume** |
+| `interrupted` 130 | **接着 resume** |
 | `suspect` 3 | 去看一眼 |
 | `failed` 1 | 查原因，**重跑** |
 
@@ -129,8 +166,13 @@ harness 的完成通知**只搬退出码，不搬 stdout**。所以 `judge` 的 
 脚本作者和 agent 看到 130 的第一反应就是「那东西被 Ctrl-C 打断了」，**不需要读本工具的文档**。
 
 **反面也要知道**：>128 在约定里指「**本进程**死于信号」，而这里死的是 codex、包装器是正常
-退出的。取它是因为**读者的第一反应正确**比语义上的精确更重要——退出码是唯一能到达 harness
-完成通知的通道。
+退出的。取它是因为**读者的第一反应正确**比语义上的精确更重要。
+
+**退出码是 `run_in_background` 正常路径下到达调用方的通道，但不是万能的。**
+前台误跑那条链路是「harness 2 分钟超时 → TERM 打进程组 → codex 收不到 → 包装器
+转 INT → 留痕 → 判据 interrupted → 返回 130」，**而此时 harness 已经超时了**，
+它报的是超时，未必会去收那个 130。那种场景下真正可靠的是**日志里那行痕迹**，
+以及之后任何一次 `status` 的复述。别把 130 说成前台误跑的交付通道。
 
 `3`(suspect) / `4`(running) 仍是自编，因为这两个概念约定里压根不存在。
 原则：**能跟约定的跟，约定没涵盖的才自己编。**
