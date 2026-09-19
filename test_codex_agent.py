@@ -721,11 +721,27 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
 
     def test_文档仍然保留代码替不了的那部分(self):
-        # 反向守一道：别为了让上面那条变绿，把该留的也删了
+        """反向守一道：别为了让上面那条变绿，把该留的也删了。
+
+        断言的是**具体内容**，不是「某个词出现过」——后者近乎空测试：
+        把 effort 分档表整张删掉，`--effort low` 那行还在，`effort` 这个词
+        照样搜得到（实测这条突变存活过）。
+        """
         skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
-        for must in ("effort", "run_in_background", "resume", "brief"):
-            with self.subTest(must=must):
-                self.assertIn(must, skill)
+        # 五个难度档位一个都不能少：派什么活用哪档，是判断力，代码替不了
+        for tier in ca.EFFORTS:
+            with self.subTest(tier=tier):
+                self.assertIn(tier, skill)
+        # 四条命令都得在，否则调用方不知道有这些能力
+        for cmd in ("run", "status", "resume", "stop"):
+            with self.subTest(cmd=cmd):
+                self.assertIn(f"codex-agent {cmd}", skill)
+        # 三件代码保证不了、只能靠调用方知道的事
+        self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
+        self.assertIn("brief", skill)               # brief 只收文件路径
+        for code in ("0", "1", "3", "4"):           # 退出码是对外契约
+            with self.subTest(code=code):
+                self.assertIn(f"`{code}`", skill)
 
 
 class TestTaskName(unittest.TestCase):
