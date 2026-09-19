@@ -35,7 +35,7 @@
        （见 TestRoundBoundary：正面钉拥有者的偏移，反面钉「猜边界当场失明」）。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
-    suspect:3, running:4, interrupted:5}，字段清单钉那六个名字，
+    suspect:3, running:4, interrupted:130}，字段清单钉那六个名字，
     边界钉「这段文本从哪来」，别只钉「两边相等」。
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
@@ -523,7 +523,14 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
     def test_五个状态的退出码逐个钉死(self):
         # 绝对值。写成 EXIT["x"] == EXIT["x"] 那种自指是空测试，本仓栽过。
         self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3,
-                                   "running": 4, "interrupted": 5})
+                                   "running": 4, "interrupted": 130})
+
+    def test_interrupted跟的是128加信号号这个既成约定(self):
+        """130 不是随手挑的数：128 + SIGINT(2)，POSIX/Bash 的既成约定
+        （同族 SIGKILL→137、SIGTERM→143）。钉住这个**算式**而不只是 130，
+        下一个人就改不成一个「看起来也挺顺」的数。
+        """
+        self.assertEqual(ca.EXIT["interrupted"], 128 + int(signal.SIGINT))
 
     def test_护栏拒绝的码不与任何判据结论相撞(self):
         self.assertEqual(ca.USAGE_ERROR, 2)
@@ -546,7 +553,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
     def test_有打断标记且无报告时状态是interrupted(self):
         v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
-        self.assertEqual(ca.EXIT[v.state], 5)
+        self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
 
     def test_额度上限和写锁仍然是failed_它们resume救不回来(self):
@@ -1014,7 +1021,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 三件代码保证不了、只能靠调用方知道的事
         self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
         self.assertIn("brief", skill)               # brief 只收文件路径
-        for code in ("0", "1", "3", "4", "5"):      # 退出码是对外契约
+        for code in ("0", "1", "3", "4", "130"):    # 退出码是对外契约
             with self.subTest(code=code):
                 self.assertIn(f"`{code}`", skill)
         # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
@@ -1625,7 +1632,7 @@ class TestExitCodeContract(_HomeSandbox):
 
     def test_退出码的绝对值是对外契约(self):
         self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3, "running": 4,
-                                   "interrupted": 5})
+                                   "interrupted": 130})
         self.assertEqual(ca.USAGE_ERROR, 2)
         # 护栏拒绝必须和五个判据结论都区分得开
         self.assertNotIn(ca.USAGE_ERROR, ca.EXIT.values())
@@ -1670,14 +1677,14 @@ class TestExitCodeContract(_HomeSandbox):
     def test_interrupt_and_resume_报告在但有未分类错误退出3(self):
         self.assertEqual(self._interrupt_and_resume("干完了", self.UNCLASSIFIED), 3)
 
-    def test_interrupt_and_resume_续跑那轮又被打断退出5(self):
-        self.assertEqual(self._interrupt_and_resume(None, ca.INTERRUPT_MARK), 5)
+    def test_interrupt_and_resume_续跑那轮又被打断退出130(self):
+        self.assertEqual(self._interrupt_and_resume(None, ca.INTERRUPT_MARK), 130)
 
-    def test_run_被打断退出5(self):
-        # 整个改动 A 的验收点：harness 的完成通知只搬退出码，于是 5 这个数字是
+    def test_run_被打断退出130(self):
+        # 整个改动 A 的验收点：harness 的完成通知只搬退出码，于是这个数字是
         # 「接着 resume，别重跑」唯一到得了调用方的形式。
-        # 2026-09-19 真机复现过这条通知：`[exited with code 5]`。
-        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 5)
+        # 2026-09-19 真机复现过这条通知：`[exited with code N]`。
+        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 130)
 
     def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
         d = ca.ensure_isolation("default")

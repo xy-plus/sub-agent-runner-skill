@@ -54,7 +54,7 @@ codex-agent stop <任务名>          # 上下文保留，之后还能 resume
 
 | 事 | 内容 |
 |---|---|
-| 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`5` interrupted（被打断，**接着续跑即可，不要重跑**）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
+| 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
 | brief | 只收**文件路径**，不收内联字符串。工具会自动前置「不得使用任何 skill」并打印一行提示 |
 | 给它 skill | 在 brief 里写该 skill 的**绝对路径**让 codex 自己读，不要往共享目录里放东西 |
 
