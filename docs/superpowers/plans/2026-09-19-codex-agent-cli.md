@@ -737,6 +737,16 @@ def account_choices():
 
 
 def isolation_home(account):
+    """每个账号一个隔离目录，任务的全部产物都落在这里。
+
+    **落点在 `$HOME` 下，不在被改的那个仓库里**，这是判据不是习惯：
+    `tasks/`、`reports/`、`logs/` 全在仓库外，过程文件就进不了 git，
+    谁 `git add -A` 都收不到它。
+    从前报告写在 `--cd` 那个仓里、靠 `tmp_codex_` 前缀加一句 brief 叮嘱来防，
+    2026-09-13 破了：子代理把 380 行的 `tmp_codex_final_ban_spec_review.json`
+    提交进了分支，**而它的收尾自述里写着「未提交 tmp_codex_*」**。
+    软约定拦不住，换成结构上够不着才拦得住。
+    """
     base = pathlib.Path.home()
     return base / ".codex-subagent" if account == "default" else base / f".codex-subagent-{account}"
 
@@ -933,8 +943,7 @@ Expected: FAIL，`AttributeError: module 'codex_agent' has no attribute 'prepend
 ```python
 SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
 
-# 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
-# 主线和 resume 都收的参数。调用方碰不到它们，也就不可能漏掉。
+# 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
 # `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
 _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
            "--skip-git-repo-check", "--disable", "plugins"]
@@ -1252,6 +1261,46 @@ class TestPid(unittest.TestCase):
         finally:
             proc.kill()
             proc.wait()
+
+
+class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
+    """SKILL.md 的验收判据：已由代码保证的约束，一条都不许在文档里再说一遍。
+
+    把文档约定变成硬约束，正是这个项目的主张本身——所以这条判据自己也得是
+    一条测试，而不是又一句靠人记住的约定。
+    每多说一遍就是第二个家：改了代码忘了改文档，文档就开始说假话，
+    而读文档的人没有任何办法发现。
+    """
+
+    # 左边是模式，右边是「这条约束现在住在代码的哪儿」
+    OWNED_BY_CODE = {
+        r"--cd": "build_run_argv / build_resume_argv",
+        r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
+        r"/proc|pgrep|pkill": "find_codex_pid",
+        r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
+        r"mkdir -p": "ensure_isolation",
+        r"--color": "build_run_argv（resume 不认它）",
+        r"CODEX_HOME|CODEX_SQLITE_HOME": "codex_env",
+        r"--sandbox|sandbox_mode": "build_run_argv / build_resume_argv",
+        r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
+        r"session id|session_id": "extract_session_id / 元数据",
+        r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
+    }
+
+    def test_没有一条代码级约束泄漏进文档(self):
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        leaked = {pat: owner for pat, owner in self.OWNED_BY_CODE.items()
+                  if re.search(pat, skill)}
+        self.assertEqual(leaked, {},
+                         "这些约束已经由代码保证，文档里不该再说一遍："
+                         + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
+
+    def test_文档仍然保留代码替不了的那部分(self):
+        # 反向守一道：别为了让上面那条变绿，把该留的也删了
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        for must in ("effort", "run_in_background", "resume", "brief"):
+            with self.subTest(must=must):
+                self.assertIn(must, skill)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1520,8 +1569,20 @@ class TestParser(_HomeSandbox):
                                "--account", "default"])
 
     def test_不提供会造成误用的参数(self):
+        """这六个参数是**刻意不提供**的，各有各的理由：
+
+        | 参数 | 为什么不给 |
+        |---|---|
+        | `--timeout` | 会误杀正当的长任务。codex 动辄跑几十分钟，没有一个安全的默认值 |
+        | `--background` | 后台与否由调用方的 `Bash(run_in_background)` 决定，工具自己加只会变成孤儿进程 |
+        | `-o` | 报告路径由工具派生（`<隔离目录>/reports/<任务>.md`）。让调用方指定就会落进仓库、被 `git add -A` 收走 |
+        | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
+        | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
+        | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
+
+        前两个是「会造成误用」，后四个是「由工具派生」。
+        """
         parser = ca.build_parser()
-        # 和 spec §5「不提供的参数」那张表一字不差
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
@@ -1600,6 +1661,27 @@ class TestRunGuards(_HomeSandbox):
         self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
         self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
 
+    def test_run也要校验隔离不变量_resume那一半补过了这一半漏了(self):
+        # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
+        # 这条没人守的话，config.toml 被软链回主配置、auth.json 指错账号，
+        # 主路径上全查不出来——而主路径才是绝大多数运行走的那条。
+        d = ca.ensure_isolation("default")
+        (d / "config.toml").unlink()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(task="t"))
+        self.assertIn("软链", cm.exception.message)
+
+    def test_同账号已结束的同名任务允许复用_只提示不拒绝(self):
+        # 刻意不一律拒绝：工具没有清理命令，一律拒绝等于任务名一次性，
+        # tasks/ 只能手工去删。已结束 + 同账号这一格是安全的——报告会被清掉、
+        # 日志是追加的，历史不丢。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex() as popen:
+            ca.cmd_run(self._args(task="t"))
+        self.assertTrue(popen.called, "同账号、已结束的同名任务被拒了，它应该允许复用")
+
     def test_开跑前三件事全在spawn之前做完(self):
         # 顺序反了每一件都会坏事：
         #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
@@ -1676,9 +1758,11 @@ class TestResumeGuards(_HomeSandbox):
                 ca.cmd_resume(self._args("t4"))
         self.assertIn("不在了", cm.exception.message)
 
-    def test_resume也要校验隔离不变量_spec要求每次run和resume都查(self):
-        # spec §6 写的是「每次 run/resume 都校验」。resume 这条路上不查的话，
-        # config.toml 被软链回主配置、auth.json 指错账号，全都查不出来。
+    def test_resume也要校验隔离不变量(self):
+        # 隔离不变量**每次 run 和 resume 都要校验**，两条路缺一条洞就还在。
+        # resume 这条路上不查的话，config.toml 被软链回主配置、auth.json 指错
+        # 账号，全都查不出来——而这种失效是静默的：跑起来一切正常，
+        # 只是 codex 看得见它不该看见的东西。
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
         (d / "config.toml").unlink()
@@ -1705,6 +1789,58 @@ class TestResumeGuards(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
             ca.cmd_resume(self._args("t3"))
         self.assertFalse((d / "reports" / "t3.md").exists())
+
+
+class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
+    """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
+
+    `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
+    不证明「run 和 resume 真的调了它」。把两处都换成裸 `read_text()` 的突变
+    曾经**全部存活**——一条印出去的承诺，没有任何东西守着。
+
+    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），
+    这句是内容层的第二道：万一哪天隔离被绕开，brief 里这句还在。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    @staticmethod
+    def _brief_codex_actually_got(run_it):
+        """codex argv 的最后一项就是 brief 正文。"""
+        seen = {}
+
+        def grab(*a, **k):
+            seen["argv"] = a[0]
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = grab
+            run_it()
+        return seen["argv"][-1]
+
+    def test_run这条路(self):
+        ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
+
+    def test_resume这条路(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
 
 
 class TestExitCodeContract(_HomeSandbox):
@@ -1955,9 +2091,14 @@ class TestStop(_HomeSandbox):
 
 
 class TestSignalSafetyRealProcesses(unittest.TestCase):
-    """用真进程、真信号验证 spec §9 的那条保证：
+    """用真进程、真信号验证整个工具最不能出错的那条保证：
 
-    无论谁怎么停包装器，codex 收到的永远**只有** INT。
+    **无论谁用什么信号停包装器，codex 收到的永远只有 INT。**
+    这条保证由两件事合起来兑现，缺一个洞就还在：
+      ① `start_new_session=True` 把 codex 挡在组信号之外
+      ② 包装器给 TERM／INT／HUP 都装 handler，统一转发 INT
+    它之所以是死线：SIGTERM 之后 codex 的 thread 会被**永久锁死**，
+    之后 resume 永远报 thread-store conflict，等多久都不释放，上下文全丢。
     上面 TestSignalSafety 用 mock 验的是「参数传对了没」，这里验的是
     「传对了之后，内核那一层真的照做了没」——这两件事不是一回事。
 
@@ -2059,6 +2200,12 @@ Expected: FAIL，`AttributeError: module 'codex_agent' has no attribute 'build_p
 # 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
 # 悄悄落成 0，`codex-agent status t && deploy` 就会在任务还在跑的时候部署。
 # 2 不在表里，留给参数错误与护栏拒绝（见 USAGE_ERROR）。
+#
+# 退出码值得这么较真，是因为它**真的会被人看见**：实测 harness 给后台任务的
+# 完成通知里直接带着退出码（exit 3 的那条通知写的就是
+# `failed with exit code 3`）。所以「run 收尾自己跑一遍判据、退出码＝判据结论」
+# 这件事等于把结论直接送到了调用方眼前——happy path 下根本不用再敲 status，
+# 而 `exit 1 ≠ 失败` 这条最反直觉的知识也就被彻底消化掉了。
 _STATES = (("success", 0), ("running", 4), ("suspect", 3), ("failed", 1))
 EXIT = dict(_STATES)
 _SEVERITY = [name for name, _ in _STATES]
@@ -2276,12 +2423,28 @@ def cmd_stop(args):
         return EXIT["success"]
     # 只发 SIGINT。SIGTERM 会让 thread 永久锁死，之后 resume 永远报
     # thread-store conflict，等多久都不释放，上下文全丢。
+    #
+    # 「INT 之后仍然可以 resume」这条最初是 2026-09-08 的结论，2026-09-19 在
+    # **codex 0.154.0** 上真机复验过：run → stop(INT) → resume 跑通，两轮
+    # session id 完全相同、token 从 3,216 接着涨到 3,989；最有力的一条是追问
+    # 「被打断前你成功创建了哪几个文件」，codex 自己答得出「s1.txt，s2.txt 当时
+    # 尚未确认完成，s3.txt 未执行」——恢复的是**语义上的上下文**，不只是一段
+    # 计费记录，它知道自己被打断在哪一步。
+    # 这条是单点：start_new_session、统一转发 INT、本函数、以及「前台误跑也能
+    # 活」那条缓解措施，四件事全都架在它上面。换 codex 大版本时值得重验一次。
     os.kill(pid, signal.SIGINT)
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
 
 def build_parser():
+    """命令行契约。
+
+    整个工具选 Python3 写，理由就在这个函数里：`argparse` 的 `required=True`
+    + `choices=` 天然实现了「强制显式」——五个参数一个都不能少、难度和账号只能
+    从枚举里挑，而且**错误消息是免费的**，不用自己写一遍校验和提示。
+    另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
+    """
     p = argparse.ArgumentParser(
         prog="codex-agent",
         description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
@@ -2327,6 +2490,18 @@ def main():
     仍可 resume，日志里还留下一行打断标记（见 note_interrupt）告诉下一个人该
     resume 而不是重跑。于是误用的代价从「会话永久锁死、上下文全丢」降到
     「这一轮没拿到完成通知」——可恢复，且判据会把话说清楚。
+
+    **这也是为什么本工具是 CLI 而不是 MCP server**（同一件事的另一面）。
+    这套东西的价值有三条：① codex 干活 ② claude 不等、去干别的 ③ 干完自动通知。
+    MCP 的两种形态各杀掉一条：
+      - 同步等待 codex 结束 —— 任务动辄几十分钟，要么超时、要么把 claude
+        阻塞在原地，②没了；
+      - 立即返回 + 轮询 —— 完成通知来自 **harness 对 `Bash(run_in_background)`
+        的追踪**，MCP 没有这个通道，③没了。
+    MCP 能买到的只有「参数有 schema」和「不用读长 skill」，而 argparse 的
+    `required=True` + `choices=` 同样给得到，还不丢后台通道。
+    （附：codex 0.154.0 的 `codex mcp` 只是管理**外部** MCP server，
+    它不提供「把自己暴露成 MCP server」这回事。）
     """
     args = build_parser().parse_args()
     try:

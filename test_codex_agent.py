@@ -1,13 +1,55 @@
+"""codex-agent 的全部单测 —— 也是这个项目的**维护者入口**。
+
+怎么跑：
+
+    python3 -m unittest test_codex_agent -v
+
+（零依赖、零 codex token。纯函数和护栏全在这里，不花钱。）
+
+这套测试被三轮突变验过，第一轮 78 个突变杀掉 57，存活的逐条补齐。
+下面这些**承重约束**的突变**全部被杀**，动它们之前先想清楚你在拆什么：
+
+    信号安全（start_new_session + 统一转发 INT + 用完还原）
+    进程反查的三道过滤（uid / comm / argv 元素精确相等）
+    开跑前三件事的顺序（落元数据、清旧报告、写轮次分隔符，全在 spawn 之前）
+    防陈旧报告（clear_report）、日志追加而非覆盖、按轮次切分日志
+    三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
+    退出码四态的绝对值、严重度排序、元数据字段清单
+    read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
+    resume 的三处 flag 差异、任务名字符集、兜底句两条路都真的加上
+
+总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
+凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
+地绿。这条是三次踩出来的，三次还都是同一个病——断言的两边一起动：
+
+    1. 陪练进程写成 `sleep 5 <mark>`，而 sleep 收到多余参数会立刻退出。
+       进程根本不存在，于是把承重的 comm 过滤整个删掉，测试照样绿。
+    2. `assertEqual(cmd_status(...), ca.EXIT["running"])`。
+       把 EXIT["running"] 改成 0，两边一起动，测试照样绿——而那正是它号称
+       要防的「status && deploy 在任务还在跑的时候提前部署」。
+    3. `assertEqual(set(new_meta(...)), set(REQUIRED_META_KEYS))`，而后者是从
+       前者派生的。构造器少一个字段，校验面跟着少，测试照样绿。
+
+    解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
+    suspect:3, running:4}，字段清单钉那六个名字，别只钉「两边相等」。
+
+还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
+**「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
+行数（现在 55 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以要 resume、
+退出码怎么读），正好把这次重写的目的做反。
+这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
+"""
 import argparse
 import contextlib
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
 from unittest import mock
@@ -646,6 +688,46 @@ class TestPid(unittest.TestCase):
             proc.wait()
 
 
+class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
+    """SKILL.md 的验收判据：已由代码保证的约束，一条都不许在文档里再说一遍。
+
+    把文档约定变成硬约束，正是这个项目的主张本身——所以这条判据自己也得是
+    一条测试，而不是又一句靠人记住的约定。
+    每多说一遍就是第二个家：改了代码忘了改文档，文档就开始说假话，
+    而读文档的人没有任何办法发现。
+    """
+
+    # 左边是模式，右边是「这条约束现在住在代码的哪儿」
+    OWNED_BY_CODE = {
+        r"--cd": "build_run_argv / build_resume_argv",
+        r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
+        r"/proc|pgrep|pkill": "find_codex_pid",
+        r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
+        r"mkdir -p": "ensure_isolation",
+        r"--color": "build_run_argv（resume 不认它）",
+        r"CODEX_HOME|CODEX_SQLITE_HOME": "codex_env",
+        r"--sandbox|sandbox_mode": "build_run_argv / build_resume_argv",
+        r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
+        r"session id|session_id": "extract_session_id / 元数据",
+        r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
+    }
+
+    def test_没有一条代码级约束泄漏进文档(self):
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        leaked = {pat: owner for pat, owner in self.OWNED_BY_CODE.items()
+                  if re.search(pat, skill)}
+        self.assertEqual(leaked, {},
+                         "这些约束已经由代码保证，文档里不该再说一遍："
+                         + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
+
+    def test_文档仍然保留代码替不了的那部分(self):
+        # 反向守一道：别为了让上面那条变绿，把该留的也删了
+        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
+        for must in ("effort", "run_in_background", "resume", "brief"):
+            with self.subTest(must=must):
+                self.assertIn(must, skill)
+
+
 class TestTaskName(unittest.TestCase):
     def test_收正常任务名(self):
         for good in ("smoke-2026-09-19", "a.b_c", "T1"):
@@ -705,8 +787,20 @@ class TestParser(_HomeSandbox):
                                "--account", "default"])
 
     def test_不提供会造成误用的参数(self):
+        """这六个参数是**刻意不提供**的，各有各的理由：
+
+        | 参数 | 为什么不给 |
+        |---|---|
+        | `--timeout` | 会误杀正当的长任务。codex 动辄跑几十分钟，没有一个安全的默认值 |
+        | `--background` | 后台与否由调用方的 `Bash(run_in_background)` 决定，工具自己加只会变成孤儿进程 |
+        | `-o` | 报告路径由工具派生（`<隔离目录>/reports/<任务>.md`）。让调用方指定就会落进仓库、被 `git add -A` 收走 |
+        | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
+        | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
+        | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
+
+        前两个是「会造成误用」，后四个是「由工具派生」。
+        """
         parser = ca.build_parser()
-        # 和 spec §5「不提供的参数」那张表一字不差
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
@@ -882,9 +976,11 @@ class TestResumeGuards(_HomeSandbox):
                 ca.cmd_resume(self._args("t4"))
         self.assertIn("不在了", cm.exception.message)
 
-    def test_resume也要校验隔离不变量_spec要求每次run和resume都查(self):
-        # spec §6 写的是「每次 run/resume 都校验」。resume 这条路上不查的话，
-        # config.toml 被软链回主配置、auth.json 指错账号，全都查不出来。
+    def test_resume也要校验隔离不变量(self):
+        # 隔离不变量**每次 run 和 resume 都要校验**，两条路缺一条洞就还在。
+        # resume 这条路上不查的话，config.toml 被软链回主配置、auth.json 指错
+        # 账号，全都查不出来——而这种失效是静默的：跑起来一切正常，
+        # 只是 codex 看得见它不该看见的东西。
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
         (d / "config.toml").unlink()
@@ -1213,9 +1309,14 @@ class TestStop(_HomeSandbox):
 
 
 class TestSignalSafetyRealProcesses(unittest.TestCase):
-    """用真进程、真信号验证 spec §9 的那条保证：
+    """用真进程、真信号验证整个工具最不能出错的那条保证：
 
-    无论谁怎么停包装器，codex 收到的永远**只有** INT。
+    **无论谁用什么信号停包装器，codex 收到的永远只有 INT。**
+    这条保证由两件事合起来兑现，缺一个洞就还在：
+      ① `start_new_session=True` 把 codex 挡在组信号之外
+      ② 包装器给 TERM／INT／HUP 都装 handler，统一转发 INT
+    它之所以是死线：SIGTERM 之后 codex 的 thread 会被**永久锁死**，
+    之后 resume 永远报 thread-store conflict，等多久都不释放，上下文全丢。
     上面 TestSignalSafety 用 mock 验的是「参数传对了没」，这里验的是
     「传对了之后，内核那一层真的照做了没」——这两件事不是一回事。
 

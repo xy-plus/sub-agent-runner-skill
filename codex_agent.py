@@ -267,6 +267,16 @@ def account_choices():
 
 
 def isolation_home(account):
+    """每个账号一个隔离目录，任务的全部产物都落在这里。
+
+    **落点在 `$HOME` 下，不在被改的那个仓库里**，这是判据不是习惯：
+    `tasks/`、`reports/`、`logs/` 全在仓库外，过程文件就进不了 git，
+    谁 `git add -A` 都收不到它。
+    从前报告写在 `--cd` 那个仓里、靠 `tmp_codex_` 前缀加一句 brief 叮嘱来防，
+    2026-09-13 破了：子代理把 380 行的 `tmp_codex_final_ban_spec_review.json`
+    提交进了分支，**而它的收尾自述里写着「未提交 tmp_codex_*」**。
+    软约定拦不住，换成结构上够不着才拦得住。
+    """
     base = pathlib.Path.home()
     return base / ".codex-subagent" if account == "default" else base / f".codex-subagent-{account}"
 
@@ -322,8 +332,7 @@ def ensure_isolation(account):
 
 SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
 
-# 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
-# 主线和 resume 都收的参数。调用方碰不到它们，也就不可能漏掉。
+# 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
 # `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
 _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
            "--skip-git-repo-check", "--disable", "plugins"]
@@ -515,6 +524,12 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
 # 悄悄落成 0，`codex-agent status t && deploy` 就会在任务还在跑的时候部署。
 # 2 不在表里，留给参数错误与护栏拒绝（见 USAGE_ERROR）。
+#
+# 退出码值得这么较真，是因为它**真的会被人看见**：实测 harness 给后台任务的
+# 完成通知里直接带着退出码（exit 3 的那条通知写的就是
+# `failed with exit code 3`）。所以「run 收尾自己跑一遍判据、退出码＝判据结论」
+# 这件事等于把结论直接送到了调用方眼前——happy path 下根本不用再敲 status，
+# 而 `exit 1 ≠ 失败` 这条最反直觉的知识也就被彻底消化掉了。
 _STATES = (("success", 0), ("running", 4), ("suspect", 3), ("failed", 1))
 EXIT = dict(_STATES)
 _SEVERITY = [name for name, _ in _STATES]
@@ -732,12 +747,28 @@ def cmd_stop(args):
         return EXIT["success"]
     # 只发 SIGINT。SIGTERM 会让 thread 永久锁死，之后 resume 永远报
     # thread-store conflict，等多久都不释放，上下文全丢。
+    #
+    # 「INT 之后仍然可以 resume」这条最初是 2026-09-08 的结论，2026-09-19 在
+    # **codex 0.154.0** 上真机复验过：run → stop(INT) → resume 跑通，两轮
+    # session id 完全相同、token 从 3,216 接着涨到 3,989；最有力的一条是追问
+    # 「被打断前你成功创建了哪几个文件」，codex 自己答得出「s1.txt，s2.txt 当时
+    # 尚未确认完成，s3.txt 未执行」——恢复的是**语义上的上下文**，不只是一段
+    # 计费记录，它知道自己被打断在哪一步。
+    # 这条是单点：start_new_session、统一转发 INT、本函数、以及「前台误跑也能
+    # 活」那条缓解措施，四件事全都架在它上面。换 codex 大版本时值得重验一次。
     os.kill(pid, signal.SIGINT)
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
 
 def build_parser():
+    """命令行契约。
+
+    整个工具选 Python3 写，理由就在这个函数里：`argparse` 的 `required=True`
+    + `choices=` 天然实现了「强制显式」——五个参数一个都不能少、难度和账号只能
+    从枚举里挑，而且**错误消息是免费的**，不用自己写一遍校验和提示。
+    另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
+    """
     p = argparse.ArgumentParser(
         prog="codex-agent",
         description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
@@ -783,6 +814,18 @@ def main():
     仍可 resume，日志里还留下一行打断标记（见 note_interrupt）告诉下一个人该
     resume 而不是重跑。于是误用的代价从「会话永久锁死、上下文全丢」降到
     「这一轮没拿到完成通知」——可恢复，且判据会把话说清楚。
+
+    **这也是为什么本工具是 CLI 而不是 MCP server**（同一件事的另一面）。
+    这套东西的价值有三条：① codex 干活 ② claude 不等、去干别的 ③ 干完自动通知。
+    MCP 的两种形态各杀掉一条：
+      - 同步等待 codex 结束 —— 任务动辄几十分钟，要么超时、要么把 claude
+        阻塞在原地，②没了；
+      - 立即返回 + 轮询 —— 完成通知来自 **harness 对 `Bash(run_in_background)`
+        的追踪**，MCP 没有这个通道，③没了。
+    MCP 能买到的只有「参数有 schema」和「不用读长 skill」，而 argparse 的
+    `required=True` + `choices=` 同样给得到，还不丢后台通道。
+    （附：codex 0.154.0 的 `codex mcp` 只是管理**外部** MCP server，
+    它不提供「把自己暴露成 MCP server」这回事。）
     """
     args = build_parser().parse_args()
     try:
