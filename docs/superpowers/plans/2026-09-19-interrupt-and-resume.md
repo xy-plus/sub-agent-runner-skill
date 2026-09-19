@@ -32,11 +32,13 @@
 **Interfaces:**
 - Consumes: 现有 `ROUND_MARK`、`strip_ansi`、`round_separator`、`_log_path`
 - Produces（确切签名）：
-  - `run_codex(kind: str, home: pathlib.Path, task: str, meta: dict, make_argv) -> str` —— 返回**本轮的日志文本**（内部用字节偏移切，但偏移不外泄）
+  - `run_codex(kind: str, home: pathlib.Path, task: str, meta: dict, make_argv) -> Round` —— 返回**报告路径 + 本轮日志文本**这一对（内部用字节偏移切，偏移不外泄）
   - `read_round(log_path: pathlib.Path, start_offset: int) -> str` —— `[start_offset, 之后第一个 ROUND_MARK)`
   - `read_last_round(log_path: pathlib.Path) -> str` —— 外部观察者用
   - `runtime_error_lines(round_text: str) -> list` —— 不再自己切轮次，只认传进来的这一段
-  - `judge(report_path: pathlib.Path, round_text: str) -> Verdict` —— **不收 pid**，存活与否由调用方判
+  - `judge(round: Round) -> Verdict` —— **只收那一对**，不收 pid（存活与否由调用方判），
+    也不再让调用方自己把报告路径和文本凑到一起（凑错是静默算对的）
+  - `has_interrupt_mark(text: str) -> bool` —— 痕迹判定走**整行**正则，不是子串
 - Removes: `current_round(log_text)` —— 它的两个职责分别由 `read_round` / `read_last_round` 接走，留着就是第二个家
 
 - [ ] **Step 1: 写失败的测试**
@@ -525,12 +527,86 @@ read_last_round 拿它唯一看得见的东西。judge 不再自己猜边界。
 
 ---
 
+### Task 1b: 边界的右端也必须是事实（代码审查 Critical-1）
+
+左端改成记下来的字节偏移之后，右端仍是 `text.find(ROUND_MARK)`／`text.rfind(...)`、
+痕迹判定仍是 `INTERRUPT_MARK in round_text`——**全是子串搜索，全是推测**。
+模块 docstring 自己写着「日志里还混着 brief 原文和 codex 转述的子进程输出」，
+而这个仓库的日常就是派 codex 来改 `codex_agent.py` 自己。
+
+| 日志里混进的源码行 | 后果 |
+|---|---|
+| `ROUND_MARK = "===== codex-agent "` | 本轮文本被切剩 14 个字符 → `interrupted` 翻成 **`failed`** |
+| `INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断…"` | `failed` 翻成 **`interrupted`**、退出码 130 → agent 去 resume 一个根本没被打断的失败轮 |
+
+**Files:** Modify `codex_agent.py` · Modify `test_codex_agent.py`
+
+- [ ] **Step 1: 写失败的测试**（两条回归，直接拿源码行当样本）
+
+```python
+    def test_日志里混进ROUND_MARK的源码行_不许被当成轮次分隔符(self):
+        # 这个仓库的日常就是派 codex 改 codex_agent.py 自己，源码行进日志是常态。
+        # 子串搜索会在这里切断本轮：切剩 'ROUND_MARK = "' 14 个字符，
+        # 打断标记被甩到本轮之外，judge 从 interrupted 翻成 failed。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        源码行 = 'ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀'
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(
+                log, 源码行 + "\n", ca.INTERRUPT_MARK + "\n")
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
+        self.assertIn(源码行, rd.text, "本轮文本被那行源码切断了")
+        self.assertEqual(ca.judge(rd).state, "interrupted")
+
+    def test_日志里混进INTERRUPT_MARK的源码行_不许被当成真打断(self):
+        # 反方向：一轮真正失败的运行，日志里恰好转述了那行常量定义，
+        # 子串搜索会判成 interrupted、退出码 130，
+        # 而照契约做决定的 agent 会去 resume 一个根本没被打断的失败轮。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        源码行 = f'INTERRUPT_MARK = "{ca.INTERRUPT_MARK}"'
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, 源码行 + "\n")
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertIn(ca.INTERRUPT_MARK, 源码行, "前提不成立：样本行里没有打断标记")
+        self.assertEqual(ca.judge(rd).state, "failed")
+```
+
+- [ ] **Step 2/3: 整行匹配**
+
+```python
+# 分隔符与痕迹一律**整行**匹配，不是子串。
+# 子串搜索在这个仓库里是真会说谎的：日志里混着 brief 原文和 codex 转述的子进程
+# 输出，而这里的日常就是派 codex 来改 codex_agent.py 自己——源码里这两行常量
+# 定义一旦被转述进日志，两个方向都会翻车（见 TestRoundBoundary 里那两条回归）。
+# round_separator 产出的 kind/task/when_iso 三段都不含空格（kind 是枚举、任务名
+# 字符集排除空格、isoformat(timespec="seconds") 无空格），所以 \S+ \S+ \S+ 精确。
+_ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
+# 痕迹行尾可以跟一个 [来源]，见 interrupt_codex 的 cause。
+_MARK_LINE = re.compile(r"^" + re.escape(INTERRUPT_MARK) + r"(\s\[.*\])?$", re.M)
+
+
+def has_interrupt_mark(text):
+    """本轮是否真的被打断。整行匹配，不是子串——理由见 _ROUND_LINE。"""
+    return _MARK_LINE.search(text) is not None
+```
+
+四个调用点：`read_round` 用 `_ROUND_LINE.search` 取右端、`read_last_round` 用
+`finditer` 取最后一个、`judge` 与 `cmd_interrupt_and_resume` 改用 `has_interrupt_mark`。
+
+- [ ] **Step 4: 突变复验**
+
+两条回归各自对应一个方向，把整行正则改回子串搜索 → 两条必须都红。
+
+---
+
 ### Task 2: `interrupted` 是第五态（改动 A-3）
 
 **Files:** Modify `codex_agent.py` · Modify `test_codex_agent.py`
 
 **Interfaces:**
-- Consumes: Task 1 的 `judge(report_path, round_text)`
+- Consumes: Task 1 的 `judge(round)`
 - Produces:
   - `_STATES = (("success", 0), ("running", 4), ("interrupted", 130), ("suspect", 3), ("failed", 1))`
   - `EXIT["interrupted"] == 130`（＝128+SIGINT，跟既成约定，见下）；`_SEVERITY == ["success", "running", "interrupted", "suspect", "failed"]`
@@ -583,7 +659,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
 
     def test_有打断标记且无报告时状态是interrupted(self):
-        v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n", None)
+        v = ca.judge(Round(self.report, ca.INTERRUPT_MARK + "\n"))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 5)
         self.assertIn("resume", v.reason)
@@ -592,7 +668,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
         for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             with self.subTest(mark=mark):
-                v = ca.judge(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n", None)
+                v = ca.judge(Round(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -1682,7 +1758,7 @@ Expected: PASS。新写的文字里不许出现 `OWNED_BY_CODE` 的任何一个�
 再在「空测试」那一节的三条病例后面补第四条（用户在这次改动里点名的那条）：
 
 ```
-    4. `assertEqual(ca.judge(report, log, None).state, "failed")` 只钉状态，不钉
+    4. `assertEqual(ca.judge(Round(report, log_text)).state, "failed")` 只钉状态，不钉
        「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，判据
        被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
        （见 TestRoundBoundary：正面钉拥有者的偏移，反面钉「猜边界当场失明」）。
@@ -1712,6 +1788,54 @@ git commit -m "docs: SKILL.md 加第四条命令与第五态，只写判断力�
 failed with exit code N，能区分的只有那个数字。
 测试模块 docstring 的承重约束清单一并同步：轮次边界由拥有者记下而非推测、
 退出码五态、以及新的第四条空测试病例。"
+```
+
+---
+
+### Task 7b: 三条没人看守的承重约束（代码审查 Important-2/3/4）
+
+三条都是**突变存活**——改坏了 163 条全绿。
+
+**① `O_APPEND` 无人看守。** 把 `interrupt_codex` 的 `O_APPEND` 去掉改成从 0 覆盖写，
+全绿。后果：痕迹落在 `start_offset` **之前** → `read_round` 看不到 → 判 `failed`
+（这个分支存在的理由被静默重新引入）；同时日志头部的分隔符和 session id 被覆盖
+→ resume 再也回不来。
+**根因是模块 docstring 点名的第 1 类空测试：前提本身不成立。** 三条留痕测试全在
+**空日志**上跑，而空文件上覆盖写和追加写结果一模一样。docstring 把「日志追加而非
+覆盖」列在「已全部被杀」里，那只覆盖了 `run_codex` 的 `"ab"`，**没覆盖 `interrupt_codex`**。
+改法：三条留痕测试的前提改成**非空日志**（头部放分隔符 + `session id:` 行），
+断言原有内容还在、痕迹落在头部**之后**。
+
+**② `_say` 是把软约定换了个地方。** 它的 docstring 说「收成一个函数而不是每个
+print 加 flush，后者是软约定漏一个就静默错序」——但 `_say` 有**完全相同的弱点，
+只是上移了一层**：15 个调用点都得记得用它。实测新加一行裸 `print` 存活、把
+「已确认退出」那句改回裸 `print` 也存活。它声称要防的失效完全可达且完全没测。
+**治本：在入口把文本层改成行缓冲，裸 `print` 自动正确，`_say` 整个删掉。**
+
+```python
+def main():
+    # stdout 接管道／文件时文本层默认**块缓冲**，而这条 fd 有两个写者：
+    # 本模块的 print 走文本层，run_codex 的 tee 走 sys.stdout.buffer（自己 flush）。
+    # 不改成行缓冲，包装器「此刻正在发生什么」的话会排到 codex 整轮输出之后
+    # （2026-09-19 端到端实测拿到过这个错序）。
+    # 在这里改一次，而不是每个 print 加 flush=True，也不是收一个 _say()——
+    # 那两种都是软约定，漏一个就静默错序，而漏一个不会报错。
+    sys.stdout.reconfigure(line_buffering=True)
+```
+
+`TestWrapperSpeaksImmediately` 的驱动改成走 `main()`，并**新增一条**：驱动里用
+**裸 `print`** 也必须当场读得到——那才是真正被钉住的东西。
+
+**③ SKILL.md 退出码表的语义无人看守。** 现在只断言「这个数字以反引号出现过」，
+把表改成 `` `1` interrupted `` / `` `130` failed ``（五个数字一个不少、含义全反）→ 全绿。
+改法：钉**数字和状态名的配对**，配对表从 `EXIT` 派生，不另写清单。
+
+```python
+        for state, code in ca.EXIT.items():
+            with self.subTest(state=state):
+                self.assertRegex(skill, rf"`{code}`\s*{state}",
+                                 f"SKILL.md 里 {code} 没有紧跟着 {state}")
+        self.assertRegex(skill, r"`2`.*(参数|护栏)")   # USAGE_ERROR 不在 EXIT 表里
 ```
 
 ---
@@ -1851,7 +1975,7 @@ done
 rm -rf /tmp/iar-smoke-2026-09-19 /tmp/iar-guard-2026-09-19
 git commit --allow-empty -m "test: 端到端冒烟通过
 
-打断留痕、被打断那一轮退出码 5、上下文真的接上（codex 自己说得出被打断前
+打断留痕、被打断那一轮退出码 130、上下文真的接上（codex 自己说得出被打断前
 建了 s1.txt）、没在跑时也能续跑、工作目录没了时闸挡在发信号之前（打断标记
 计数不变）。"
 ```
