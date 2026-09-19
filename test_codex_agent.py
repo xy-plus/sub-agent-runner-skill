@@ -1971,6 +1971,48 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
                       "stop 只发信号不留痕 → status 会把被打断的轮次报成 failed")
 
 
+class TestWrapperSpeaksImmediately(unittest.TestCase):
+    """包装器自己说的话必须**当场**出现在屏幕上，不能攒到进程退出才吐。
+
+    这条 fd 有两个写者：包装器走文本层的 print，run_codex 的 tee 走
+    sys.stdout.buffer（它自己 flush）。stdout 接管道／文件时文本层是**块缓冲**的，
+    于是包装器的话会一直躺在缓冲区里，到退出才随 atexit 一起吐出来——排在
+    codex 整轮输出**之后**。
+
+    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 和
+    `已确认退出` 两句都排在 codex 整轮输出的最后面，而它们要说的恰恰是
+    「此刻正在发生什么」。wait_for_exit 卡住的那 60 秒里，屏幕上更是一个字都没有。
+    """
+
+    def test_说完就能被读到_不等进程退出(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        screen = d / "screen.out"
+        driver = (
+            "import sys,time\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import codex_agent as ca\n"
+            "ca._say('这句必须当场看得到')\n"
+            "time.sleep(30)\n"
+        )
+        # 接的是文件不是 tty，Python 默认块缓冲——所以「这行现在就读得到」
+        # 只可能来自 _say 自己的 flush。
+        with open(screen, "wb") as out:
+            proc = subprocess.Popen([sys.executable, "-c", driver],
+                                    stdout=out, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 8
+            while time.time() < deadline and "这句必须当场看得到" not in screen.read_text():
+                if proc.poll() is not None:
+                    self.fail(f"驱动进程提前退出：{proc.stderr.read().decode()}")
+                time.sleep(0.05)
+            self.assertIsNone(proc.poll(), "驱动进程已经退出了，那这条测的就不是实时性")
+            self.assertIn("这句必须当场看得到", screen.read_text())
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stderr.close()
+
+
 class TestStop(_HomeSandbox):
     def test_只发SIGINT_绝不发SIGTERM(self):
         d = ca.ensure_isolation("default")
