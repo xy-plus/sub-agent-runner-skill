@@ -103,8 +103,17 @@ def has_interrupt_mark(text):
     return _MARK_LINE.search(text) is not None
 
 
-def interrupt_codex(pid, log_path):
+def interrupt_codex(pid, log_path, cause):
     """发 SIGINT 并在日志留痕。这两件事必须一起发生，所以焊在同一个函数里。
+
+    `cause` ∈ {"stop", "interrupt-and-resume", "外部信号转发"}，**必填**，
+    追在痕迹行尾。三条路的含义完全不同：前两条是有人**故意**停它；第三条在
+    `run_in_background` 下**根本不该发生**——它出现就等于前台误跑被 2 分钟
+    超时杀掉了。不带来源的话，日志里只剩一句「被打断了」，下一个人读不出
+    「你当时用错了启动方式」。
+    这是把「一条编不进去的软约定（必须用 run_in_background）被违反了」变成
+    **日志里可读的诊断**。`INTERRUPT_MARK` 仍是稳定前缀，`_MARK_LINE` 的
+    `(\s\[.*\])?$` 把来源收掉，判据不受影响。
 
     拆开放就会漏，而且**已经漏过一次**：`cmd_stop` 用裸 `os.kill` 打给 codex，
     而写痕迹的函数只在包装器自己的信号处理器里被调用，于是 stop 这条路上痕迹
@@ -129,7 +138,10 @@ def interrupt_codex(pid, log_path):
     的滥用面。这里的 ProcessLookupError 只是「刚好在这一瞬退出了」——
     信号没送出去就不该留下假痕迹，所以直接返回。
 
-    留痕用 O_APPEND + 单次 os.write：小写入在 Linux 上是原子的，不会和 tee 循环
+    留痕**必须 O_APPEND**：换成从 0 覆盖写的话，痕迹会落在本轮 start_offset
+    之前（read_round 看不到 → 判 failed，这个分支存在的理由被静默重新引入），
+    同时把日志头部的分隔符和 session id 抹掉（resume 再也回不来）。
+    O_APPEND + 单次 os.write：小写入在 Linux 上是原子的，不会和 tee 循环
     的缓冲写互相撕裂；也刻意不碰那个已经打开的文件对象——信号处理器随时可能插在
     它的 write 中间。写不进去就算了（吞掉 OSError）：INT 已经发出去了，保住
     codex 的上下文优先于留痕。这个降级方向正是「可观测的失效不许拖垮存活」。
@@ -141,7 +153,7 @@ def interrupt_codex(pid, log_path):
     try:
         fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
-            os.write(fd, (INTERRUPT_MARK + "\n").encode())
+            os.write(fd, (INTERRUPT_MARK + f" [{cause}]\n").encode())
         finally:
             os.close(fd)
     except OSError:
@@ -802,7 +814,9 @@ def run_codex(kind, home, task, meta, make_argv):
             # 而且日志里一定留下痕迹——之后跑判据的人（包括另一个进程里的 status）
             # 才知道这轮该 resume 而不是重跑。
             # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
-            interrupt_codex(proc.pid, _log_path(home, task))
+            # 来源写「外部信号转发」：在 run_in_background 下这条路根本不该
+            # 走到——它出现在日志里，就是前台误跑被超时杀掉的诊断。
+            interrupt_codex(proc.pid, _log_path(home, task), "外部信号转发")
 
         # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
         # 而不还原，等于把本函数的副作用留给了整个进程的余生。
@@ -1027,7 +1041,7 @@ def cmd_interrupt_and_resume(args):
             print(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
-            interrupt_codex(pid, log)
+            interrupt_codex(pid, log, "interrupt-and-resume")
             print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
         if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
             reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
@@ -1048,7 +1062,7 @@ def cmd_stop(args):
     # 发 INT 与留痕焊在 interrupt_codex 里，这条路不可能只做一半。
     # 上面 `pid is None` 那一支正是「调用之前判它在不在跑」的地方，
     # 所以 interrupt_codex 不需要回一个 bool 让这里再判一遍。
-    interrupt_codex(pid, _log_path(home, args.task))
+    interrupt_codex(pid, _log_path(home, args.task), "stop")
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
@@ -1117,9 +1131,16 @@ def main():
 
     能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
     包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
-    仍可 resume，日志里还留下一行打断标记（见 interrupt_codex）告诉下一个人该
-    resume 而不是重跑。于是误用的代价从「会话永久锁死、上下文全丢」降到
-    「这一轮没拿到完成通知」——可恢复，且判据会把话说清楚。
+    仍可 resume，日志里还留下一行带来源的打断标记（`[外部信号转发]`，见
+    interrupt_codex）告诉下一个人该 resume 而不是重跑。于是误用的代价从
+    「会话永久锁死、上下文全丢」降到「这一轮没拿到完成通知」——可恢复。
+
+    **这条路上别指望退出码。** 链路是「harness 超时 → TERM 打进程组 → codex
+    收不到 → 包装器转 INT → 留痕 → 判据 interrupted → 返回 130」，而此时
+    harness 已经超时了，它报的是超时，未必会去收那个 130。
+    退出码 130 是 `run_in_background` **正常路径**上的通道；前台误跑这条路上
+    真正可靠的是**日志里那行痕迹**（连带它的来源），以及之后任何一次 `status`
+    的复述。
 
     **这也是为什么本工具是 CLI 而不是 MCP server**（同一件事的另一面）。
     这套东西的价值有三条：① codex 干活 ② claude 不等、去干别的 ③ 干完自动通知。

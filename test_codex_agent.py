@@ -1563,7 +1563,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # **打给谁**也要钉：传成报告路径的话，痕迹写进**报告** → judge 看到非空
         # 报告、无错误行 → 判 success、退出码 0。不是崩，是静默说谎。
         # 实跑确认：只钉 assert_called_once() 的话这个突变 156 条全绿。
-        ic.assert_called_once_with(4242, ca._log_path(self.d, "t"))
+        ic.assert_called_once_with(4242, ca._log_path(self.d, "t"), "interrupt-and-resume")
 
     def test_日志分隔符写的是interrupt_and_resume_而不是resume(self):
         # 日志要看得出这一轮是被插话打断后续上的
@@ -1953,7 +1953,7 @@ class TestInterruptCodex(unittest.TestCase):
             self.assertTrue(ready.exists(),
                             "前提不成立：陪练进程没装上 INT 处理器，这条测不到「被 INT 正常收走」")
             self.assertTrue(ca.pid_alive(proc.pid), "前提不成立：陪练进程没起来")
-            ca.interrupt_codex(proc.pid, self.log)
+            ca.interrupt_codex(proc.pid, self.log, "stop")
             self.assertIn(ca.INTERRUPT_MARK, self.log.read_text())
             self._assert_appended("发信号留痕")
             proc.wait(timeout=5)
@@ -1970,14 +1970,33 @@ class TestInterruptCodex(unittest.TestCase):
         dead.wait()
         self.assertFalse(ca.pid_alive(dead.pid),
                          "前提不成立：陪练进程还活着，这条测的就不是「已退出」")
-        ca.interrupt_codex(dead.pid, self.log)
+        ca.interrupt_codex(dead.pid, self.log, "stop")
         self.assertEqual(self.log.read_text(), self.HEAD, "没送出信号却动了日志")
+
+    def test_痕迹带上来源_三条路读得出是哪一条(self):
+        """三条路的含义完全不同，日志里必须分得开。
+
+        `stop` 和 `interrupt-and-resume` 是有人**故意**停它；
+        `外部信号转发` 在 run_in_background 下**根本不该发生**——它出现就等于
+        前台误跑被 2 分钟超时杀掉了。不带来源的话日志里只剩一句「被打断了」，
+        下一个人读不出「你当时用错了启动方式」。
+        这是把一条编不进去的软约定被违反，变成日志里可读的诊断。
+        """
+        for cause in ("stop", "interrupt-and-resume", "外部信号转发"):
+            with self.subTest(cause=cause):
+                self.log.write_text(self.HEAD)
+                with mock.patch.object(ca.os, "kill"):
+                    ca.interrupt_codex(4242, self.log, cause)
+                self.assertIn(f"[{cause}]", self.log.read_text())
+                # 带了来源也仍然是合法痕迹：判据不受影响
+                self.assertTrue(ca.has_interrupt_mark(self.log.read_text()),
+                                f"带上 [{cause}] 之后判据认不出这是打断了")
 
     def test_只发INT绝不发TERM(self):
         # SIGTERM 会让 thread 永久锁死，之后 resume 永远报 thread-store conflict，
         # 等多久都不释放，上下文全丢
         with mock.patch.object(ca.os, "kill") as k:
-            ca.interrupt_codex(4242, self.log)
+            ca.interrupt_codex(4242, self.log, "stop")
         k.assert_called_once_with(4242, signal.SIGINT)
         self._assert_appended("只发 INT 这条路")
 
@@ -1986,7 +2005,7 @@ class TestInterruptCodex(unittest.TestCase):
         那才是判它的地方。给个 bool 出来，就多出一个「谁检查」的滥用面。
         """
         with mock.patch.object(ca.os, "kill"):
-            self.assertIsNone(ca.interrupt_codex(4242, self.log))
+            self.assertIsNone(ca.interrupt_codex(4242, self.log, "stop"))
 
 
 class TestWaitForExit(unittest.TestCase):
