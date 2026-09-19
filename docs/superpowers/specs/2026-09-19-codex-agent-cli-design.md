@@ -62,7 +62,7 @@ $D = ~/.codex-subagent            (account=default)
 ├── auth.json -> 该账号登录态
 ├── skills/  plugins/  # 存在即可，保持不含用户 skill/plugin
 ├── tasks/<任务>.json   # 任务元数据（见 §7）
-├── reports/<任务>.json # codex 收尾自述（`-o` 落点）
+├── reports/<任务>.md   # codex 收尾自述（`-o` 落点，是 agent 的最后一条消息，通常是散文不是 JSON）
 └── logs/<任务>.log     # 全量输出
 ```
 
@@ -84,7 +84,7 @@ codex-agent stop   N
 | `--task` | 全局唯一。`run` 前扫描**所有**隔离目录，重名即拒绝 |
 | `--dir` | 自动 `realpath` 成绝对路径；不是目录即拒绝 |
 | `--brief` | **必须是文件路径**，不收内联字符串（杜绝引号地狱） |
-| `--effort` | `choices={low,medium,high,xhigh,max}`，无默认值 |
+| `--effort` | `choices={low,medium,high,xhigh,max}`，无默认值。**这是对 codex 全集（`minimal/low/medium/high/xhigh/max/ultra`）的刻意裁剪**；`choices` 是唯一守门员——实测 codex 对 `-c model_reasoning_effort=bogus` 静默接受、banner 照打 |
 | `--account` | `choices` 在运行时由 `~/.codex-accounts/` 扫描得出 + `default`，无默认值 |
 
 `resume` / `stop` / `status` **不收 `--account`**：账号从任务元数据**查出来**，不是默认值。
@@ -111,7 +111,7 @@ harness 的完成通知里直接带成败结论，happy path 下无需再敲 `st
 ```
 run:    codex exec --cd <abs> -m gpt-6-astra -c model_reasoning_effort=<E>
         --sandbox danger-full-access -c approval_policy=never -c project_doc_max_bytes=0
-        --skip-git-repo-check --disable plugins -o <D>/reports/<N>.json <brief>
+        --skip-git-repo-check --disable plugins --color never -o <D>/reports/<N>.md <brief>
 resume: codex exec --cd <abs> resume <session_id> …同上，但
         -c sandbox_mode=danger-full-access   # resume 不认 --sandbox（退出码 2）
 ```
@@ -122,17 +122,30 @@ resume: codex exec --cd <abs> resume <session_id> …同上，但
 
 | 不变量 | 违反时 |
 |---|---|
-| `config.toml` 是普通文件，**不是软链** | 拒跑并说明：软链主配置＝隔离失效 |
-| `config.toml` 内容为工具写入的安全基线 | 缺失则创建 |
+| `config.toml` 是普通文件，**不是软链** | 拒跑：软链主配置会把 MCP/plugins/hooks 全带回来，隔离当场失效 |
 | `auth.json` 软链指向该账号登录态 | 缺失则创建；账号无登录态则拒跑 |
-| `skills/`、`plugins/` 存在 | 缺失则创建（空） |
+| `skills/`、`plugins/`、`tasks/`、`reports/`、`logs/` 存在 | 缺失则创建 |
+| `~/.agents/skills/` 为空 | 拒跑：那是 `CODEX_HOME` **管不到**的共享扫描根，放了东西 codex 就看得见，隔离的前提不成立 |
+
+**`config.toml` 的内容不是不变量，不许校验也不许重写。** 2026-09-19 实测：codex 自己往这个
+文件里写 `[projects."…"] trust_level = "trusted"`，`~/.codex-subagent` 已经累积了 19 段。
+校验内容则第二次 run 就失败，重写则抹掉 codex 自己的 trust 状态。缺失时只创建一个**仅含
+说明注释的空配置**，让打开它的人知道这文件为什么必须是本地的。
+
+**`model` / `model_reasoning_effort` / `sandbox_mode` / `approval_policy` 一律不写进
+`config.toml`**——CLI 每次都显式传，config 里再存一份就是同一条事实有两个家，而且是个会被
+静默覆盖的缺省值。
 
 ## 7. 任务元数据 `tasks/<任务>.json`
 
 ```json
 {"task": "...", "account": "...", "dir": "/abs/...", "effort": "low",
- "session_id": "01a0…", "started_at": "...", "pid": 254153}
+ "session_id": "01a0…", "started_at": "..."}
 ```
+
+**刻意不存 `pid`。** 存活判定必须每次从 `pgrep` + `comm` 重新反查（见 §8），
+存一个会过期、还会被系统复用的 PID，只会诱导别人犯这个设计本来要防的错。
+`resume` 会把 `effort` 写回，元数据始终描述最后一次调用。
 
 存在的理由：`resume` 必须回到**同一个目录、同一个会话**。有元数据就不用重新给 `--dir`，
 也就不可能 resume 到错的目录去。它同时是 `status` 无参时的任务清单来源。
@@ -142,49 +155,92 @@ resume: codex exec --cd <abs> resume <session_id> …同上，但
 | 状态 | 条件 |
 |---|---|
 | `running` | 真实 PID 存活 |
-| `success` | 报告存在且非空 + log 末 50 行无**未知**运行时 ERROR |
-| `suspect` | 报告存在且非空 + 有未知运行时 ERROR → 打印那几行，交给人判断 |
+| `success` | 报告存在且非空 + 本轮日志无未分类错误 |
+| `suspect` | 报告存在且非空 + 有未分类错误 → 打印那几行，交给人判断 |
 | `failed` | 报告缺失或为空（＝没正常收尾），`reason` 说明为何 |
+
+### 「报告存在」必须是关于**这一次调用**的事实
+
+2026-09-19 实测：codex **只在正常收尾时**写 `-o` 指定的文件，启动时**不 truncate**。
+所以 run 成功写下报告、随后 resume 秒死于写锁时，判据会读到**上一轮的旧报告**并判 `success`
+——工具在说谎。真实日志里有 5 份样本正是这条路径。
+
+**所以 `run` 和 `resume` 都在 spawn codex 之前先删掉报告文件。** 本工具是它唯一的创建者，
+于是「报告存在」重新变成一句关于本次调用的真话。代价是失败的 resume 会连带毁掉上一轮的报告
+——可以接受：日志是追加的，上一轮的内容仍在日志里。
 
 ### 真实 PID 怎么拿（不能靠 `$!`、不能靠日志）
 
-`pgrep -f "reports/<任务>.json"` → 再按 `ps -o comm=` 是 `codex` 收窄 → `kill -0` 确认。
-**`comm` 这道过滤是承重的，不是保险**：2026-09-19 实测 `pgrep -f <报告路径>` 确实命中了
-发命令的 bash 自己（`comm=bash`），少了这道过滤会把 shell 当成 codex。
-报告路径在 argv 里且按任务唯一，这是「按任务命名」的第二个用处。
-`$!` 拿到的是包装链最外层，不是 codex（2026-09-17 实测：`$!`=254151，codex=254153）。
+`pgrep -u <当前用户> -f "reports/<任务>.md"` → 再按 `ps -o comm=` 严格等于 `codex` 收窄
+→ `kill -0` 确认。报告路径在 codex 的 argv 里且按任务唯一，这是「按任务命名」的第二个用处。
 
-### 运行时 ERROR 怎么认（2026-09-19 实测，决定性）
+- `$!` 拿到的是包装链最外层，不是 codex（2026-09-17 实测：`$!`=254151，codex=254153）。
+- **`comm` 过滤是承重的**：2026-09-19 实测，`pgrep -f <报告路径>` 确实命中发命令的 bash 自己。
+- **`-u` 过滤也是承重的**：本机有其他用户同时在跑 codex。
+- `kill -0` 的 `PermissionError`（EPERM）意思是**进程存在**，只有 `ProcessLookupError`（ESRCH）
+  才是已退出。把 EPERM 当死，就会误判「已结束」而去 resume 一个还在跑的会话。
 
-log 里**混着 brief 原文和 codex 转述的子进程输出**，裸 `grep -E 'ERROR|WARN'` 大面积误报。
-实测出现过的误报源：cargo 的 `error[E0599]`、pytest 的 `E   KeyError`、
-brief 里引用 TDD skill 的 `**Test errors?**`、markdown 标题 `## Warning Signs`。
+### 怎么认 codex 自己的错误（2026-09-19 对 106 份真实日志全量统计）
 
-**codex 自己的运行时日志有两种形态，判据必须同时认，漏掉任一种都等于判据失效**
-（剥掉 ANSI 转义之后看）：
+日志里**混着 brief 原文和 codex 转述的子进程输出**，裸 `grep -E 'ERROR|WARN'` 大面积误报：
+cargo 的 `error[E0599]`、pytest 的 `E   KeyError`、brief 里引用 TDD skill 的
+`**Test errors?**`、markdown 标题 `## Warning Signs`。
 
-| 形态 | 样例（已剥 ANSI） | 特征 |
+codex 自己的错误有**三种锚定形式**，少认一种就等于判据失效：
+
+| 形式 | 剥 ANSI 后的样子 | 语料行数 |
 |---|---|---|
-| A 用户层 | `ERROR: You've hit your usage limit. …` | **行首**是 `ERROR:` / `WARN:` |
-| B tracing 结构化日志 | `2026-09-18T16:49:02.380969Z ERROR codex_models_manager::manager: failed to refresh available models: …` | **行首是 ISO8601 时间戳**，其后为 `ERROR`/`WARN` + `codex_*` target |
+| A 用户层 | `ERROR: Reconnecting... 2/5` | 23 |
+| B tracing | `2026-09-17T14:35:32.578919Z ERROR codex_core::session: Failed to create session: thread-store conflict: …` | 92 |
+| C 顶层致命 | `Error: thread/resume: … already has an active writer (code -32600)` | 5 |
 
-形态 B 的行首不是 `ERROR:`——只按行首匹配会把整类结构化日志漏掉。
-（原 SKILL.md 写的 `ERROR/WARN codex` 匹配的就是 B 的 `codex_*` target，A 靠行首。）
+形式 C 的首字母是大写 `Error:`，大小写敏感的 `^ERROR:` 匹配不到它——而它正是 §9 整节在讲的
+那个错误。
 
-正则两条，取并集：
-- `^(ERROR|WARN):\s`
-- `^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(ERROR|WARN)\s+codex\S*:`
+**形式 B 按 module target 分类，不按自由文本匹配**（文本会变，target 不会）：
 
-已知良性（命中后过滤掉，不计入判据）：
-- `failed to refresh available models`（形态 B）
-- `Reconnecting...`（形态 A，可恢复，后续正常继续）
+| target | 结论 |
+|---|---|
+| `codex_models_manager::*` | 良性：模型列表刷新超时，不影响本次运行 |
+| `codex_api::endpoint::responses_websocket` | 良性：连接抖动，自己会重连 |
+| `rmcp::transport::worker` | 良性 |
+| `codex_core::tools::router` | 良性：apply_patch 被拒后重打成功 |
+| 其余（含 `codex_core::session*`） | 未分类 → 计入判据 |
 
-特判进 `reason`（不新增状态）：`You've hit your usage limit` —— 补救手段不同（换账号／等额度）。
+形式 A 的良性只有一条：`Reconnecting...` **前缀**（有 `waiting for network` 和 `1/5`~`5/5`
+等多种后缀，写整行字面量会漏）。形式 C **一律致命**。
+
+特判进 `reason`（不新增状态）：`You've hit your usage limit`（换账号或等额度）、
+`thread-store conflict`（会话被锁，只能新起）。
+
+### 扫多长的日志：本轮的全部，不是末 N 行
+
+日志是**追加**的，每次调用前写一行分隔符：
+
+```
+===== codex-agent <run|resume> <任务名> <ISO 时间> =====
+```
+
+判据只扫**最后一个分隔符之后**的内容。
+
+旧写法是「扫末 50 行」，那个窗口其实在偷偷承担语义——「运行已经恢复过去的错误不算」。
+但这件事现在由 module 分类正经做了（`codex_core::tools::router` 那类本来就是良性），
+窗口就成了它的劣化替代品，**去掉**。留着只会让下一个撞上 60 行尾部堆栈的人把 50 改成 500，
+然后每一次「已恢复的错误」都静默变成 `suspect`。
+
+### 日志从源头就该是纯文本
+
+固定参数里带 `--color never`。实测 `--color auto`（默认）在输出被重定向时**并不关颜色**，
+106 份日志无一例外含 ANSI 转义，于是提 session id 和跑判据要各自剥一遍。
+从源头关掉，两个消费方都不再依赖剥离器（解析侧仍保留一个 `strip_ansi` 作防御，
+但它不再是承重结构）。
 
 ### 不进判据的东西
 
 原 skill 的 `jq -e '.commit // .branch'` **属于任务层，不属于工具层**——那是 brief 要求
-codex 填的字段。工具只管「有没有正常收尾」，并把报告的顶层 key 列出来给调用方自己看。
+codex 填的字段。而且实测 156 份真实报告只有 4 份能解析成 JSON：`-o` 写的是 agent 的最后
+一条**消息**，通常是 markdown 散文。所以报告用 `.md` 后缀，`success` 时打印它的**前 5 行**
+（对任何格式都成立），要结构化输出是 `--output-schema` 的事，另行决定。
 
 ## 9. 续跑与停止
 
