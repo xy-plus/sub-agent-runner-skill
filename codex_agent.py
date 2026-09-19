@@ -410,19 +410,39 @@ def find_codex_pid(report_path):
     没有收尾标记），所以 tail 日志只能看它在干什么，判不了存活。
     $! 拿到的是包装链最外层（2026-09-17 实测：$! 是 254151，codex 是 254153），
     据此判"已退出"再 resume，会撞上它自己的写锁。
-    报告路径在 codex 的 argv 里且按任务唯一，所以反查从它入手；
-    再按 comm 收窄——pgrep -f 会命中发命令的 shell 自己（2026-09-19 实测，
-    comm=bash），少了这道过滤会把 shell 当成 codex。
+
+    反查直接扫 /proc，**不用 pgrep**。三条理由，每条都是承重的：
+
+    1. `pgrep -f <模式>` 的模式是**正则**，而报告路径里有 `.`（任务名允许点，
+       后缀又是 `.md`）。2026-09-19 实测：任务 `a` 的 `…/reports/a.md` 拿去
+       pgrep，命中了任务 `aXmd` 的 `…/reports/aXmd.md`——`a`+任意字符+`md`。
+       后果是 `stop a` 把 SIGINT 发给 aXmd 的 codex。转义救不了根：这里要的
+       根本不是匹配，是**相等**。报告路径在 codex 的 argv 里正好是独立一项
+       （`-o <路径>`），所以按 argv 元素精确比对，正则语义一点都不引入。
+    2. comm 必须是 codex：pgrep -f 会命中发命令的 shell 自己（2026-09-19 实测，
+       comm=bash），少了这道过滤会把 shell 当成 codex。
+    3. 必须限当前用户：本机有别的用户在跑 codex，不限的话 stop 会打到别人身上。
+
+    顺带省掉每次 1+N 次子进程（一个 pgrep 加每个候选一个 ps）。
     """
-    # -u 这道过滤也是承重的：本机有其他用户同时在跑 codex，不限用户的话
-    # 他们的进程会进候选集，stop 就可能把 SIGINT 发到别人的会话上。
-    r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", report_path],
-                       capture_output=True, text=True)
-    for pid_str in r.stdout.split():
-        comm = subprocess.run(["ps", "-o", "comm=", "-p", pid_str],
-                              capture_output=True, text=True).stdout.strip()
-        if comm == "codex" and pid_alive(int(pid_str)):
-            return int(pid_str)
+    me = os.getuid()
+    needle = report_path.encode()
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            # 进程随时可能退出，每一步都可能 ENOENT——一律跳过，不让它打断扫描
+            if entry.stat().st_uid != me:
+                continue
+            if (entry / "comm").read_bytes().strip() != b"codex":
+                continue
+            if needle not in (entry / "cmdline").read_bytes().split(b"\0"):
+                continue
+        except OSError:
+            continue
+        pid = int(entry.name)
+        if pid_alive(pid):
+            return pid
     return None
 
 

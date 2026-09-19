@@ -395,30 +395,58 @@ class TestPid(unittest.TestCase):
             self.assertTrue(ca.pid_alive(1))
 
     def test_只看当前用户的进程_别人的codex不进候选集(self):
-        # 本机有其他用户同时在跑 codex，-u 这道过滤也是承重的
-        with mock.patch.object(ca.subprocess, "run") as run:
-            run.return_value.stdout = ""
-            ca.find_codex_pid("/d/reports/t.md")
-        self.assertEqual(run.call_args.args[0][:3], ["pgrep", "-u", str(os.getuid())])
-
-    def test_只认comm是codex的进程_shell自己不算(self):
-        # 2026-09-19 实测：pgrep -f <报告路径> 会命中发命令的 bash 自己（comm=bash），
-        # comm 过滤是承重的，不是保险。
-        # 这里起一个 argv 里含该路径、comm 绝不是 codex 的活进程来验证它被排除。
-        # （计划原稿用 `sleep 5 <mark>`，实测 sleep 会立刻以 "invalid time interval"
-        #   退出——进程根本不存在，测试变成空转。所以先断言前提成立再断言结论。）
-        mark = "/tmp/codex-agent-selftest-不存在的报告.json"
-        proc = subprocess.Popen([sys.executable, "-c", f"import time; time.sleep(30)  # {mark}"])
+        # 本机有别的用户同时在跑 codex，不限用户的话 stop 会把 SIGINT 打到别人身上。
+        # 没法真拿别人的账号起进程，就反过来做：把「当前用户」换成别人，
+        # 我们自己这个 comm=codex、argv 对得上的进程就该落选。
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        pathlib.Path(mark).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                hit = subprocess.run(["pgrep", "-f", mark],
-                                     capture_output=True, text=True).stdout.split()
-                if str(proc.pid) in hit:
-                    break
-                time.sleep(0.05)
-            else:
-                self.fail("pgrep 没命中陪练进程，本测试无法验证 comm 过滤，不能算通过")
+            self._wait_argv(proc, mark)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid)   # 前提：本来找得到
+            with mock.patch.object(ca.os, "getuid", return_value=os.getuid() + 12345):
+                self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    @staticmethod
+    def _argv_of(pid):
+        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
+
+    def _wait_argv(self, proc, needle):
+        """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            try:
+                if needle in self._argv_of(proc.pid):
+                    return
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+            time.sleep(0.05)
+        self.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
+
+    @staticmethod
+    def _fake_codex(tmp):
+        """把一个真二进制命名成 codex —— comm 就会报 codex。"""
+        fake = tmp / "codex"
+        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
+        fake.chmod(0o755)
+        return fake
+
+    def test_只认comm是codex的进程_别的进程不算(self):
+        # 2026-09-19 实测：按报告路径反查会命中发命令的 bash 自己（comm=bash），
+        # comm 过滤是承重的，不是保险。
+        # 陪练进程把报告路径作为 argv 里**独立一项**传进去，和 codex 的 `-o <路径>`
+        # 形状一致——否则测到的只是「没匹配上」，不是「comm 把它挡住了」。
+        mark = "/tmp/codex-agent-selftest-不存在的报告.md"
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
+        try:
+            self._wait_argv(proc, mark)
             self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
@@ -426,21 +454,68 @@ class TestPid(unittest.TestCase):
 
     def test_comm真是codex的进程会被找到_反向也要成立(self):
         # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
-        # 把一个真二进制命名成 codex，ps -o comm= 就会报 codex。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = tmp / "codex"
-        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
-        fake.chmod(0o755)
+        fake = self._fake_codex(tmp)
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
-        (tmp / "reports" / "t.md").write_text("")
+        pathlib.Path(mark).write_text("")
         proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            deadline = time.time() + 5
-            while time.time() < deadline and ca.find_codex_pid(mark) is None:
-                time.sleep(0.05)
+            self._wait_argv(proc, mark)
             self.assertEqual(ca.find_codex_pid(mark), proc.pid)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_报告路径必须是argv里独立一项_出现在brief正文里不算(self):
+        """brief 是 codex argv 里的最后一项，正文里完全可能提到别的任务的报告路径。
+
+        按子串匹配的话那就成了误命中：这个进程干的根本不是那个任务，
+        却会被 status 报成 running、被 stop 打中、让 run 以「还在跑」误拒。
+        报告路径在 codex 的 argv 里正好是独立一项（`-o <路径>`），
+        所以比对必须是**元素相等**，不是子串包含。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mine = str(tmp / "reports" / "mine.md")
+        others = str(tmp / "reports" / "others.md")
+        pathlib.Path(mine).write_text("")
+        brief = f"请参考 {others} 里的结论再动手"      # 别的任务的报告路径只出现在正文里
+        proc = subprocess.Popen([str(fake), "-f", mine, brief], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, brief)
+            self.assertEqual(ca.find_codex_pid(mine), proc.pid)   # 前提：自己找得到自己
+            self.assertIsNone(ca.find_codex_pid(others))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_任务名里的点不是通配符_不许命中别的任务(self):
+        """`.` 在 `pgrep -f` 的正则里是「任意字符」。
+
+        任务名 `a` 的报告路径是 `…/reports/a.md`，拿它当模式去匹配，会命中任务
+        `aXmd` 的 `…/reports/aXmd.md`（`a` + 任意字符 + `md`）——2026-09-19 实测
+        `pgrep -f .../a.md` 确实返回了 aXmd 那个进程的 pid。
+        后果是实打实的：`codex-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
+        而 `run --task a` 会被「还在跑」误拒。
+        所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = self._fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        victim = str(tmp / "reports" / "aXmd.md")   # 任务 aXmd 的报告路径
+        hunter = str(tmp / "reports" / "a.md")      # 任务 a 的报告路径
+        pathlib.Path(victim).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", victim], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            self._wait_argv(proc, victim)
+            # 前提：它找得到自己，否则下面那条断言是空的
+            self.assertEqual(ca.find_codex_pid(victim), proc.pid)
+            self.assertIsNone(ca.find_codex_pid(hunter))
         finally:
             proc.kill()
             proc.wait()
