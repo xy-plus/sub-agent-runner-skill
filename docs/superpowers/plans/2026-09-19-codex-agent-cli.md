@@ -1012,35 +1012,9 @@ git commit -m "feat: 任务元数据与真实 PID 反查——comm 过滤是承�
 
 - [ ] **Step 1: 写失败的测试**
 
+测试文件顶部已有的 `_no_codex()` / `_full_meta()` / `_HomeSandbox`（Task 1 建立）继续复用。
+
 ```python
-# 所有 setUp 都同时 patch Path.home 和 $HOME：`Path.expanduser()` 走的是
-# os.path.expanduser（读 $HOME），**不受 Path.home 的 patch 影响**，而 cmd_run
-# 里有 .expanduser()（#20）。
-def _full_meta(task, **over):
-    """元数据的完整形状；_load_meta 会校验必填键，测试不能再写半截字典。"""
-    meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "session_id": None, "started_at": "2026-09-19T00:00:00"}
-    meta.update(over)
-    return meta
-
-
-class _HomeSandbox(unittest.TestCase):
-    def setUp(self):
-        self.home = pathlib.Path(tempfile.mkdtemp())
-        self.patches = [
-            mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home)),
-            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
-        ]
-        for q in self.patches:
-            q.start()
-        (self.home / ".codex").mkdir()
-        (self.home / ".codex" / "auth.json").write_text("{}")
-
-    def tearDown(self):
-        for q in reversed(self.patches):
-            q.stop()
-
-
 class TestTaskName(unittest.TestCase):
     def test_收正常任务名(self):
         for good in ("smoke-2026-09-19", "a.b_c", "T1"):
@@ -1154,16 +1128,40 @@ class TestRunGuards(_HomeSandbox):
     def test_开跑前删掉上一轮的报告_否则旧报告会被判成本轮成功(self):
         d = ca.ensure_isolation("default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
-        with mock.patch.object(ca, "run_codex") as fake:
+        with _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
-        self.assertTrue(fake.called)
+        self.assertTrue(popen.called)
         self.assertFalse((d / "reports" / "t.md").exists())
+
+    def test_开跑前三件事全在spawn之前做完(self):
+        # 顺序反了每一件都会坏事：
+        #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
+        #   写元数据在 spawn 之后 -> 中途炸了就留下一个没人管的孤儿 codex
+        #   写分隔符在 spawn 之后 -> 同上，而且判据会把上一轮的错误算到这一轮头上
+        d = ca.ensure_isolation("default")
+        (d / "reports" / "t.md").write_text("上一轮的报告")
+        (d / "logs" / "t.log").write_text("上一轮的日志\n")
+        seen = {}
+
+        def snapshot(*a, **k):
+            seen["旧报告还在"] = (d / "reports" / "t.md").exists()
+            seen["元数据已落盘"] = ca.meta_path(d, "t").exists()
+            seen["分隔符已写入"] = ca.ROUND_MARK in (d / "logs" / "t.log").read_text()
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = snapshot
+            ca.cmd_run(self._args(task="t"))
+        self.assertEqual(seen, {"旧报告还在": False, "元数据已落盘": True, "分隔符已写入": True})
 
     def test_日志是追加的_上一轮的内容不会被冲掉(self):
         d = ca.ensure_isolation("default")
         (d / "logs" / "t.log").write_text("上一轮的日志\n")
-        ca.cmd_run(self._args(task="t"))
-        self.assertIn("上一轮的日志", (d / "logs" / "t.log").read_text())
+        with _no_codex():
+            ca.cmd_run(self._args(task="t"))
+        text = (d / "logs" / "t.log").read_text()
+        self.assertIn("上一轮的日志", text)
+        self.assertIn(ca.ROUND_MARK, text)
 
 
 class TestResumeGuards(_HomeSandbox):
@@ -1179,8 +1177,10 @@ class TestResumeGuards(_HomeSandbox):
             ["resume", task, "--brief", str(self.brief), "--effort", "low"])
 
     def test_任务不存在就报错(self):
+        # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
+        # 否则测到的是 argparse 的拒绝，不是 cmd_resume 的
         with self.assertRaises(ca.Rejected) as cm:
-            ca.cmd_resume(self._args("没有"))
+            ca.cmd_resume(self._args("no-such-task"))
         self.assertIn("没有这个任务", cm.exception.message)
 
     def test_还在跑就拒绝resume_写锁冲突和SIGTERM锁死长得一样(self):
@@ -1213,8 +1213,7 @@ class TestResumeGuards(_HomeSandbox):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
         (d / "reports" / "t3.md").write_text("上一轮的报告")
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
-             mock.patch.object(ca, "run_codex"):
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
             ca.cmd_resume(self._args("t3"))
         self.assertFalse((d / "reports" / "t3.md").exists())
 
@@ -1266,29 +1265,62 @@ class TestSignalSafety(unittest.TestCase):
 
 class TestRunCodexStreaming(unittest.TestCase):
     def test_banner一出来就把session_id落盘_不等攒满缓冲区(self):
-        # read(1024) 会阻塞到凑满 1024 字节：实测子进程 t=0 flush 了 172 字节，
-        # 父进程 4.06 秒（EOF 时）才看到。后果连锁：屏幕不刷新 → 日志全程 0 字节
-        # → session_id 从来没写进元数据 → 包装进程一被杀就再也 resume 不回来。
+        """假 codex 只打一行 banner（约 50 字节）然后睡 30 秒，不到 EOF。
+
+        用 `read(1024)` 的话父进程会一直阻塞到凑满 1024 字节或 EOF，这一行永远
+        到不了元数据——实测子进程 t=0 就 flush 了 172 字节，父进程 4.06 秒（EOF
+        时）才看到。后果连锁：屏幕不刷新 → 日志全程 0 字节（status 的日志判据在
+        运行期完全失效）→ session_id 从来没写进元数据 → 包装进程一被杀，
+        cmd_resume 只能报「没记到 session id」，上下文全丢。
+        `run_codex` 在这里必须跑在**子进程的主线程**里：它要装信号 handler，
+        而 signal.signal 在非主线程会直接 ValueError。
+        """
         d = pathlib.Path(tempfile.mkdtemp())
         for sub in ("tasks", "reports", "logs"):
             (d / sub).mkdir()
-        fake = ("import sys,time;"
-                "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n');"
-                "sys.stdout.flush();time.sleep(30)")
-        th = threading.Thread(
-            target=ca.run_codex,
-            args=([sys.executable, "-c", fake], dict(os.environ), d, "t", "run", _full_meta("t")),
-            daemon=True)
-        th.start()
-        deadline = time.time() + 5
-        got = None
-        while time.time() < deadline:
-            meta = json.loads((d / "tasks" / "t.json").read_text())
-            if meta["session_id"]:
-                got = meta["session_id"]
-                break
-            time.sleep(0.05)
-        self.assertEqual(got, "01a0b408-f718-7ff3-8123-d5202551acba")
+        fake_codex = ("import sys,time;"
+                      "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n');"
+                      "sys.stdout.flush();time.sleep(30)")
+        driver = (
+            "import json,os,pathlib,sys;"
+            f"sys.path.insert(0, {str(pathlib.Path.cwd())!r});"
+            "import codex_agent as ca;"
+            f"d = pathlib.Path({str(d)!r});"
+            f"ca.run_codex([sys.executable, '-c', {fake_codex!r}], dict(os.environ),"
+            f" d, 't', 'run', {_full_meta('t')!r})"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", driver],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 8
+            got = None
+            while time.time() < deadline:
+                meta_file = d / "tasks" / "t.json"
+                if meta_file.exists():
+                    got = json.loads(meta_file.read_text())["session_id"]
+                    if got:
+                        break
+                if proc.poll() is not None:
+                    self.fail(f"驱动进程提前退出：{proc.stderr.read().decode()}")
+                time.sleep(0.05)
+            self.assertEqual(got, "01a0b408-f718-7ff3-8123-d5202551acba")
+            # 日志也必须已经落盘，而不是等 EOF 才一次性刷出来
+            self.assertIn("session id", (d / "logs" / "t.log").read_text())
+        finally:
+            proc.kill()
+            proc.wait()
+            proc.stderr.close()
+
+
+class TestStop(_HomeSandbox):
+    def test_只发SIGINT_绝不发SIGTERM(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        args = ca.build_parser().parse_args(["stop", "t"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca.os, "kill") as k:
+            ca.cmd_stop(args)
+        k.assert_called_once_with(4242, signal.SIGINT)
 
 
 class TestSignalSafetyRealProcesses(unittest.TestCase):
@@ -1369,17 +1401,6 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
                 pass
             proc.wait()
             proc.stderr.close()
-
-
-class TestStop(_HomeSandbox):
-    def test_只发SIGINT_绝不发SIGTERM(self):
-        d = ca.ensure_isolation("default")
-        ca.write_meta(d, "t", _full_meta("t"))
-        args = ca.build_parser().parse_args(["stop", "t"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca.os, "kill") as k:
-            ca.cmd_stop(args)
-        k.assert_called_once_with(4242, signal.SIGINT)
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -1439,59 +1460,67 @@ def run_codex(argv, env, home, task, kind, meta):
     "Reading additional input from stdin" + 进程 0% CPU）。
     不设 timeout：会误杀正当的长任务。
     """
+    # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
+    # 不会留下一个没人管的孤儿进程。（实测教训：原先要求调用方自己先 write_meta，
+    # 漏了的话会在 codex 已经跑起来之后才炸 FileNotFoundError。）
     write_meta(home, task, meta)
     clear_report(_report_path(home, task))
 
-    # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
-    # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
-    # 就是这么干的）会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、
-    # 再也 resume 不了、上下文全丢。隔到独立会话后 codex 收不到任何组信号，
-    # 只会收到下面 handler 转发的 INT。
-    proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-
-    def forward_as_sigint(signum, frame):
-        # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
-        # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
-        try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            pass
-
-    # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
-    # 而不还原，等于把本函数的副作用留给了整个进程的余生。
-    previous = {sig: signal.signal(sig, forward_as_sigint)
-                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        _tee_until_exit(proc, home, task, kind, meta)
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-
-
-def _tee_until_exit(proc, home, task, kind, meta):
-    head, session_id = b"", None
-    # 日志追加不覆盖，进来先写一行本轮分隔符——判据只扫它之后的内容。
+    # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
     with open(_log_path(home, task), "ab") as log:
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
-        # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
-        # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
-        # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
-        # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
-        for chunk in iter(lambda: proc.stdout.read1(1024), b""):
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-            log.write(chunk)
-            log.flush()
-            if session_id is None and len(head) < _HEAD_LIMIT:
-                head += chunk
-                session_id = extract_session_id(head.decode("utf-8", "replace"))
-                if session_id:
-                    meta["session_id"] = session_id
-                    write_meta(home, task, meta)
+
+        # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
+        # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
+        # 就是这么干的）会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、
+        # 再也 resume 不了、上下文全丢。隔到独立会话后 codex 收不到任何组信号，
+        # 只会收到下面 handler 转发的 INT。
+        #
+        # stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
+        # "Reading additional input from stdin" + 进程 0% CPU）。
+        # 不设 timeout：会误杀正当的长任务。
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+
+        def forward_as_sigint(signum, frame):
+            # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
+            # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+        # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
+        # 而不还原，等于把本函数的副作用留给了整个进程的余生。
+        previous = {sig: signal.signal(sig, forward_as_sigint)
+                    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        try:
+            _tee_until_exit(proc, log, home, task, meta)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def _tee_until_exit(proc, log, home, task, meta):
+    head, session_id = b"", None
+    # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
+    # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
+    # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
+    # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
+    for chunk in iter(lambda: proc.stdout.read1(1024), b""):
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        log.write(chunk)
+        log.flush()
+        if session_id is None and len(head) < _HEAD_LIMIT:
+            head += chunk
+            session_id = extract_session_id(head.decode("utf-8", "replace"))
+            if session_id:
+                meta["session_id"] = session_id
+                write_meta(home, task, meta)
     proc.wait()
 
 
