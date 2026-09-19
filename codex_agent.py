@@ -96,6 +96,19 @@ def extract_session_id(log_text):
     return m.group(1) if m else None
 
 
+def clear_report(report_path):
+    """每轮开跑前删掉报告文件。
+
+    2026-09-19 实测：codex **只在正常收尾时**写 `-o` 指定的文件，启动时**不**
+    truncate。所以 run 成功写下报告、随后 resume 秒死于写锁时，判据会读到上一轮
+    的旧报告并判 success——工具在说谎（真实日志里有 5 份样本走的正是这条路）。
+    删掉之后本工具成为报告的唯一创建者，「报告存在」才重新是一句关于本次调用的
+    真话。代价是失败的 resume 会连带毁掉上一轮的报告：可以接受，日志是追加的，
+    上一轮的内容还在里面。
+    """
+    report_path.unlink(missing_ok=True)
+
+
 class Verdict(NamedTuple):
     state: str   # running / success / suspect / failed
     reason: str  # 一行人话
@@ -127,12 +140,11 @@ def judge(report_path, log_path, pid):
         return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的 codex 错误", errors)
 
     # 报告内容由 brief 决定（要 commit 还是要别的），属于任务层不属于工具层。
-    # 工具只把顶层 key 列出来，让调用方自己核对 brief 要的字段在不在。
-    try:
-        keys = sorted(json.loads(report_path.read_text()).keys())
-    except (json.JSONDecodeError, AttributeError):
-        keys = []
-    return Verdict("success", "正常收尾，本轮日志无未分类错误", keys)
+    # 只预览前几行，让调用方自己核对 brief 要的东西在不在——不解析 JSON：实测
+    # 156 份真实报告只有 4 份是 JSON，`-o` 写的是 agent 的最后一条消息，通常是
+    # markdown 散文。要结构化输出那是 --output-schema 的事。
+    preview = [l for l in report_path.read_text().splitlines() if l.strip()][:REPORT_PREVIEW_LINES]
+    return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
 MODEL = "gpt-6-astra"

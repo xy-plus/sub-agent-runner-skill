@@ -107,7 +107,7 @@ class TestExtractSessionId(unittest.TestCase):
 class TestJudge(unittest.TestCase):
     def setUp(self):
         self.d = pathlib.Path(tempfile.mkdtemp())
-        self.report = self.d / "t.json"
+        self.report = self.d / "t.md"
         self.log = self.d / "t.log"
         self.log.write_text("正常收尾\n")
 
@@ -131,25 +131,42 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "failed")
         self.assertIn("额度", v.reason)
 
-    def test_报告在且日志干净是success_并列出顶层key(self):
-        self.report.write_text('{"commit": "abc", "summary": "done"}')
+    def test_报告是散文也算success_并预览前几行(self):
+        # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
+        # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事，不是工具层的。
+        self.report.write_text("干完了，见分支 feat/x\n改了 3 个文件\n测试全绿\n")
         v = ca.judge(self.report, self.log, None)
         self.assertEqual(v.state, "success")
-        self.assertEqual(sorted(v.detail), ["commit", "summary"])
+        self.assertEqual(v.detail[0], "干完了，见分支 feat/x")
 
-    def test_报告不是JSON也算success_那是任务层的事(self):
-        # 报告内容由 brief 决定，工具层只管"有没有正常收尾"
-        self.report.write_text("干完了，见分支 feat/x")
+    def test_预览最多几行_长报告不刷屏(self):
+        self.report.write_text("\n".join(f"第 {i} 行" for i in range(50)))
         v = ca.judge(self.report, self.log, None)
-        self.assertEqual(v.state, "success")
-        self.assertEqual(v.detail, [])
+        self.assertEqual(len(v.detail), ca.REPORT_PREVIEW_LINES)
 
-    def test_报告在但日志尾有未知运行时ERROR是suspect(self):
-        self.report.write_text('{"ok": 1}')
-        self.log.write_text("2026-09-18T16:50:00.000000Z ERROR codex_core::rollout: failed to persist rollout")
+    def test_报告在但本轮日志有未分类错误是suspect(self):
+        self.report.write_text("干完了")
+        self.log.write_text("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                            "Failed to create session: thread-store conflict")
         v = ca.judge(self.report, self.log, None)
         self.assertEqual(v.state, "suspect")
         self.assertEqual(len(v.detail), 1)
+
+    def test_撞上写锁_reason要点名(self):
+        self.log.write_text(ERR_FATAL)
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("锁", v.reason)
+
+    def test_清报告之后旧内容不会被当成本轮产物(self):
+        # codex 只在正常收尾时写 -o、启动时不 truncate。不清掉的话，一次秒死于
+        # 写锁的 resume 会读到上一轮的报告并被判成 success——工具在说谎。
+        self.report.write_text("上一轮的报告")
+        ca.clear_report(self.report)
+        self.assertEqual(ca.judge(self.report, self.log, None).state, "failed")
+
+    def test_清报告对还没有报告的任务也成立(self):
+        ca.clear_report(self.report)   # 不存在也不许抛
 
 
 class TestIsolation(unittest.TestCase):

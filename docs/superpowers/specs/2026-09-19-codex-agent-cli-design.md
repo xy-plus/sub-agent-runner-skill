@@ -81,7 +81,7 @@ codex-agent stop   N
 
 | 参数 | 规则 |
 |---|---|
-| `--task` | 全局唯一。`run` 前扫描**所有**隔离目录，重名即拒绝 |
+| `--task` | 字符集限死 `[A-Za-z0-9._-]+`，**由 argparse 的 `type=` 把关**，四个子命令都绕不过。重名规则见下 |
 | `--dir` | 自动 `realpath` 成绝对路径；不是目录即拒绝 |
 | `--brief` | **必须是文件路径**，不收内联字符串（杜绝引号地狱） |
 | `--effort` | `choices={low,medium,high,xhigh,max}`，无默认值。**这是对 codex 全集（`minimal/low/medium/high/xhigh/max/ultra`）的刻意裁剪**；`choices` 是唯一守门员——实测 codex 对 `-c model_reasoning_effort=bogus` 静默接受、banner 照打 |
@@ -89,6 +89,31 @@ codex-agent stop   N
 
 `resume` / `stop` / `status` **不收 `--account`**：账号从任务元数据**查出来**，不是默认值。
 `status` 省略任务名 = 列出所有隔离目录下的全部任务。
+
+### 任务名为什么要限字符集
+
+任务名同时是**文件名**和 **`pgrep -f` 的匹配模式**，两边都会被奇怪字符咬（2026-09-19 实测）：
+
+| 传进去的名字 | 后果 |
+|---|---|
+| `../escape` | 元数据写到 `tasks/` **外面**去了 |
+| `a/b` | 裸 `FileNotFoundError`，不是人话 |
+| `a\|b` | `pgrep -f` 把它当**正则或**，命中任意含 `b.json` 的进程 → **`stop` 把 SIGINT 发到别人的 codex 上** |
+| `fix(api)` | pgrep 正则分组，匹配语义静默改变 |
+
+第三行正是 §9 发誓要避免的后果（「永不 `pkill -f`，共享机器会误杀」），从任务名这个后门
+又放了进来。所以收窄放在 `argparse` 的 `type=` 上——结构上不可绕过，不是校验函数靠调用方记得调。
+
+### 重名规则
+
+| 情况 | 处置 |
+|---|---|
+| 同名任务**还在跑** | 拒绝 |
+| 同名任务在**同一账号**下、已结束 | 允许复用：报告被覆盖，日志是追加的所以上一轮仍在 |
+| 同名任务在**别的账号**下 | 拒绝，并告诉你它属于哪个账号 |
+
+第三行是硬约束不是洁癖：`find_meta` 按账号顺序查，跨账号同名会留下一份**再也够不着的孤儿
+元数据**，而 `run` 打印的「上一轮会被覆盖」在跨账号时是**假话**（两个 home 的报告路径不同）。
 
 ### 不提供的参数（刻意的）
 
@@ -281,5 +306,9 @@ codex 填的字段。而且实测 156 份真实报告只有 4 份能解析成 JS
 1. 实现 `codex_agent.py` + 单测，全绿。
 2. 改写 `SKILL.md` 到 ~40 行：派什么任务、effort 分档表、四条命令。
    250 行里的实测教训（日期／当时怎么炸的）**搬进代码注释，贴在防住它的那行旁边**。
-3. 合回 master，目录 `codex-sub-agent` → `codex-agent` 改名，建 `~/.local/bin/codex-agent` 软链。
+3. 合回 master，目录 `codex-sub-agent` → `codex-agent` 改名，**改名之后**才建
+   `~/.local/bin/codex-agent` → `~/.claude/skills/codex-agent/codex_agent.py` 软链。
+   顺序不能倒：软链指向工作树的话，工作树一删命令就断。
+   脚本需 `#!/usr/bin/env python3` 且有可执行位，这两样都显式做，不靠默认。
+   端到端冒烟在改名前用 `python3 <绝对路径>/codex_agent.py` 调用，验的是同一份代码。
 4. 端到端冒烟通过后，删除本 spec 与计划文档。
