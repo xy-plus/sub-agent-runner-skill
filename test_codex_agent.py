@@ -57,6 +57,7 @@ import sys
 import tempfile
 import time
 import unittest
+import warnings
 from unittest import mock
 
 import codex_agent as ca
@@ -135,6 +136,27 @@ class _HomeSandbox(unittest.TestCase):
     def tearDown(self):
         for q in reversed(self.patches):
             q.stop()
+
+
+class TestModuleCompilesClean(unittest.TestCase):
+    """源码编译不许产生任何警告。
+
+    包装器的 stdout 是判据结论的通道（退出码之外唯一带细节的那条），
+    任何警告都会混进去。2026-09-19 端到端实测撞到过：`interrupt_codex` 的
+    docstring 里写了正则 `(\\s\\[.*\\])?$` 却没转义，于是**每次调用**都先打一行
+    `SyntaxWarning: invalid escape sequence '\\s'`——冒烟输出里就夹着它，
+    而那正是刚用行缓冲修干净的那条通道。
+
+    这类污染不会让任何测试变红，所以要专门钉一条。
+    """
+
+    def test_源码编译没有任何警告(self):
+        src = pathlib.Path(ca.__file__).read_text()
+        self.assertIn("SyntaxWarning" if False else "def ", src, "前提不成立：读到的不是源码")
+        with warnings.catch_warnings(record=True) as got:
+            warnings.simplefilter("always")
+            compile(src, ca.__file__, "exec")
+        self.assertEqual([f"{w.category.__name__}: {w.message}" for w in got], [])
 
 
 class TestStripAnsi(unittest.TestCase):

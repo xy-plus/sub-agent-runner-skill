@@ -113,7 +113,7 @@ def interrupt_codex(pid, log_path, cause):
     「你当时用错了启动方式」。
     这是把「一条编不进去的软约定（必须用 run_in_background）被违反了」变成
     **日志里可读的诊断**。`INTERRUPT_MARK` 仍是稳定前缀，`_MARK_LINE` 的
-    `(\s\[.*\])?$` 把来源收掉，判据不受影响。
+    `(\\s\\[.*\\])?$` 把来源收掉，判据不受影响。
 
     拆开放就会漏，而且**已经漏过一次**：`cmd_stop` 用裸 `os.kill` 打给 codex，
     而写痕迹的函数只在包装器自己的信号处理器里被调用，于是 stop 这条路上痕迹
