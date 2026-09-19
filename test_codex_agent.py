@@ -1193,6 +1193,112 @@ class TestTaskName(unittest.TestCase):
                 ca.task_name(bad)
 
 
+class TestSkillPathArg(unittest.TestCase):
+    """`--skill` 的四条校验。**四条缺一不可**，每条各钉一条。
+
+    为什么必须当场拒（而不是让 codex 自己去发现）：2026-09-19 真跑过一次
+    brief 指向不存在的 SKILL.md，codex 第一步 `cat` 退 1，第二步拿 `find` 翻
+    真实 home **跑了 34.9 秒**，结论是「未找到该文件，因此无法严格按其流程
+    执行，尚未创建 out.txt」——磁盘上产物**不存在**，而本工具判 success、
+    **退出码 0**。「零工作量」被报成「完成」，没有任何别的信号救得回来。
+    """
+
+    def _dir(self):
+        return pathlib.Path(tempfile.mkdtemp())
+
+    def _skill_file(self):
+        d = self._dir()
+        q = d / "SKILL.md"
+        q.write_text("---\nname: x\n---\n")
+        return q
+
+    def test_收一个正常的绝对路径SKILL文件(self):
+        q = self._skill_file()
+        self.assertTrue(q.is_absolute() and q.is_file(), "前提不成立：样本文件没建起来")
+        self.assertEqual(ca.skill_path(str(q)), str(q))
+
+    def test_相对路径被拒(self):
+        with self.assertRaises(argparse.ArgumentTypeError) as cm:
+            ca.skill_path("skills/foo/SKILL.md")
+        self.assertIn("绝对路径", str(cm.exception))
+
+    def test_指向不存在的文件被拒(self):
+        missing = self._dir() / "SKILL.md"
+        self.assertFalse(missing.exists(), "前提不成立：这个文件居然存在")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            ca.skill_path(str(missing))
+
+    def test_权限000的文件被拒_is_file说True而codex的cat退1(self):
+        # 这条是审查实测逼出来的：只查 is_absolute + is_file 的话，
+        # 「文件不可读」这一支原样漏掉——而那正是核心承诺失效的地方。
+        self.assertNotEqual(os.geteuid(), 0, "前提不成立：root 读得了 000 的文件，这条测不到")
+        q = self._skill_file()
+        os.chmod(q, 0o000)
+        try:
+            self.assertTrue(q.is_file(), "前提不成立：is_file 本来就该返回 True，这条才有意义")
+            self.assertFalse(os.access(q, os.R_OK), "前提不成立：这个文件居然读得了")
+            self.assertEqual(subprocess.run(["cat", str(q)], capture_output=True).returncode, 1,
+                             "前提不成立：codex 用的 cat 居然没退 1")
+            with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                ca.skill_path(str(q))
+            self.assertIn("读不了", str(cm.exception))
+        finally:
+            os.chmod(q, 0o644)
+
+    def test_传目录被拒_错误信息要说清期望的是文件本身(self):
+        # 传 skill 目录是最容易犯的错，而 is_file() 为 False 时调用方看不出为什么
+        d = self._dir()
+        self.assertTrue(d.is_dir(), "前提不成立：目录没建起来")
+        with self.assertRaises(argparse.ArgumentTypeError) as cm:
+            ca.skill_path(str(d))
+        self.assertIn("SKILL.md", str(cm.exception))
+
+    def test_含控制字符的路径被拒(self):
+        q = self._skill_file()
+        for bad in (f"{q}\t", f"{q}\n", "/abs\x00/SKILL.md"):
+            # assertRaises 必须嵌在 subTest **里面**：写成 `with subTest(), assertRaises()`
+            # 再在块外读 cm.exception，一旦没抛出，真正的失败信息会被随后那句
+            # `'_AssertRaisesContext' object has no attribute 'exception'` 盖掉。
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                    ca.skill_path(bad)
+                self.assertIn("控制字符", str(cm.exception))
+
+    def test_每条拒绝都点名是哪个路径(self):
+        # 调用方是 agent：它拿到的只有 stderr 那一行，不点名就无从改起
+        q = self._skill_file()
+        os.chmod(q, 0o000)
+        try:
+            cases = ["skills/foo/SKILL.md", str(self._dir() / "SKILL.md"),
+                     str(q.parent), str(q)]
+            for bad in cases:
+                with self.subTest(bad=bad):
+                    with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                        ca.skill_path(bad)
+                    self.assertIn(bad, str(cm.exception))
+        finally:
+            os.chmod(q, 0o644)
+
+
+class TestWorkDirArg(unittest.TestCase):
+    def test_收一个正常目录路径(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        self.assertEqual(ca.work_dir(str(d)), str(d))
+
+    def test_含制表符或换行的目录被拒_而mkdir和is_dir全都放行(self):
+        # 前提断言就是这条测试存在的理由：文件系统那一层**根本不管**，
+        # 2026-09-19 实测含 \t 和 \n 的目录 mkdir / resolve() / is_dir() 全过。
+        weird = pathlib.Path(tempfile.mkdtemp()) / "a\tb\nc"
+        weird.mkdir()
+        self.assertTrue(weird.is_dir(), "前提不成立：带控制字符的目录建不起来，这条就没意义了")
+        self.assertIn("\n", str(weird.resolve()), "前提不成立：resolve 居然把换行吃掉了")
+        for bad in (str(weird), "/tmp/a\tb", "/tmp/a\nb"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(argparse.ArgumentTypeError) as cm:
+                    ca.work_dir(bad)
+                self.assertIn("控制字符", str(cm.exception))
+
+
 class TestParser(_HomeSandbox):
     def test_run的五个参数一个都不能少(self):
         parser = ca.build_parser()

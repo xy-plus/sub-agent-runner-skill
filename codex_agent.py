@@ -59,6 +59,65 @@ def task_name(value):
     return value
 
 
+# 控制字符（C0 全段 + DEL）。制表符和换行只是其中最容易撞上的两个。
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _reject_control_chars(flag, value):
+    """控制字符必须在**入口**挡住，不能指望「一般没人这么干」。
+
+    2026-09-19 实测：`--dir` 给一个含制表符和换行的路径，`mkdir`／`resolve()`／
+    `is_dir()` **全都放行**——文件系统这一层根本不管。而这个路径会原样进
+    `status` 的数据行，一个换行就让「一行一任务」不成立，任何切分方案都救不
+    回来（见 status_row）。
+    `--skill` 同理，但坏法不同：兜底句把白名单**逐行**列出来，路径里一个换行
+    就把一条白名单静默劈成两行，codex 读到的是两个都不存在的路径。
+    """
+    hit = _CONTROL_CHARS.search(value)
+    if hit:
+        # 这里用 !r：value 已经确定含控制字符，裸插进错误信息会把 stderr 也弄成
+        # 多行／带制表符的一坨。skill_path 后面三条的 value 是干净路径，用裸的。
+        raise argparse.ArgumentTypeError(
+            f"{flag} {value!r} 含控制字符 {hit.group()!r}（第 {hit.start()} 个字符）。"
+            f"这个值要原样进 status 的数据行和兜底句的白名单行，控制字符会把它们切坏。")
+
+
+def work_dir(value):
+    """`--dir` 的 type=。只管控制字符；「是不是目录」归 cmd_run——它要先 expanduser／resolve。"""
+    _reject_control_chars("--dir", value)
+    return value
+
+
+def skill_path(value):
+    """`--skill` 的 type=。四条缺一不可，全部当场拒，绝不「尽力而为」地继续。
+
+    收的是 **SKILL.md 文件本身**，不是 skill 目录。
+
+    为什么非得当场拒：2026-09-19 真跑（`--effort low`，brief 指向一个不存在的
+    SKILL.md）——codex 第一步 `cat` 退 1，第二步拿 `find` 翻真实 home **跑了
+    34.9 秒**，结论「未找到该文件，因此无法严格按其流程执行，尚未创建 out.txt」，
+    磁盘上产物**不存在**，而本工具判 `success`、**退出码 0**。
+    「零工作量」被报成「完成」，且没有任何别的信号救得回来：`cat` 的失败是 shell
+    退出码，不匹配 runtime_error_lines 的三种错误形式，judge 结构上看不见它。
+    """
+    _reject_control_chars("--skill", value)
+    q = pathlib.Path(value)
+    if not q.is_absolute():
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 不是绝对路径。codex 的 cwd 是 --dir，相对路径解释不出你的意思。")
+    if not q.is_file():
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 不是文件。要传的是 SKILL.md **文件本身**，不是 skill 目录。")
+    # 第三条是审查实测逼出来的：**权限 000 的文件 is_file() 返回 True**，
+    # 而 codex 的 `cat` 退 1。只查前两条的话，这次改动的核心承诺（路径写错从
+    # 静默失效变当场报错）在「文件存在但读不了」这一支上原样漏掉。
+    if not os.access(q, os.R_OK):
+        raise argparse.ArgumentTypeError(
+            f"--skill {value} 存在但当前用户读不了（权限 {oct(q.stat().st_mode)[-3:]}）。"
+            f"codex 的 cat 会退 1，而那个失败判据看不见。")
+    return value
+
+
 USAGE_LIMIT_MARK = "You've hit your usage limit"
 THREAD_LOCK_MARK = "already has an active writer"
 REPORT_PREVIEW_LINES = 5
