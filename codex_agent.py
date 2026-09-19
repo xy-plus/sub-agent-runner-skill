@@ -340,11 +340,26 @@ def write_meta(home, task, meta):
     meta_path(home, task).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
 
 
-# 元数据的形状只在这里定义一次。读回来就校验，之后所有地方放心裸下标——
-# `.get(键, 默认值)` 是默认缺省值，正是本工具要消灭的东西。
-# 刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
-# 留着它只会诱导别人犯这个设计本来要防的错。
-REQUIRED_META_KEYS = ("task", "account", "dir", "effort", "session_id", "started_at")
+def _now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def new_meta(task, account, workdir, effort):
+    """元数据的**唯一**构造器。字段清单只在这里写一次。
+
+    刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
+    留着它只会诱导别人犯这个设计本来要防的错。
+    """
+    return {"task": task, "account": account, "dir": workdir, "effort": effort,
+            "session_id": None, "started_at": _now_iso()}
+
+
+# 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
+# 静默的：少一个字段，run 照常报成败，但那个任务从此 status/resume/stop 全
+# 够不着，工具还会建议「删掉它重新 run」——会话就此丢掉。
+# 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
+# 正是本工具要消灭的东西。
+REQUIRED_META_KEYS = tuple(new_meta("", "", "", "").keys())
 
 
 def _load_meta(path):
@@ -468,10 +483,6 @@ def _worse(a, b):
 # session id 在 banner 里，前几百字节就出现。攒到这个上限还没有就不再攒，
 # 免得几 MB 的输出全堆在内存里。
 _HEAD_LIMIT = 8192
-
-
-def _now_iso():
-    return datetime.datetime.now().isoformat(timespec="seconds")
 
 
 def _report_path(home, task):
@@ -598,8 +609,7 @@ def cmd_run(args):
     print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
     run_codex("run", home, args.task,
-              {"task": args.task, "account": args.account, "dir": str(workdir),
-               "effort": args.effort, "session_id": None, "started_at": _now_iso()},
+              new_meta(args.task, args.account, str(workdir), args.effort),
               lambda r: build_run_argv(str(workdir), args.effort, r, brief))
 
     verdict = judge(report, _log_path(home, args.task), None)

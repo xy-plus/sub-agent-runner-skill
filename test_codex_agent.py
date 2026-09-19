@@ -381,6 +381,51 @@ class TestMeta(_HomeSandbox):
         self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
 
 
+class TestMetaShape(_HomeSandbox):
+    """元数据的形状只许有一个家。
+
+    突变掉 `cmd_run` 手拼字典里的一个 `effort` 之后的真实后果：run 照常报成败，
+    但那个任务从此 status/resume/stop **全够不着**（`_load_meta` 一律拒绝），
+    而工具给出的唯一建议「删掉它重新 run」会把会话**彻底弄丢**。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
+    # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
+    # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
+    FIELDS = {"task", "account", "dir", "effort", "session_id", "started_at"}
+
+    def test_字段清单的绝对值(self):
+        self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
+        # resume 要回到同一个目录、同一个会话，这两个字段是它的命根子
+        self.assertIn("dir", self.FIELDS)
+        self.assertIn("session_id", self.FIELDS)
+        # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
+        self.assertNotIn("pid", self.FIELDS)
+
+    def test_构造器的键集就是校验面(self):
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low")),
+                         set(ca.REQUIRED_META_KEYS))
+
+    def test_run落盘的元数据键集与校验面相等_不多不少(self):
+        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 pid 又会破坏
+        # 「存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        d = ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        with _no_codex():
+            ca.cmd_run(args)
+        self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
+                         set(ca.REQUIRED_META_KEYS))
+
+
 class TestPid(unittest.TestCase):
     def test_自己的进程判定为存活(self):
         self.assertTrue(ca.pid_alive(os.getpid()))
