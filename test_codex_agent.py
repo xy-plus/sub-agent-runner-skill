@@ -29,10 +29,10 @@
        要防的「status && deploy 在任务还在跑的时候提前部署」。
     3. `assertEqual(set(new_meta(...)), set(REQUIRED_META_KEYS))`，而后者是从
        前者派生的。构造器少一个字段，校验面跟着少，测试照样绿。
-    4. `assertEqual(ca.judge(report, log_text).state, "failed")` 只钉状态，不钉
-       「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，判据
-       被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
-       （见 TestRoundBoundary：正面钉拥有者的偏移，反面钉「猜边界当场失明」）。
+    4. `assertEqual(ca.judge(Round(report, log_text)).state, "failed")` 只钉状态，
+       不钉「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，
+       判据被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
+       （见 TestRoundBoundary：正面钉拥有者的本轮文本，反面钉「猜边界当场失明」）。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
     suspect:3, running:4, interrupted:130}，字段清单钉那六个名字，
@@ -120,6 +120,12 @@ class _HomeSandbox(unittest.TestCase):
     两个 patch 缺一不可：`Path.home()` 和 `Path.expanduser()` 是两条路——
     后者走 os.path.expanduser 读 $HOME，不受 Path.home 的 patch 影响，
     而 cmd_run 里就有 .expanduser()。
+
+    **凡需要 HOME 沙箱的测试类一律继承这个类，不许手写第二份。** 手写的那份
+    必然漏掉其中一条（漏的总是 `$HOME` 那条，`Path.home()` 更显眼），
+    而漏掉之后测试**不会红**——它只是悄悄读写**真实** HOME 下的
+    ~/.codex-subagent，把开发机上真实的任务元数据当成被测数据。
+    纯函数测试不要它。
     """
 
     def setUp(self):
@@ -430,8 +436,9 @@ class TestRoundBoundaryWiring(_HomeSandbox):
     """谁用哪种边界，是这次改动的全部意义所在。
 
     单元层的 read_round 全绿、cmd_run 却接成 read_last_round —— bug 一点没修。
-    所以三条路各钉一条：run 和 resume 用 run_codex 回传的本轮文本，
-    status 用最后一轮。
+    所以**四条路各钉一条**：run 和 resume 用 run_codex 回传的本轮文本、
+    status 不在跑时用最后一轮、status **还在跑时根本不读日志**
+    （judge 那一支用不到它，而 status 是轮询用的热路径）。
     """
 
     def setUp(self):
