@@ -1,4 +1,7 @@
+import pathlib
+import tempfile
 import unittest
+
 import codex_agent as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
@@ -60,3 +63,51 @@ class TestExtractSessionId(unittest.TestCase):
 
     def test_还没打出来时返回None(self):
         self.assertIsNone(ca.extract_session_id("OpenAI Codex v0.154.0\n"))
+
+
+class TestJudge(unittest.TestCase):
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp())
+        self.report = self.d / "t.json"
+        self.log = self.d / "t.log"
+        self.log.write_text("正常收尾\n")
+
+    def test_PID还活着就是running_不看产物(self):
+        v = ca.judge(self.report, self.log, 12345)
+        self.assertEqual(v.state, "running")
+
+    def test_报告缺失是failed(self):
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+
+    def test_报告为空也是failed(self):
+        self.report.write_text("")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+
+    def test_报告缺失且撞额度上限_reason要点名(self):
+        self.log.write_text("\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://x")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")
+        self.assertIn("额度", v.reason)
+
+    def test_报告在且日志干净是success_并列出顶层key(self):
+        self.report.write_text('{"commit": "abc", "summary": "done"}')
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(sorted(v.detail), ["commit", "summary"])
+
+    def test_报告不是JSON也算success_那是任务层的事(self):
+        # 报告内容由 brief 决定，工具层只管"有没有正常收尾"
+        self.report.write_text("干完了，见分支 feat/x")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(v.detail, [])
+
+    def test_报告在但日志尾有未知运行时ERROR是suspect(self):
+        self.report.write_text('{"ok": 1}')
+        self.log.write_text("2026-09-18T16:50:00.000000Z ERROR codex_core::rollout: failed to persist rollout")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "suspect")
+        self.assertEqual(len(v.detail), 1)
