@@ -412,3 +412,264 @@ def find_codex_pid(report_path):
         if comm == "codex" and pid_alive(int(pid_str)):
             return int(pid_str)
     return None
+
+
+# codex 全集是 minimal/low/medium/high/xhigh/max/ultra，这五档是**刻意裁剪**。
+# argparse 的 choices 是唯一守门员——实测 codex 对 `-c model_reasoning_effort=bogus`
+# 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你。
+EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+
+# 四个状态都在表里，取值一律 EXIT[state]，不用 .get(state, 默认值)：
+# 有默认值的话 running 会悄悄落成 0，`codex-agent status t && deploy` 就会在任务
+# 还在跑的时候部署。2 留给参数错误与护栏拒绝（见 USAGE_ERROR）。
+EXIT = {"success": 0, "failed": 1, "suspect": 3, "running": 4}
+
+# 越靠后越该拦住调用方。不能直接比退出码：suspect 的码(3)比 failed(1)大，
+# 按码取 max 会让一个 failed 被一个 suspect 盖过去。
+_SEVERITY = ["success", "running", "suspect", "failed"]
+
+
+def _worse(a, b):
+    return a if _SEVERITY.index(a) >= _SEVERITY.index(b) else b
+
+
+# session id 在 banner 里，前几百字节就出现。攒到这个上限还没有就不再攒，
+# 免得几 MB 的输出全堆在内存里。
+_HEAD_LIMIT = 8192
+
+
+def _now_iso():
+    return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+def _report_path(home, task):
+    # .md 不是 .json：`-o` 写的是 agent 的最后一条消息，实测 156 份里只有 4 份
+    # 能解析成 JSON，其余都是 markdown 散文。后缀名要说真话。
+    return home / "reports" / f"{task}.md"
+
+
+def _log_path(home, task):
+    return home / "logs" / f"{task}.log"
+
+
+def run_codex(argv, env, home, task, kind, meta):
+    """唯一的 spawn 入口。开跑前必须做的三件事全在这里，调用方不需要记住顺序：
+    ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
+
+    原先这三件事散在调用方，实测漏掉「先 write_meta」会在 codex **已经跑起来
+    之后**才炸 FileNotFoundError，子进程当场变孤儿。
+
+    stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
+    "Reading additional input from stdin" + 进程 0% CPU）。
+    不设 timeout：会误杀正当的长任务。
+    """
+    write_meta(home, task, meta)
+    clear_report(_report_path(home, task))
+
+    # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
+    # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
+    # 就是这么干的）会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、
+    # 再也 resume 不了、上下文全丢。隔到独立会话后 codex 收不到任何组信号，
+    # 只会收到下面 handler 转发的 INT。
+    proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            start_new_session=True)
+
+    def forward_as_sigint(signum, frame):
+        # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
+        # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
+    # 而不还原，等于把本函数的副作用留给了整个进程的余生。
+    previous = {sig: signal.signal(sig, forward_as_sigint)
+                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        _tee_until_exit(proc, home, task, kind, meta)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def _tee_until_exit(proc, home, task, kind, meta):
+    head, session_id = b"", None
+    # 日志追加不覆盖，进来先写一行本轮分隔符——判据只扫它之后的内容。
+    # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
+    with open(_log_path(home, task), "ab") as log:
+        log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
+        log.flush()
+        # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
+        # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
+        # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
+        # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
+        for chunk in iter(lambda: proc.stdout.read1(1024), b""):
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+            log.write(chunk)
+            log.flush()
+            if session_id is None and len(head) < _HEAD_LIMIT:
+                head += chunk
+                session_id = extract_session_id(head.decode("utf-8", "replace"))
+                if session_id:
+                    meta["session_id"] = session_id
+                    write_meta(home, task, meta)
+    proc.wait()
+
+
+def _print_verdict(task, verdict):
+    print(f"\n[codex-agent] {task}: {verdict.state} —— {verdict.reason}")
+    for line in verdict.detail:
+        print(f"  {line}")
+
+
+def cmd_run(args):
+    workdir = pathlib.Path(args.dir).expanduser().resolve()
+    if not workdir.is_dir():
+        reject(f"--dir {args.dir} 不是目录")
+    brief_file = pathlib.Path(args.brief).expanduser()
+    if not brief_file.is_file():
+        reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
+
+    home = isolation_home(args.account)
+    old_home, old_meta = find_meta(args.task)
+    if old_meta is not None:
+        # 换账号重跑同名任务很好走（撞额度上限时就该这么干），但那会让同一个名字
+        # 出现在两个隔离目录里：find_meta 按账号顺序查，另一份就成了再也够不着的
+        # 孤儿元数据，而「上一轮会被覆盖」那句提示在跨账号时还是假话（报告路径不同）。
+        if old_home != home:
+            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
+                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
+        if find_codex_pid(str(_report_path(home, args.task))) is not None:
+            reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-agent stop {args.task}`")
+        print(f"[codex-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
+
+    ensure_isolation(args.account)
+    report = _report_path(home, args.task)
+    brief = prepend_skill_guard(brief_file.read_text())
+    print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
+
+    run_codex(build_run_argv(str(workdir), args.effort, str(report), brief),
+              codex_env(home), home, args.task, "run",
+              {"task": args.task, "account": args.account, "dir": str(workdir),
+               "effort": args.effort, "session_id": None, "started_at": _now_iso()})
+
+    verdict = judge(report, _log_path(home, args.task), None)
+    _print_verdict(args.task, verdict)
+    print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
+    return EXIT[verdict.state]
+
+
+def cmd_status(args):
+    if args.task:
+        home, meta = find_meta(args.task)
+        if meta is None:
+            reject(f"没有这个任务：{args.task}")
+        rows = [(home, meta)]
+    else:
+        rows = all_metas()
+    if not rows:
+        print("还没有任何任务")
+        return EXIT["success"]
+    worst = "success"
+    for home, meta in rows:
+        report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
+        verdict = judge(report, log, find_codex_pid(str(report)))
+        print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
+              f"{verdict.reason}  {meta['dir']}")
+        for line in verdict.detail:
+            print(f"    {line}")
+        worst = _worse(worst, verdict.state)
+    return EXIT[worst]
+
+
+def cmd_resume(args):
+    home, meta = find_meta(args.task)
+    if meta is None:
+        reject(f"没有这个任务：{args.task}")
+    report = _report_path(home, args.task)
+    # resume 之前必须确认真的退出了：对还在跑的会话 resume，报的错和 SIGTERM 锁死
+    # 一模一样（thread-store conflict），而处置完全相反——一个该等，一个该弃。
+    if find_codex_pid(str(report)) is not None:
+        reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。等它结束，或先 stop。")
+    if not meta["session_id"]:
+        reject(f"任务 {args.task} 没有记到 session id，无法 resume，只能新起一个任务")
+    workdir = pathlib.Path(meta["dir"])
+    if not workdir.is_dir():
+        reject(f"任务 {args.task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
+               f"codex 会以 os error 2 当场崩，所以这里直接拒。")
+    brief_file = pathlib.Path(args.brief).expanduser()
+    if not brief_file.is_file():
+        reject(f"--brief {args.brief} 不是文件")
+
+    ensure_isolation(meta["account"])
+    brief = prepend_skill_guard(brief_file.read_text())
+    meta["effort"] = args.effort          # 元数据始终描述最后一次调用
+    run_codex(build_resume_argv(meta["dir"], meta["session_id"], args.effort, str(report), brief),
+              codex_env(home), home, args.task, "resume", meta)
+    verdict = judge(report, _log_path(home, args.task), None)
+    _print_verdict(args.task, verdict)
+    return EXIT[verdict.state]
+
+
+def cmd_stop(args):
+    home, meta = find_meta(args.task)
+    if meta is None:
+        reject(f"没有这个任务：{args.task}")
+    pid = find_codex_pid(str(_report_path(home, args.task)))
+    if pid is None:
+        print(f"任务 {args.task} 已经不在跑了")
+        return EXIT["success"]
+    # 只发 SIGINT。SIGTERM 会让 thread 永久锁死，之后 resume 永远报
+    # thread-store conflict，等多久都不释放，上下文全丢。
+    os.kill(pid, signal.SIGINT)
+    print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
+    return EXIT["success"]
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="codex-agent",
+        description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # 五个参数全必填：不设默认值，因为隐式选中的账号／难度是最容易被误用的地方
+    r = sub.add_parser("run", help="起一个新任务")
+    r.add_argument("--task", required=True, type=task_name,
+                   help="任务名，全局唯一（PID 反查和产物命名都靠它）")
+    r.add_argument("--dir", required=True, help="codex 的工作目录，自动转绝对路径")
+    r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
+    r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
+    r.add_argument("--account", required=True, choices=account_choices(), help="codex 账号")
+    r.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("status", help="看任务状态；省略任务名则列出全部")
+    s.add_argument("task", nargs="?", type=task_name)
+    s.set_defaults(func=cmd_status)
+
+    # resume/stop 不收 --account：账号从元数据查出来，不可能指错
+    m = sub.add_parser("resume", help="给已结束的任务补一轮")
+    m.add_argument("task", type=task_name)
+    m.add_argument("--brief", required=True)
+    m.add_argument("--effort", required=True, choices=EFFORTS)
+    m.set_defaults(func=cmd_resume)
+
+    k = sub.add_parser("stop", help="停一个任务（只发 SIGINT）")
+    k.add_argument("task", type=task_name)
+    k.set_defaults(func=cmd_stop)
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        return args.func(args)
+    except Rejected as e:
+        print(e.message, file=sys.stderr)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

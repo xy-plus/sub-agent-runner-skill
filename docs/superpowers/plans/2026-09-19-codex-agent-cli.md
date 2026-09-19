@@ -1213,10 +1213,15 @@ class TestStatusExitCode(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
             self.assertEqual(ca.cmd_status(args), ca.EXIT["running"])
 
-    def test_多任务取最该拦住调用方的那个_failed盖过suspect(self):
+    def test_多任务取最该拦住调用方的那个(self):
+        # 四个状态的相对顺序全部钉死：少钉一对，_SEVERITY 就能被悄悄重排。
+        # failed 排在最后＝最该拦住调用方：它需要人现在就看，而 running 只需要等。
         self.assertEqual(ca._worse("suspect", "failed"), "failed")
-        self.assertEqual(ca._worse("success", "running"), "running")
         self.assertEqual(ca._worse("failed", "suspect"), "failed")
+        self.assertEqual(ca._worse("running", "failed"), "failed")
+        self.assertEqual(ca._worse("suspect", "running"), "suspect")
+        self.assertEqual(ca._worse("success", "running"), "running")
+        self.assertEqual(ca._worse("success", "success"), "success")
 
 
 class TestSignalSafety(unittest.TestCase):
@@ -1360,9 +1365,18 @@ def run_codex(argv, env, home, task, kind, meta):
         except ProcessLookupError:
             pass
 
-    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, forward_as_sigint)
+    # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
+    # 而不还原，等于把本函数的副作用留给了整个进程的余生。
+    previous = {sig: signal.signal(sig, forward_as_sigint)
+                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        _tee_until_exit(proc, home, task, kind, meta)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
+
+def _tee_until_exit(proc, home, task, kind, meta):
     head, session_id = b"", None
     # 日志追加不覆盖，进来先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
