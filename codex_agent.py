@@ -158,11 +158,16 @@ MODEL = "gpt-6-astra"
 # 隔离目录自己的 config，绝不软链主配置。
 # 2026 年踩过：`codex-acct` 把 config.toml 软链到主配置，一用就把 MCP、plugins、
 # hooks、memories 全带回来，隔离当场失效。账号和隔离是正交的两件事，要组合。
-CONFIG_BASELINE = f'''model = "{MODEL}"
-model_reasoning_effort = "medium"
-approval_policy = "never"
-sandbox_mode = "danger-full-access"
-service_tier = "default"
+#
+# 这份初始内容**刻意只有注释**。model／effort／sandbox_mode／approval_policy
+# 由 CLI 每次显式传，写进 config 就是同一条事实有两个家，还是个会被静默覆盖的
+# 缺省值（现存两个隔离目录的 model/effort/service_tier 本来就互相打架）。
+CONFIG_NOTE = '''# codex-agent 的隔离配置。
+# 这个文件必须是本目录自己的普通文件，不许软链 ~/.codex/config.toml——
+# 软链会把主配置的 MCP／plugins／hooks／memories 全带回来，隔离当场失效。
+# 刻意不写 model / model_reasoning_effort / sandbox_mode / approval_policy：
+# 那些由 codex-agent 每次运行显式传参，写在这里只会变成一份会被静默覆盖的缺省值。
+# codex 自己会往下面追加 [projects.*] trust_level，那是它的状态，不要手动清。
 '''
 
 
@@ -183,6 +188,11 @@ def auth_source(account):
     return base / ".codex" / "auth.json" if account == "default" else base / ".codex-accounts" / account / "auth.json"
 
 
+def shared_skill_root():
+    """CODEX_HOME 管不到的共享扫描根。放了东西 codex 就看得见，隔离的前提不成立。"""
+    return pathlib.Path.home() / ".agents" / "skills"
+
+
 def ensure_isolation(account):
     """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。"""
     d = isolation_home(account)
@@ -192,13 +202,25 @@ def ensure_isolation(account):
     for sub in ("skills", "plugins", "tasks", "reports", "logs"):
         (d / sub).mkdir(parents=True, exist_ok=True)
 
+    # 拒跑而不是打印警告：隔离的前提一旦被破坏，本工具的核心承诺就是空的，
+    # 而警告会被淹没在几千行 codex 输出里没人看见。
+    intruders = sorted(q.name for q in shared_skill_root().iterdir()) if shared_skill_root().is_dir() else []
+    if intruders:
+        raise SystemExit(
+            f"{shared_skill_root()} 非空：{'、'.join(intruders)}\n"
+            f"那是 CODEX_HOME 管不到的共享扫描根，放了东西 codex 就看得见，隔离不成立。清空它再跑。")
+
     config = d / "config.toml"
+    # 唯一的 config 不变量是「它是普通文件」。内容既不校验也不重写：2026-09-19
+    # 实测 codex 自己往这个文件里追加 [projects."…"] trust_level = "trusted"，
+    # ~/.codex-subagent 已累积 19 段——校验内容则第二次 run 就失败，重写则抹掉
+    # codex 自己的 trust 状态。
     if config.is_symlink():
         raise SystemExit(
             f"{config} 是软链——隔离会失效（软链主配置会把 MCP/plugins/hooks 全带回来）。\n"
-            f"请删掉它，重跑本命令会生成一份独立的安全基线配置。")
+            f"请删掉它，重跑本命令会生成一份新的。")
     if not config.exists():
-        config.write_text(CONFIG_BASELINE)
+        config.write_text(CONFIG_NOTE)
 
     src = auth_source(account)
     if not src.exists():

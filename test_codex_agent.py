@@ -191,11 +191,32 @@ class TestIsolation(unittest.TestCase):
 
     def test_首次使用自动建齐目录与配置(self):
         d = ca.ensure_isolation("acct2")
-        self.assertTrue((d / "skills").is_dir())
-        self.assertTrue((d / "plugins").is_dir())
+        for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+            with self.subTest(sub=sub):
+                self.assertTrue((d / sub).is_dir())
         self.assertTrue((d / "config.toml").is_file())
         self.assertTrue((d / "auth.json").is_symlink())
-        self.assertIn("danger-full-access", (d / "config.toml").read_text())
+
+    def test_生成的config不写模型与沙箱_那些由CLI每次显式传(self):
+        # 写进 config 就是同一条事实有两个家，还是个会被静默覆盖的缺省值
+        d = ca.ensure_isolation("acct2")
+        text = (d / "config.toml").read_text()
+        for key in ("model", "model_reasoning_effort", "sandbox_mode", "approval_policy"):
+            with self.subTest(key=key):
+                self.assertNotIn(f"{key} =", text)
+
+    def test_config被codex追加过内容也不重写_那是它的trust状态(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").write_text(ca.CONFIG_NOTE + '\n[projects."/x"]\ntrust_level = "trusted"\n')
+        ca.ensure_isolation("default")
+        self.assertIn("trust_level", (d / "config.toml").read_text())
+
+    def test_共享扫描根非空就拒跑_CODEX_HOME管不到它(self):
+        (self.home / ".agents" / "skills" / "某个skill").mkdir(parents=True)
+        with self.assertRaises(SystemExit) as cm:
+            ca.ensure_isolation("default")
+        self.assertIn("某个skill", str(cm.exception))
 
     def test_config是软链就拒跑_隔离会失效(self):
         d = self.home / ".codex-subagent"

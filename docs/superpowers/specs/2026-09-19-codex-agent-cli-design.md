@@ -58,12 +58,12 @@ MCP 能买到的只有「参数有 schema」和「不用读长 skill」，CLI �
 ```
 $D = ~/.codex-subagent            (account=default)
      ~/.codex-subagent-<账号>      (account=acct2 / acct3 / …)
-├── config.toml        # 自有文件，禁软链（软链主配置会把 MCP/plugins/hooks 带回来）
+├── config.toml        # 禁软链；内容不归我们管（codex 自己往里写 trust_level）
 ├── auth.json -> 该账号登录态
 ├── skills/  plugins/  # 存在即可，保持不含用户 skill/plugin
 ├── tasks/<任务>.json   # 任务元数据（见 §7）
 ├── reports/<任务>.md   # codex 收尾自述（`-o` 落点，是 agent 的最后一条消息，通常是散文不是 JSON）
-└── logs/<任务>.log     # 全量输出
+└── logs/<任务>.log     # 全量输出，**追加**，每次调用前写一行分隔符
 ```
 
 `reports/`、`logs/`、`tasks/` 全在**仓库外**——过程文件进不了 git，`git add -A` 收不到。
@@ -115,6 +115,20 @@ codex-agent stop   N
 第三行是硬约束不是洁癖：`find_meta` 按账号顺序查，跨账号同名会留下一份**再也够不着的孤儿
 元数据**，而 `run` 打印的「上一轮会被覆盖」在跨账号时是**假话**（两个 home 的报告路径不同）。
 
+### 退出码即结论
+
+| 码 | 含义 |
+|---|---|
+| `0` | success |
+| `1` | failed |
+| `2` | **护栏拒绝或参数写错**（与 argparse 同码，两者是同一类事） |
+| `3` | suspect |
+| `4` | running（`status` 用；任务还没结束） |
+
+`2` 单独留给「调用方写错了」，**绝不与 `failed` 共用**——否则脚本分不清
+「`--dir` 写错了」和「codex 真的跑失败了」。`status` 列多个任务时按**严重度**取最坏
+（success < running < suspect < failed），不按数值取 max。
+
 ### 不提供的参数（刻意的）
 
 `--timeout`、`--background`、`-o`、`--log`、`--model`、`--sandbox` —— 这些要么会造成误用，
@@ -122,11 +136,20 @@ codex-agent stop   N
 
 ### run 的行为
 
-1. 校验参数 → 2. 校验／创建隔离目录（§6）→ 3. 建 `tasks/`、`reports/`、`logs/` →
-4. 查重任务名 → 5. 读 brief，**自动前置**「不得使用任何 skill，除非本 brief 明确指定。」
-   并打印一行提示（不做隐形魔法）→ 6. 起 codex，`stdin=DEVNULL`，输出 tee 到屏幕和
-   `logs/<任务>.log` → 7. 从 log 头提取 session id 写进元数据 →
-8. **进程结束后自己跑一遍判据（§8），打印结论，退出码＝判据结论**。
+1. 校验参数（任务名字符集由 argparse 把关）
+2. 校验／创建隔离目录（§6）
+3. 查重任务名（§5「重名规则」）
+4. 读 brief，**自动前置**「不得使用任何 skill，除非本 brief 明确指定。」并打印一行提示
+   （不做隐形魔法）
+5. **删掉旧报告** —— 让「报告存在」变成关于本次调用的事实（§8）
+6. 日志追加一行分隔符，写元数据
+7. 起 codex：`stdin=DEVNULL`、`start_new_session=True`、装信号 handler（§9），
+   输出 tee 到屏幕和日志
+8. 从输出里提取 session id 写进元数据（**边跑边写**，不等结束——包装进程被杀时
+   没写进去的话，这一轮就再也 resume 不回来）
+9. **进程结束后自己跑一遍判据（§8），打印结论，退出码＝判据结论**
+
+`resume` 除了第 3 步换成「必须已结束且工作目录还在」，其余相同。
 
 第 8 步是核心收益：`exit 1 ≠ 失败`这条最反直觉的知识被彻底消化，
 harness 的完成通知里直接带成败结论，happy path 下无需再敲 `status`。
@@ -271,7 +294,7 @@ codex 填的字段。而且实测 156 份真实报告只有 4 份能解析成 JS
 
 | 命令 | 硬约束 |
 |---|---|
-| `resume N` | 先跑判据，状态是 `running` 就**拒绝**（对还在跑的会话 resume，报错和 SIGTERM 锁死一模一样，处置却相反：一个该等，一个该弃） |
+| `resume N` | 三道闸：① 状态是 `running` 就**拒绝**（对还在跑的会话 resume，报错和 SIGTERM 锁死一模一样，处置却相反：一个该等，一个该弃）② 元数据里没 session id 就拒绝 ③ **元数据里的工作目录不在了就拒绝**（worktree 被删后 codex 会以 `os error 2` 当场崩——和 `--cd` 传相对路径同款症状，而 `run` 那条路是被人话拒绝的，同一个约束不能只编译一半） |
 | `stop N` | **只发 `SIGINT`**，只发给本任务的真实 PID。永不裸 `kill`（SIGTERM 会让 thread 永久锁死、再也 resume 不了），永不 `pkill -f`（共享机器会误杀，且模式会匹配到发命令的 shell 自己） |
 
 ### 谁停了包装器都一样：codex 只会收到 INT
