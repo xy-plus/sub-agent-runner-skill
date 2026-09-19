@@ -236,8 +236,11 @@ def ensure_isolation(account):
 SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
 
 # 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
+# --color never：实测 --color auto（默认）在输出被重定向时**并不**关颜色，106 份
+# 日志无一例外含 ANSI，于是提 session id 和跑判据要各自剥一遍。从源头关掉之后，
+# 两个消费方都不再依赖剥离器（strip_ansi 保留作防御，但不再承重）。
 _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
-           "--skip-git-repo-check", "--disable", "plugins"]
+           "--skip-git-repo-check", "--disable", "plugins", "--color", "never"]
 
 
 def prepend_skill_guard(brief_text):
@@ -316,6 +319,8 @@ def pid_alive(pid):
     except (ProcessLookupError, ValueError):
         return False
     except PermissionError:
+        # EPERM 是「有这个进程，但不归你管」，不是「已退出」。把它当死，就会
+        # 误判「已结束」而去 resume 一个还在跑的会话，撞上它自己的写锁。
         return True
     return True
 
@@ -331,7 +336,10 @@ def find_codex_pid(report_path):
     再按 comm 收窄——pgrep -f 会命中发命令的 shell 自己（2026-09-19 实测，
     comm=bash），少了这道过滤会把 shell 当成 codex。
     """
-    r = subprocess.run(["pgrep", "-f", report_path], capture_output=True, text=True)
+    # -u 这道过滤也是承重的：本机有其他用户同时在跑 codex，不限用户的话
+    # 他们的进程会进候选集，stop 就可能把 SIGINT 发到别人的会话上。
+    r = subprocess.run(["pgrep", "-u", str(os.getuid()), "-f", report_path],
+                       capture_output=True, text=True)
     for pid_str in r.stdout.split():
         comm = subprocess.run(["ps", "-o", "comm=", "-p", pid_str],
                               capture_output=True, text=True).stdout.strip()

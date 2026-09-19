@@ -247,24 +247,31 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(ca.prepend_skill_guard(once), once)
 
     def test_run参数完整(self):
-        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.json", "brief")
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief")
         self.assertEqual(argv[:3], ["codex", "exec", "--cd"])
         self.assertEqual(argv[3], "/abs/repo")
         self.assertIn("--sandbox", argv)
         self.assertIn("danger-full-access", argv)
         self.assertIn('model_reasoning_effort="low"', " ".join(argv))
         self.assertEqual(argv[-1], "brief")
-        self.assertEqual(argv[argv.index("-o") + 1], "/d/reports/t.json")
+        self.assertEqual(argv[argv.index("-o") + 1], "/d/reports/t.md")
 
     def test_resume的cd在resume之前_否则clap直接拒收(self):
-        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.json", "再来一轮")
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.md", "再来一轮")
         self.assertLess(argv.index("--cd"), argv.index("resume"))
         self.assertEqual(argv[argv.index("resume") + 1], "sess-1")
 
     def test_resume不许出现sandbox长选项_它不认(self):
-        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.json", "x")
+        argv = ca.build_resume_argv("/abs/repo", "sess-1", "low", "/d/reports/t.md", "x")
         self.assertNotIn("--sandbox", argv)
         self.assertIn('sandbox_mode="danger-full-access"', " ".join(argv))
+
+    def test_两条命令都从源头关掉颜色(self):
+        # --color auto（默认）在输出被重定向时并不关颜色，106 份日志无一例外含 ANSI
+        for argv in (ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b"),
+                     ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")):
+            with self.subTest(argv=argv[2]):
+                self.assertEqual(argv[argv.index("--color") + 1], "never")
 
     def test_环境变量把会话索引留在主目录_resume才找得到(self):
         env = ca.codex_env(pathlib.Path("/d"))
@@ -306,6 +313,19 @@ class TestPid(unittest.TestCase):
 
     def test_不存在的进程判定为已退出(self):
         self.assertFalse(ca.pid_alive(2 ** 22))
+
+    def test_没权限发信号意味着进程存在_不是已退出(self):
+        # EPERM 是「有这个进程但不归你管」，只有 ESRCH 才是已退出。
+        # 把 EPERM 当死，就会误判「已结束」而去 resume 一个还在跑的会话。
+        with mock.patch.object(ca.os, "kill", side_effect=PermissionError):
+            self.assertTrue(ca.pid_alive(1))
+
+    def test_只看当前用户的进程_别人的codex不进候选集(self):
+        # 本机有其他用户同时在跑 codex，-u 这道过滤也是承重的
+        with mock.patch.object(ca.subprocess, "run") as run:
+            run.return_value.stdout = ""
+            ca.find_codex_pid("/d/reports/t.md")
+        self.assertEqual(run.call_args.args[0][:3], ["pgrep", "-u", str(os.getuid())])
 
     def test_只认comm是codex的进程_shell自己不算(self):
         # 2026-09-19 实测：pgrep -f <报告路径> 会命中发命令的 bash 自己（comm=bash），
