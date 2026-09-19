@@ -1394,8 +1394,14 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ic.assert_not_called()
 
     def test_没有session_id时绝不发信号_那一轮白毁且拿不回来(self):
+        # 三条闸测试都 mock 掉 wait_for_exit。不 mock 的话闸序一坏就掉进真的
+        # 60 秒等待：实测「把 check_can_resume 挪到发信号之后」这个突变要
+        # **180.3 秒**才红，而且报的是「收到 INT 后 60 秒还没退出」——闸序坏了，
+        # 报的却是等超时，指错方向。mock 之后同一突变 2.1 秒变红，报错是
+        # `Expected 'interrupt_codex' to not have been called`，正中要害。
         ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1408,6 +1414,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
                                                dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1418,6 +1425,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_brief不是文件时绝不发信号(self):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1457,11 +1465,20 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             f.write(ca.INTERRUPT_MARK + "\n")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k, \
              mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
              mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
-        w.assert_called_once()   # 不发信号，但照样要等
+        # 「零调用」要钉 os.kill 本身，不能只钉 interrupt_codex：在那一支里加一行
+        # 裸 os.kill 也会红，但红的原因是 ProcessLookupError（4242 不存在）这个
+        # **巧合**——pid 若恰好存在就是绿的。同一个类里四条闸测试都钉了 os.kill。
+        k.assert_not_called()
+        # **等的是谁**也要钉死：把报告路径传成日志路径，find_codex_pid 永远找不到，
+        # wait_for_exit 秒返 True、等待整个被跳过、直接续跑撞写锁——而这正是
+        # 这条命令唯一独有的收益。实跑确认：不钉参数的话这个突变 156 条全绿。
+        w.assert_called_once_with(ca._report_path(self.d, "t"),
+                                  ca.INTERRUPT_EXIT_TIMEOUT, ca.INTERRUPT_POLL_INTERVAL)
 
     def test_上一轮的打断痕迹不算数_本轮还是要发INT(self):
         # 反面钉一道：判据必须只看**本轮**。看全文的话，一个被打断过的任务
@@ -1475,7 +1492,10 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
              mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
-        ic.assert_called_once()
+        # **打给谁**也要钉：传成报告路径的话，痕迹写进**报告** → judge 看到非空
+        # 报告、无错误行 → 判 success、退出码 0。不是崩，是静默说谎。
+        # 实跑确认：只钉 assert_called_once() 的话这个突变 156 条全绿。
+        ic.assert_called_once_with(4242, ca._log_path(self.d, "t"))
 
     def test_日志分隔符写的是interrupt_and_resume_而不是resume(self):
         # 日志要看得出这一轮是被插话打断后续上的
