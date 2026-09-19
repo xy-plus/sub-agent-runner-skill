@@ -67,8 +67,8 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀
 
 # 本轮被信号打断时留在日志里的痕迹。**刻意不以 ROUND_MARK 开头**：
-# current_round 是按 ROUND_MARK 往回切的，这行要是同前缀，它就会被当成新一轮
-# 的开始，本轮前面的错误全被丢掉，判据当场失明。
+# read_round／read_last_round 都按 ROUND_MARK 切，这行要是同前缀，它就会被当成
+# 新一轮的开始，本轮前面的错误全被丢掉，判据当场失明。
 INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断，上下文保留，可 resume -----"
 
 
@@ -140,15 +140,59 @@ def strip_ansi(text):
     return _ANSI.sub("", text)
 
 
-def current_round(log_text):
-    """日志是追加的，判据只看最后一个分隔符之后——上一轮的错误不是这一轮的事。"""
-    text = strip_ansi(log_text)
+def read_round(log_path, start_offset):
+    """读日志的 `[start_offset, 之后第一个 ROUND_MARK)` 这一段——本轮，且只有本轮。
+
+    `start_offset` 是 `run_codex` 写完本轮分隔符之后回传的**字节**偏移，
+    是 codex 还没起跑之前就拿到的事实，**后来的任何一轮都不可能把它致盲**。
+    这替掉了「按最后一个 ROUND_MARK 往回猜」那套：日志是多个进程共写的，
+    interrupt-and-resume 一确认退出就往同一个日志追加新分隔符，而被打断那一轮的
+    包装器此刻正要跑判据——谁先谁后没有任何保证，实测两者落在同一秒内。
+    包装器晚一步，同一份日志上的结论就从「被 INT 打断，接着 resume」
+    翻成「报告缺失＝没正常收尾」。判据成本还随日志增长（0.83MB 时 7.6ms），
+    长任务上天平继续朝竞争方倾斜，而长任务正是最该打断、上下文最值钱的场景。
+
+    **偏移是字节不是字符**，所以这里走二进制 seek 再 decode：日志里全是中文
+    （brief 原文、codex 的中文输出），按字符切会整体错位，切出来的开头是半截
+    字节，判据读到的「本轮」根本不是本轮。偏移永远落在分隔符那行的 `\\n` 之后，
+    不会切在多字节字符中间。
+    `errors="replace"`：codex 被 INT 打断时可能只写出半截字节，裸 decode 会把
+    判据整个打崩。
+    右端截到「起点之后的第一个 ROUND_MARK」，所以后一轮的内容也不会被吞进来。
+    """
+    if not log_path.exists():
+        return ""
+    with open(log_path, "rb") as f:
+        f.seek(start_offset)
+        raw = f.read()
+    text = strip_ansi(raw.decode("utf-8", "replace"))
+    cut = text.find(ROUND_MARK)
+    return text if cut < 0 else text[:cut]
+
+
+def read_last_round(log_path):
+    """最后一轮。**只给外部观察者用**（`status`）——它手里没有偏移。
+
+    这是它诚实的上界：它本来就只能看到最后一轮，说不出更多。
+    本轮的拥有者（cmd_run / _resume_with）绝不该用它：拥有者手里有事实，
+    用这个就等于把事实换回推测。
+    """
+    if not log_path.exists():
+        return ""
+    text = strip_ansi(log_path.read_text(errors="replace"))
     cut = text.rfind(ROUND_MARK)
     return text if cut < 0 else text[cut:]
 
 
-def runtime_error_lines(log_text):
+def runtime_error_lines(round_text):
     """本轮日志里 codex 自己的错误行（已滤掉良性 target 与良性用户层消息）。
+
+    **本轮的边界由调用方划好再传进来**，本函数不再自己切——切法有两种
+    （拥有者用偏移、观察者用最后一轮），藏在这里面就只剩「猜」一种。
+
+    这里仍然 strip_ansi 一道：它是幂等的，而少了它，一个直接拿原始日志文本
+    调进来的人会静默拿到空结果（`^ERROR:` 匹配不到 `\\x1b[31mERROR:`）——
+    静默的错比多一次正则扫描贵得多。
 
     刻意没有「只看末 N 行」的窗口参数。那个窗口过去偷偷承担着「运行中已经恢复
     过去的错误不算」这个语义，而这件事现在由 target 白名单正经做了，窗口只剩下
@@ -156,7 +200,7 @@ def runtime_error_lines(log_text):
     然后每一次已恢复的错误都静默变成 suspect。
     """
     hits = []
-    for raw in current_round(log_text).splitlines():
+    for raw in strip_ansi(round_text).splitlines():
         line = raw.strip()
         if _ERR_FATAL.match(line):
             hits.append(line)
@@ -196,8 +240,13 @@ class Verdict(NamedTuple):
     detail: list # suspect／failed：出事的那几行；success：报告前几行
 
 
-def judge(report_path, log_path, pid):
-    """唯一的成败判据。`run` 收尾和 `status` 共用它，避免两处判据漂移。
+def judge(report_path, round_text, pid):
+    """唯一的成败判据。`run`／`resume` 收尾和 `status` 共用它，避免两处判据漂移。
+
+    **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
+    不一样：本轮的拥有者手里有 `run_codex` 回传的起始偏移（`read_round`），
+    外部观察者只能看最后一轮（`read_last_round`）。把这件事塞回 judge 里，
+    就只剩「猜」一种做法，而那正是这次要修掉的整类 bug。
 
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
@@ -205,9 +254,7 @@ def judge(report_path, log_path, pid):
     if pid is not None:
         return Verdict("running", f"pid={pid} 存活", [])
 
-    log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
-    round_text = current_round(log_text)
-    errors = runtime_error_lines(log_text)
+    errors = runtime_error_lines(round_text)
     # errors="replace"：codex 被 SIGINT 打断时可能只写出半截字节，
     # 裸 read_text 会 UnicodeDecodeError 把判据整个打崩。
     report_text = report_path.read_text(errors="replace") if report_path.exists() else ""
@@ -555,7 +602,9 @@ def _log_path(home, task):
 
 
 def run_codex(kind, home, task, meta, make_argv):
-    """唯一的 spawn 入口。开跑前必须做的三件事全在这里，调用方不需要记住顺序：
+    """唯一的 spawn 入口。**返回本轮在日志中的字节起始偏移。**
+
+    开跑前必须做的三件事全在这里，调用方不需要记住顺序：
     ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
 
     **报告路径由本函数拥有**，回传给 `make_argv` 去拼命令；`env` 也由 `home`
@@ -584,6 +633,11 @@ def run_codex(kind, home, task, meta, make_argv):
     with open(_log_path(home, task), "ab") as log:
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
+        # 本轮的起点：分隔符之后的第一个字节。**这是本函数唯一的返回值。**
+        # O_APPEND 下每次 write 都是「原子地跳到末尾再写」，所以即使别的进程
+        # 正往同一个日志追加（留痕、另一轮的分隔符），这个位置依然精确指向
+        # **我们自己刚写的那行之后**——拥有者的边界由此成为事实而非推测。
+        start_offset = log.tell()
 
         # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
         # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
@@ -618,6 +672,8 @@ def run_codex(kind, home, task, meta, make_argv):
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
+
+    return start_offset
 
 
 def _tee_until_exit(proc, log, home, task, meta):
@@ -672,11 +728,13 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text())
     print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
-    run_codex("run", home, args.task,
-              new_meta(args.task, args.account, str(workdir), args.effort),
-              lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+    # 本轮的拥有者：用 run_codex 回传的偏移，**不用 read_last_round**——
+    # 后者是外部观察者的上界，拥有者用它就是把事实换回推测。
+    start_offset = run_codex("run", home, args.task,
+                             new_meta(args.task, args.account, str(workdir), args.effort),
+                             lambda r: build_run_argv(str(workdir), args.effort, r, brief))
 
-    verdict = judge(report, _log_path(home, args.task), None)
+    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
@@ -696,7 +754,8 @@ def cmd_status(args):
     worst = "success"
     for home, meta in rows:
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
-        verdict = judge(report, log, find_codex_pid(str(report)))
+        # 外部观察者：它手里没有偏移，只能看最后一轮，也只该看最后一轮。
+        verdict = judge(report, read_last_round(log), find_codex_pid(str(report)))
         print(f"{meta['task']:<24} {meta['account']:<8} {verdict.state:<8} "
               f"{verdict.reason}  {meta['dir']}")
         for line in verdict.detail:
@@ -730,9 +789,10 @@ def cmd_resume(args):
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = args.effort
     meta["started_at"] = _now_iso()
-    run_codex("resume", home, args.task, meta,
-              lambda r: build_resume_argv(meta["dir"], meta["session_id"], args.effort, r, brief))
-    verdict = judge(report, _log_path(home, args.task), None)
+    start_offset = run_codex("resume", home, args.task, meta,
+                             lambda r: build_resume_argv(meta["dir"], meta["session_id"],
+                                                         args.effort, r, brief))
+    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
     _print_verdict(args.task, verdict)
     return EXIT[verdict.state]
 

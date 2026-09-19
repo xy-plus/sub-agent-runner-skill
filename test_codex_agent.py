@@ -174,19 +174,218 @@ class TestRuntimeErrorLines(unittest.TestCase):
         self.assertEqual(ca.runtime_error_lines(noise), [])
 
 
-class TestCurrentRound(unittest.TestCase):
-    def test_只扫最后一个分隔符之后_上一轮的错误不算这一轮的(self):
-        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n" + ERR_FATAL + "\n"
-               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n干净收尾\n")
-        self.assertEqual(ca.runtime_error_lines(log), [])
+class TestReadLastRound(unittest.TestCase):
+    """外部观察者（status）只能看最后一轮——它手里没有偏移，这是它诚实的上界。"""
+
+    def _log(self, text):
+        p = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        p.write_text(text)
+        return p
+
+    def test_只给最后一轮_上一轮的错误不算这一轮的(self):
+        log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
+                        + ERR_FATAL + "\n"
+                        + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n干净收尾\n")
+        self.assertEqual(ca.runtime_error_lines(ca.read_last_round(log)), [])
 
     def test_本轮自己的错误照样认(self):
-        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n干净\n"
-               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n" + ERR_FATAL + "\n")
-        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
+        log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n干净\n"
+                        + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n"
+                        + ERR_FATAL + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
 
-    def test_没有分隔符时扫全文_老日志和半路接手都还能判(self):
-        self.assertEqual(len(ca.runtime_error_lines(ERR_FATAL)), 1)
+    def test_没有分隔符时返回全文_老日志和半路接手都还能判(self):
+        log = self._log(ERR_FATAL + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
+
+    def test_打断标记不能被当成新一轮的开始(self):
+        # 它要是以 ROUND_MARK 开头，read_last_round 就从它这里切开，
+        # 本轮前面的错误全被丢掉——判据当场失明
+        self.assertFalse(ca.INTERRUPT_MARK.startswith(ca.ROUND_MARK))
+        log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
+                        + ERR_FATAL + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
+
+
+class TestRoundBoundary(unittest.TestCase):
+    """一轮的边界是**记下来的事实**，不是从日志里往回猜出来的。
+
+    病根：judge 过去按最后一个 ROUND_MARK 往回切，而日志是多个进程共写的。
+    interrupt-and-resume 一确认 codex 退出就调 run_codex 往同一个日志追加新的
+    ROUND_MARK，而被打断那一轮的 run 包装器此刻正要跑判据——谁先谁后没有任何
+    保证，实测两者落在同一秒内。包装器晚一步，INTERRUPT_MARK 就被切到本轮之外，
+    同一份日志上的结论从「被 INT 打断，接着 resume」翻成「报告缺失＝没正常收尾」。
+    判据成本还随日志增长（0.83MB 时 7.6ms），长任务上天平继续朝竞争方倾斜，
+    而长任务正是最该打断、上下文最值钱的场景。
+    """
+
+    def _home(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        return d
+
+    def test_run_codex返回的偏移正好是本轮内容的起点(self):
+        d = self._home()
+        log = ca._log_path(d, "t")
+        log.write_bytes("上一轮的尾巴\n".encode())
+        with _no_codex():
+            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        # 绝对值：此刻日志 = 上一轮 + 本轮分隔符行，偏移必须正好落在文件末尾
+        self.assertEqual(offset, len(log.read_bytes()))
+        with open(log, "ab") as f:
+            f.write("本轮的内容\n".encode())
+        self.assertEqual(ca.read_round(log, offset), "本轮的内容\n")
+
+    def test_后来的轮次不能把前一轮判瞎_这是P1的回归锁(self):
+        d = self._home()
+        log, report = ca._log_path(d, "t"), ca._report_path(d, "t")
+
+        def spawn(*a, **k):
+            # 本轮被 INT 打断：只留下打断标记，没有报告
+            with open(log, "ab") as f:
+                f.write((ca.INTERRUPT_MARK + "\n").encode())
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = spawn
+            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
+
+        # 判据还没跑，interrupt-and-resume 已经把下一轮的分隔符追了进去（实测同一秒内）
+        with open(log, "ab") as f:
+            f.write((ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
+                     + "\n干净收尾\n").encode())
+
+        self.assertIn("resume", ca.judge(report, ca.read_round(log, offset), None).reason)
+        # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
+        self.assertNotIn("resume", ca.judge(report, ca.read_last_round(log), None).reason)
+
+    def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
+        d = self._home()
+        log = ca._log_path(d, "t")
+        with _no_codex():
+            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        with open(log, "ab") as f:
+            f.write("本轮干净\n".encode())
+            f.write((ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n").encode())
+            f.write((ERR_FATAL + "\n").encode())
+        text = ca.read_round(log, offset)
+        self.assertEqual(text, "本轮干净\n")
+        self.assertEqual(ca.runtime_error_lines(text), [],
+                         "后一轮的致命错误被算到了前一轮头上")
+
+    def test_偏移是字节数不是字符数_中文日志不许错位(self):
+        # 日志里全是中文：brief 原文、codex 的中文输出。按字符切会整体错位，
+        # 切出来的开头是半截字节——判据读到的「本轮」根本不是本轮。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        log.write_bytes("上一轮写了很多中文内容\n".encode())
+        with _no_codex():
+            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        with open(log, "ab") as f:
+            f.write("本轮第一行\n".encode())
+        raw = log.read_bytes()
+        self.assertNotEqual(len(raw), len(raw.decode()),
+                            "前提不成立：日志里没有多字节字符，这条测不到错位")
+        self.assertEqual(ca.read_round(log, offset), "本轮第一行\n")
+
+    def test_日志还没有时读回空串_不许抛(self):
+        d = self._home()
+        missing = ca._log_path(d, "从来没写过")
+        self.assertFalse(missing.exists(), "前提不成立：这个文件居然存在")
+        self.assertEqual(ca.read_round(missing, 0), "")
+        self.assertEqual(ca.read_last_round(missing), "")
+
+    def test_半截多字节字符不许把读取打崩(self):
+        # codex 被 INT 打断时可能只写出半截字节，裸 decode 会把判据整个打崩
+        d = self._home()
+        log = ca._log_path(d, "t")
+        log.write_bytes(b"\xff\xfe" + "正常收尾".encode())
+        self.assertIn("正常收尾", ca.read_last_round(log))
+        self.assertIn("正常收尾", ca.read_round(log, 0))
+
+
+class TestRoundBoundaryWiring(_HomeSandbox):
+    """谁用哪种边界，是这次改动的全部意义所在。
+
+    单元层的 read_round 全绿、cmd_run 却接成 read_last_round —— bug 一点没修。
+    所以三条路各钉一条：run 用自己的偏移、resume 用自己的偏移、status 用最后一轮。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    def _race(self, d):
+        """假 codex：本轮被打断（只留痕、不留报告），紧接着下一轮的分隔符抢先落地。"""
+        def spawn(*a, **k):
+            with open(ca._log_path(d, "t"), "ab") as f:
+                f.write((ca.INTERRUPT_MARK + "\n").encode())
+                f.write((ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
+                         + "\n干净收尾\n").encode())
+            return mock.DEFAULT
+        return spawn
+
+    def test_run收尾用的是自己的偏移(self):
+        d = ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        seen = {}
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
+            popen.side_effect = self._race(d)
+            ca.cmd_run(args)
+        self.assertIn("resume", seen["v"].reason,
+                      "run 接成了 read_last_round：被后来的一轮判瞎了")
+
+    def test_resume收尾用的是自己的偏移(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        seen = {}
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
+            popen.side_effect = self._race(d)
+            ca.cmd_resume(args)
+        self.assertIn("resume", seen["v"].reason)
+
+    def test_status用的是最后一轮_外部观察者只能看最后一轮(self):
+        # 反向钉一道：status 没有偏移可用，它只能看最后一轮，也**只该**看最后一轮。
+        # 接成别的（比如从头扫）会把上一轮的打断标记算到这一轮头上。
+        #
+        # 这里 spy 的是 judge 而不是 _print_verdict：cmd_status 自己排版、
+        # 根本不走 _print_verdict（patch 它只会拿到空列表，是条空测试）。
+        # spy 还顺手把**传给判据的那段文本**也钉住了——这正是「谁用哪种边界」的本体。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        log = ca._log_path(d, "t")
+        log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
+                       + ca.INTERRUPT_MARK + "\n"
+                       + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净收尾\n")
+        args = ca.build_parser().parse_args(["status", "t"])
+        seen, texts, real_judge = [], [], ca.judge
+
+        def spy(report_path, round_text, pid):
+            texts.append(round_text)
+            v = real_judge(report_path, round_text, pid)
+            seen.append(v)
+            return v
+
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "judge", side_effect=spy):
+            ca.cmd_status(args)
+        self.assertEqual(len(seen), 1, "前提不成立：judge 没被调到，这条什么都没测")
+        self.assertNotIn(ca.INTERRUPT_MARK, texts[0],
+                         "status 把上一轮的打断标记读进了本轮")
+        self.assertNotIn("resume", seen[0].reason,
+                         "上一轮的打断标记被算到了这一轮头上")
 
 
 class TestExtractSessionId(unittest.TestCase):
@@ -199,57 +398,55 @@ class TestExtractSessionId(unittest.TestCase):
 
 
 class TestJudge(unittest.TestCase):
+    """判据只认**已经划好的本轮文本**。边界谁来划，见 TestRoundBoundary。"""
+
     def setUp(self):
         self.d = pathlib.Path(tempfile.mkdtemp())
         self.report = self.d / "t.md"
-        self.log = self.d / "t.log"
-        self.log.write_text("正常收尾\n")
+
+    def _judge(self, round_text="正常收尾\n", pid=None):
+        return ca.judge(self.report, round_text, pid)
 
     def test_PID还活着就是running_不看产物(self):
-        v = ca.judge(self.report, self.log, 12345)
-        self.assertEqual(v.state, "running")
+        self.assertEqual(self._judge(pid=12345).state, "running")
 
     def test_报告缺失是failed(self):
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge()
         self.assertEqual(v.state, "failed")
         self.assertIn("没正常收尾", v.reason)
 
     def test_报告为空也是failed(self):
         self.report.write_text("")
-        v = ca.judge(self.report, self.log, None)
-        self.assertEqual(v.state, "failed")
+        self.assertEqual(self._judge().state, "failed")
 
     def test_报告缺失且撞额度上限_reason要点名(self):
-        self.log.write_text("\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://x")
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge(ERR_USER_LAYER + "\n")
         self.assertEqual(v.state, "failed")
         self.assertIn("额度", v.reason)
 
     def test_报告是散文也算success_并预览前几行(self):
         # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
-        # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事，不是工具层的。
+        # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事。
         self.report.write_text("干完了，见分支 feat/x\n改了 3 个文件\n测试全绿\n")
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge()
         self.assertEqual(v.state, "success")
         self.assertEqual(v.detail[0], "干完了，见分支 feat/x")
 
     def test_预览最多几行_长报告不刷屏(self):
         self.report.write_text("\n".join(f"第 {i} 行" for i in range(50)))
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge()
         self.assertEqual(len(v.detail), ca.REPORT_PREVIEW_LINES)
         self.assertLess(len(v.detail), 50)   # 钉住「确实截断了」，不随常量一起动
 
     def test_报告在但本轮日志有未分类错误是suspect(self):
         self.report.write_text("干完了")
-        self.log.write_text("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
-                            "Failed to create session: thread-store conflict")
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                        "Failed to create session: thread-store conflict\n")
         self.assertEqual(v.state, "suspect")
         self.assertEqual(len(v.detail), 1)
 
     def test_撞上写锁_reason要点名(self):
-        self.log.write_text(ERR_FATAL)
-        v = ca.judge(self.report, self.log, None)
+        v = self._judge(ERR_FATAL + "\n")
         self.assertEqual(v.state, "failed")
         self.assertIn("锁", v.reason)
 
@@ -258,7 +455,7 @@ class TestJudge(unittest.TestCase):
         # 写锁的 resume 会读到上一轮的报告并被判成 success——工具在说谎。
         self.report.write_text("上一轮的报告")
         ca.clear_report(self.report)
-        self.assertEqual(ca.judge(self.report, self.log, None).state, "failed")
+        self.assertEqual(self._judge().state, "failed")
 
     def test_清报告对还没有报告的任务也成立(self):
         ca.clear_report(self.report)   # 不存在也不许抛
@@ -266,37 +463,20 @@ class TestJudge(unittest.TestCase):
     def test_被INT打断的那轮_reason要告诉人可以resume(self):
         """2026-09-19 真机复现：`stop t` 刚打印完「上下文保留，可 resume」，
         紧接着 `status t` 就说 `failed —— 报告缺失或为空＝没正常收尾`，退出码 1。
-        两句话自相矛盾，而调用方拿不到那条唯一有用的信息：这轮是被打断的，
-        接着 resume 就行，不用重跑。
+        两句话自相矛盾，而调用方拿不到那条唯一有用的信息。
         """
-        self.log.write_text(ca.INTERRUPT_MARK + "\n")
-        v = ca.judge(self.report, self.log, None)
-        self.assertEqual(v.state, "failed")     # 产物确实没出来，状态不变
-        self.assertIn("resume", v.reason)       # 但处置得说清楚
-
-    def test_打断标记不能被当成新一轮的开始(self):
-        # 它要是以 ROUND_MARK 开头，current_round 就会从它这里切开，
-        # 本轮前面的错误全被丢掉——判据当场失明
-        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
-               + ERR_FATAL + "\n" + ca.INTERRUPT_MARK + "\n")
-        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
-        self.assertFalse(ca.INTERRUPT_MARK.startswith(ca.ROUND_MARK))
+        v = self._judge(ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(v.state, "failed")     # 状态这一维在 Task 2 才改
+        self.assertIn("resume", v.reason)
 
     def test_撞额度上限比被打断更该被说出来(self):
         # 两个都命中时，「换账号」比「可以 resume」更接近真正的处置
-        self.log.write_text(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n")
-        self.assertIn("额度", ca.judge(self.report, self.log, None).reason)
-
-    def test_非UTF8的日志不许把判据打崩(self):
-        # codex 被 INT 打断时可能只写出半截多字节字符
-        self.report.write_text("干完了")
-        self.log.write_bytes(b"\xff\xfe" + "正常收尾".encode())
-        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
+        self.assertIn("额度", self._judge(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n").reason)
 
     def test_非UTF8的报告不许把判据打崩(self):
         # codex 被 SIGINT 打断时可能只写出半截字节
         self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
-        self.assertEqual(ca.judge(self.report, self.log, None).state, "success")
+        self.assertEqual(self._judge().state, "success")
 
 
 class TestIsolation(_HomeSandbox):
