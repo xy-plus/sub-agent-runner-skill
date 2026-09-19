@@ -2379,17 +2379,15 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             task=task, brief=str(self.brief if brief is None else brief), effort="low",
             skills=())
 
-    def test_在跑时顺序是先打断再确认退出再续跑(self):
+    def test_在跑时顺序是先打断再续跑(self):
         order = []
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex",
                                side_effect=lambda *a: order.append("打断")), \
-             mock.patch.object(ca, "wait_for_exit",
-                               side_effect=lambda *a: order.append("等退出") or True), \
              mock.patch.object(ca, "_resume_round",
                                side_effect=lambda *a: order.append("续跑") or 0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
-        self.assertEqual(order, ["打断", "等退出", "续跑"], "顺序反了就会撞写锁")
+        self.assertEqual(order, ["打断", "续跑"], "顺序反了就会撞写锁")
 
     def test_没在跑时不发信号直接续跑(self):
         # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
@@ -2400,14 +2398,12 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ic.assert_not_called()
 
     def test_没有session_id时绝不发信号_那一轮白毁且拿不回来(self):
-        # 三条闸测试都 mock 掉 wait_for_exit。不 mock 的话闸序一坏就掉进真的
-        # 60 秒等待：实测「把 check_can_resume 挪到发信号之后」这个突变要
-        # **180.3 秒**才红，而且报的是「收到 INT 后 60 秒还没退出」——闸序坏了，
-        # 报的却是等超时，指错方向。mock 之后同一突变 2.1 秒变红，报错是
-        # `Expected 'interrupt_codex' to not have been called`，正中要害。
+        # 闸序一坏会怎样：实测「把 check_can_resume 挪到发信号之后」这个突变，
+        # 在等待还挂在本命令上的那个版本里要 **180.3 秒**才红，而且报的是
+        # 「收到 INT 后 60 秒还没退出」——指错方向。等待搬进 run_codex 之后，
+        # 这几条闸测试一个 mock 都不需要：它们在 _resume_round 之前就拒绝了。
         ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2429,7 +2425,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         bad = self.home / "自带兜底句.md"
         bad.write_text("**不得使用任何 skill。**\n\n顺便把 X 也改了")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2443,7 +2438,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
                                                dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2454,7 +2448,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_brief不是文件时绝不发信号(self):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2472,17 +2465,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ic.assert_not_called()
         k.assert_not_called()
 
-    def test_等不到退出就拒绝续跑且绝不升级信号(self):
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "interrupt_codex"), \
-             mock.patch.object(ca, "wait_for_exit", return_value=False), \
-             mock.patch.object(ca, "_resume_round") as rw:
-            with self.assertRaises(ca.Rejected) as cm:
-                ca.cmd_interrupt_and_resume(self._args())
-        rw.assert_not_called()
-        self.assertEqual(cm.exception.code, 2)      # 绝对值：护栏拒绝就是 2
-        self.assertIn("稍后", cm.exception.message)
-
     def test_本轮已有打断痕迹时只等不发第二发INT(self):
         """超时的处置是「稍后重试」，而重试就是再跑一遍这条命令 → 又一次
         interrupt_codex → 第二发 INT。很多 CLI 把第二发 Ctrl-C 当强退；
@@ -2495,7 +2477,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k, \
-             mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
              mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
@@ -2503,11 +2484,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # 裸 os.kill 也会红，但红的原因是 ProcessLookupError（4242 不存在）这个
         # **巧合**——pid 若恰好存在就是绿的。同一个类里四条闸测试都钉了 os.kill。
         k.assert_not_called()
-        # **等的是谁**也要钉死：把报告路径传成日志路径，find_codex_pid 永远找不到，
-        # wait_for_exit 秒返 True、等待整个被跳过、直接续跑撞写锁——而这正是
-        # 这条命令唯一独有的收益。实跑确认：不钉参数的话这个突变 156 条全绿。
-        w.assert_called_once_with(ca._report_path(self.d, "t"),
-                                  ca.INTERRUPT_EXIT_TIMEOUT, ca.INTERRUPT_POLL_INTERVAL)
 
     def test_上一轮的打断痕迹不算数_本轮还是要发INT(self):
         # 反面钉一道：判据必须只看**本轮**。看全文的话，一个被打断过的任务
@@ -2518,7 +2494,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
                        + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净\n")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
         # **打给谁**也要钉：传成报告路径的话，痕迹写进**报告** → judge 看到非空
@@ -3224,46 +3199,229 @@ class TestInterruptCodex(unittest.TestCase):
             self.assertIsNone(ca.interrupt_codex(4242, self.log, "stop"))
 
 
-class TestWaitForExit(unittest.TestCase):
-    # 一律传 pathlib.Path：契约就是 Path（find_codex_pid 的注释专门强调过
-    # 「全模块只剩传 Path 一种传法」）。测试示范 str 的话，下一个人会照着传 str，
-    # 而那正是那条注释要消掉的缝。
-    def test_进程退出后返回True(self):
-        with mock.patch.object(ca, "find_codex_pid", side_effect=[4242, 4242, None]):
-            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 5, 0.01))
+class TestWaitPreviousRoundEnds(_HomeSandbox):
+    """「上一轮结束了没有」＝**两个都停了**，缺一不可。
 
-    def test_一直不退则超时返回False(self):
+        还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
+        会话还被占着吗   find_codex_pid           现场反查
+
+    只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
+    argv 比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上**孤儿 codex**：
+    SIGKILL 掉包装器之后 codex 存活并跑完（实测），续跑就撞上它的写锁。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def _写盘(self, **over):
+        ca.write_meta(self.d, "t", _full_meta("t", **over))
+
+    def test_没有上一轮就直接放行(self):
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
+        self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+
+    def test_两个都停了才放行(self):
+        self._写盘()
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立：默认身份居然还在写")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+
+    def test_上一轮的writer还在写就等到超时(self):
+        # **突变锁：只等 codex。** 只看 codex 的话这里会立刻放行——那正是病根本身。
+        self._写盘(**_live_writer(self))
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
+    def test_孤儿codex_writer没了codex还在_不许放行(self):
+        # **突变锁：只等 writer。** SIGKILL 掉包装器之后 codex 会存活并跑完（实测），
+        # 只看包装器就会放行，续跑撞上它的写锁。
+        self._写盘()
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242):
-            self.assertFalse(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01))
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
+    def test_codex早变僵尸而writer还在排干时必须继续等(self):
+        """**本次回归锁**，整条链一起验：真起一个 comm=codex、argv 对得上的陪练，
+        杀掉但不回收 → 它是僵尸、`cmdline` 已空 → `find_codex_pid` 判 None，
+        而上一轮的 writer 还在写 → 必须继续等到超时。
+        """
+        (self.d / "reports").mkdir(exist_ok=True)
+        fake = _fake_codex(self.d)
+        report = ca._report_path(self.d, "t")
+        report.write_text("")
+        # 陪练身份要在起僵尸**之前**拿：_live_writer 会建 Popen，而 Popen.__init__
+        # 顺手调 subprocess._cleanup() 把僵尸回收掉（见 _wait_zombie）。
+        写者 = _live_writer(self)
+        proc = subprocess.Popen([str(fake), "-f", str(report)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_argv(self, proc, str(report))
+            self.assertEqual(ca.find_codex_pid(report), proc.pid, "前提不成立：活着时就找不到它")
+            proc.kill()
+            _wait_zombie(self, proc.pid)
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"",
+                             "前提不成立：僵尸的 cmdline 不空，那 argv 过滤就不是免费做对的")
+            self.assertIsNone(ca.find_codex_pid(report), "前提不成立：僵尸居然还被当成在跑")
+            self._写盘(**写者)
+            self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_等待期间绝不发任何信号(self):
         # 超时的正确处置是告诉调用方稍后再来，不是加大火力。
         # 升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+        self._写盘()
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
-            ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01)
+            ca._wait_previous_round_ends(self.d, "t", 0.05, 0.01)
         k.assert_not_called()
 
-    def test_超时是上界不是等待时长(self):
-        # 一确认退出就立刻往下走，不把 timeout 睡满
+    def test_等到了就立刻走_不把超时睡满(self):
+        self._写盘()
         started = time.monotonic()
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 30, 0.01))
+            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 30, 0.01))
         self.assertLess(time.monotonic() - started, 1.0)
 
-    def test_两个常量的绝对值_并且余量对得上实测(self):
+    def test_真要等的时候先说一句_否则run变成静默挂起(self):
+        """等待排在**分隔符之前**，所以这段时间里日志是死的，屏幕也不能死。
+
+        不打印的话 `run` 会多出一个全新的静默挂起：用户看不出它在等谁、等多久。
+        这句**只进屏幕不进日志**——日志里此刻还没有本轮的边界，写进去就落在
+        上一轮里，把上一轮的判据弄脏。它当场就读得到，靠的是 `main()` 那行
+        `sys.stdout.reconfigure(line_buffering=True)`。
+        """
+        self._写盘(**_live_writer(self))
+        buf = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(buf):
+            ca._wait_previous_round_ends(self.d, "t", 0.15, 0.01)
+        self.assertIn("上一轮还在收尾", buf.getvalue())
+
+    def test_不用等的时候一个字都不说(self):
+        # 反面钉一道：无条件打印的话，那句话在 99% 的情况下是假的
+        # （上一轮早就结束了），而假话说多了人就不看了。
+        self._写盘()
+        buf = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(buf):
+            ca._wait_previous_round_ends(self.d, "t", 5, 0.01)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_两个常量的绝对值(self):
         """常量必须是**模块级**的，不是函数默认参数：测试要把它压到 0.3 秒，
         而仓库规范本来就不许用默认缺省值。
 
-        60 秒的实测锚点（codex 0.154.0、effort low、sleep 工具调用执行中被打断）：
-        INT → PID 消失分别是 1.854 秒和 0.964 秒。这里把「30~60 倍余量」这个
-        **理由**也钉住——只钉 60 这个数字的话，下一个人把实测值改了没人拦。
+        **刻意只钉绝对值，一条「倍数余量」都不钉。** 排干多久由 codex 起的后代
+        决定，**无上界**（起个后台服务就永不结束），所以 60 秒是「本工具愿意等
+        多久」的**策略值**。原先那两条（`>= 1.854 * 30`、`< 0.964`）都把 codex 的
+        INT 退出实测当成了上界，已删。
         """
-        self.assertEqual(ca.INTERRUPT_EXIT_TIMEOUT, 60)
-        self.assertEqual(ca.INTERRUPT_POLL_INTERVAL, 0.2)
-        self.assertGreaterEqual(ca.INTERRUPT_EXIT_TIMEOUT, 1.854 * 30)
-        self.assertLess(ca.INTERRUPT_POLL_INTERVAL, 0.964,
-                        "轮询间隔比实测最快的退出还长，等于把等待时间凭空拉长一轮")
+        self.assertEqual(ca.ROUND_END_TIMEOUT, 60)
+        self.assertEqual(ca.ROUND_END_POLL_INTERVAL, 0.2)
+
+
+class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
+    """等待折进唯一的 spawn 入口——三条路都经过它，「哪个入口漏了」结构上不存在。"""
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def test_等的是磁盘上那份_不是传进来的meta(self):
+        """**本版头号回归锁。**
+
+        按参数读的话，`cmd_run` 传的是刚造好的 `new_meta()`——那一份的 writer 就是
+        本进程，于是这一轮会去等**参数里记的那个进程**，而不是上一轮真正的写者。
+
+        构造：磁盘那份记的是一个早没了的进程（→ 正确实现一路走完），**参数**那份
+        记的是一个**还活着的别的进程**（→ 读错了就会等满 0.3 秒然后 reject）。
+        判据同时钉**走通**和**耗时**，超时只给 0.3 秒，所以这条测试自己绝不挂死。
+
+        **参数那份刻意不用本进程的身份**（计划原稿是那样写的）：
+        `_previous_writer_alive` 对本进程恒答「停了」，拿本进程当参数的话，
+        「改读参数」那个突变会被那条短路救活——实测确实存活。换成真陪练之后才杀得掉。
+        """
+        ca.write_meta(self.d, "t", _full_meta("t"))          # 磁盘：上一轮早停了
+        活的 = _full_meta("t", **_live_writer(self))          # 参数：一个还活着的别的进程
+        # 前提用 _read_stat_fields 表达，**不碰谓词本身**：突变要改的正是谓词的签名，
+        # 用谓词写前提的话，突变会先把前提这一行炸成 TypeError——红是红了，
+        # 但红的是「签名变了」，不是「等错了人」，指错方向（实跑踩过）。
+        self.assertIsNone(ca._read_stat_fields(GONE_PID),
+                          "前提不成立：磁盘那份记的进程居然还在")
+        self.assertIsNotNone(ca._read_stat_fields(活的["writer_pid"]),
+                             "前提不成立：参数那份记的进程不在，突变就不会卡住")
+        started = time.monotonic()
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex():
+            ca.run_codex("run", self.d, "t", 活的, lambda r: ["codex"])
+        self.assertLess(time.monotonic() - started, 0.3,
+                        "等了——说明读的是参数那份，而那一份记的根本不是上一轮的写者")
+
+    def test_同一进程连跑两轮不会等自己(self):
+        """第二轮的磁盘元数据记的正是**本进程**（第一轮刚盖上去的）。
+
+        直问「那个进程还在吗」就恒答「还在」——于是第二轮等自己，等满超时为止。
+        真实失败模式是 **60 秒静默挂起**：等待排在分隔符之前，屏幕和日志都是死的，
+        而「别让调用方遇到静默挂起」正是本工具存在的理由。
+        挡住它的是 `_previous_writer_alive` 里「本进程不算」那一行。
+        """
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex():
+            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+            落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
+            self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity(),
+                             "前提不成立：第一轮没把本进程的身份盖上去，第二轮就不会等自己")
+            started = time.monotonic()
+            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertLess(time.monotonic() - started, 0.3, "第二轮在等自己")
+
+    def test_超时就拒绝_且不留半个状态(self):
+        """**本版最值钱的性质**：等待排在 `write_meta` / `clear_report` / 分隔符
+        **全部之前**，所以超时的时候，上一轮的报告还在、日志没被加分隔符、
+        元数据还是上一轮那份、codex 一个都没起。
+        """
+        ca.write_meta(self.d, "t", _full_meta("t", **_live_writer(self)))
+        报告 = ca._report_path(self.d, "t")
+        报告.write_text("上一轮的报告")
+        日志 = ca._log_path(self.d, "t")
+        日志.write_text("旧日志\n")
+        旧元数据 = ca.meta_path(self.d, "t").read_text()
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex() as popen:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(cm.exception.code, 2, "护栏拒绝走 2，不许和判据结论撞码")
+        popen.assert_not_called()
+        self.assertEqual(报告.read_text(), "上一轮的报告", "clear_report 跑了")
+        self.assertEqual(日志.read_text(), "旧日志\n", "分隔符写进去了")
+        self.assertEqual(ca.meta_path(self.d, "t").read_text(), 旧元数据, "元数据被覆盖了")
+
+    def test_超时文案按kind分(self):
+        """两种停不下来的处置不同，而这行 stderr 是调用方唯一的线索。
+
+        文案产生在 `run_codex` 内部，因为只有它认得 `kind`——而 `kind` 已经被
+        `_require_enum(kind, _KINDS, "kind")` 守着，不会冒出第四种。
+        """
+        陪练 = _live_writer(self)
+        for kind, 期望 in (("run", "换个任务名"), ("resume", "换个任务名"),
+                           ("interrupt-and-resume", "不要再 stop")):
+            with self.subTest(kind=kind):
+                ca.write_meta(self.d, "t", _full_meta("t", **陪练))
+                with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+                     mock.patch.object(ca, "find_codex_pid", return_value=None), \
+                     _no_codex():
+                    with self.assertRaises(ca.Rejected) as cm:
+                        ca.run_codex(kind, self.d, "t", _full_meta("t"), lambda r: ["codex"])
+                self.assertIn(期望, cm.exception.message)
+                self.assertIn("包装器还在读", cm.exception.message, "没说清谁还没停")
 
 
 class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
