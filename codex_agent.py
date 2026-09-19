@@ -238,7 +238,7 @@ def interrupt_codex(pid, log_path, cause):
     codex 的上下文优先于留痕。这个降级方向正是「可观测的失效不许拖垮存活」。
     """
     # 校验必须排在 os.kill **之前**：INT 发出去收不回来，先打断再发现 cause
-    # 写错，那一轮白毁——和四道闸同一条道理。
+    # 写错，那一轮白毁——和发信号前那几道闸同一条道理。
     _require_enum(cause, _CAUSES, "cause")
     try:
         os.kill(pid, signal.SIGINT)
@@ -596,7 +596,10 @@ def ensure_isolation(account):
     return d
 
 
-SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
+# 兜底句的**词干**。派生出来的两种措辞都含有它，SKILL.md 历史上印过的那句
+# 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它——所以拿它当
+# 「调用方是不是自己写了兜底句」的判据，一条就挡住全部写法。
+SKILL_GUARD_STEM = "不得使用任何 skill"
 
 # 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
 # `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
@@ -604,11 +607,52 @@ _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
            "--skip-git-repo-check", "--disable", "plugins"]
 
 
-def prepend_skill_guard(brief_text):
-    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。"""
-    if brief_text.startswith(SKILL_GUARD):
-        return brief_text
-    return f"{SKILL_GUARD}\n\n{brief_text}"
+def build_skill_guard(skill_paths):
+    """本轮的兜底句。**每轮派生，不是常量**——白名单是每一轮的事。
+
+    旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
+    调用方无处声明白名单，只好让 brief 正文去破例。`--skill` 出现之后那半句就
+    该消失——白名单由 CLI 指定，brief 正文不再是声明渠道。
+
+    白名单**逐行**列出，所以路径里一个换行就能把一条静默劈成两条
+    （见 _reject_control_chars，那条拒绝就是为这里守的）。
+    """
+    if not skill_paths:
+        return f"**{SKILL_GUARD_STEM}。**"
+    return f"**{SKILL_GUARD_STEM}，以下几个除外：**\n" + "\n".join(f"- {q}" for q in skill_paths)
+
+
+def check_brief_has_no_guard(brief_text):
+    """**调用方自己写了兜底句就拒跑**，不去重、不合并。**只拒绝，无副作用。**
+
+    两句兜底句并存时的优先级根本不该需要被定义（铁律 2）。而 SKILL.md 把那句话
+    明文印过、调用方照抄进 brief 开头是**可达路径**。拒绝比去重少一个分支，
+    且把「无定义」变成「不可能」。
+
+    抽成独立函数，是因为它必须在**两个**地方跑（同 check_can_resume 的两次调用）：
+      1. `check_can_resume` 里，排在 interrupt-and-resume 发 INT **之前**；
+      2. `prepend_skill_guard` 里，作为结构性兜底——闸留在动作本身上，
+         才没有一条绕过去的后门（cmd_run 根本不走 check_can_resume）。
+    纯拒绝、无副作用，跑两遍不花钱。
+
+    **判据用子串，不用整行**，这是对「本仓刚把轮次边界从子串改成整行」那条教训
+    的**刻意例外**：那次要从混杂文本里解析**自己的标记**，误判会让判据说谎；
+    这次要认的是**调用方写了任意措辞的兜底句**，误判的后果是拒绝一个确实在谈
+    skill 禁令的 brief——而那正是我们要拒的。失败方向是良性的。
+    """
+    if SKILL_GUARD_STEM in brief_text:
+        reject(f"brief 里已经有兜底句（含「{SKILL_GUARD_STEM}」）。这句话归工具所有：\n"
+               f"要放行哪些 skill 就用 --skill 逐条给（SKILL.md 的绝对路径，可重复），"
+               f"一个都不给就用 --no-skill。")
+
+
+def prepend_skill_guard(brief_text, skill_paths):
+    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。
+
+    两个参数都**没有默认值**：白名单每轮重给，缺省成空就等于替调用方做了决定。
+    """
+    check_brief_has_no_guard(brief_text)
+    return f"{build_skill_guard(skill_paths)}\n\n{brief_text}"
 
 
 def build_run_argv(dir_abs, effort, report_path, brief):
@@ -1037,8 +1081,9 @@ def cmd_run(args):
 
     ensure_isolation(args.account)
     report = _report_path(home, args.task)
-    brief = prepend_skill_guard(brief_file.read_text())
-    print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
+    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
+    # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
 
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
@@ -1081,7 +1126,7 @@ def cmd_status(args):
 
 
 def check_can_resume(task, meta, brief_path):
-    """续跑的三道闸。**只拒绝，不产生任何副作用**，所以可以在发信号之前先跑一遍。
+    """续跑的四道闸。**只拒绝，不产生任何副作用**，所以可以在发信号之前先跑一遍。
 
     抽成独立函数，是因为 `interrupt-and-resume` 必须把**全部**拒绝跑在发信号
     之前：INT 发出去就收不回来，先打断、再发现没 session id，那一轮白毁**且拿
@@ -1092,16 +1137,21 @@ def check_can_resume(task, meta, brief_path):
     `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
 
-    **判据是「这个拒绝可不可恢复」，不是「所有拒绝都要排在信号之前」。**
-    这三道（加上调用方那道「任务存在吗」）拒的都是**不可恢复**的事：没 session id
-    就再也回不来，工作目录没了、brief 不是文件则连命令都拼不出来——这些必须在
-    INT 发出去**之前**问清楚，因为 INT 收不回来。
+    **判据（已精化）：凡是对「调用方已经交给我们的输入」的纯检查，一律在任何
+    不可逆动作之前做完。** 早先写的是「不可恢复的挪前面、可恢复的留后面」，
+    而那条按字面会把第四道闸放到信号后面——它确实「可恢复」（上下文还在）。
+    但那条判据的**本意**是「有些检查在动手之前做不了」（比如 `ensure_isolation`
+    要先解析出账号），不是「可恢复就随便放」。brief 的内容是调用方交进来的输入，
+    动手之前就问得出来；白白烧掉一轮，即使可恢复也是浪费。
+
+    四道闸里前三道拒的是**不可恢复**的事：没 session id 就再也回不来，工作目录
+    没了、brief 不是文件则连命令都拼不出来。第四道（brief 自带兜底句）是纯输入
+    检查。四道都必须在 INT 发出去**之前**问清楚，因为 INT 收不回来。
     而 `_resume_round` 里的 `ensure_isolation` 确实会在信号**之后**才拒绝
     （实测：`.agents/skills` 非空时 `os.kill` 已经调过一次，随后退出码 2），
-    那是**可恢复**的：修好不变量再 `resume` 一次就行，上下文还在。
-    所以它留在那儿没问题。
-    **往这条路上加新拒绝时，就按这条判据放**：不可恢复的挪到这里来，
-    可恢复的留在后面。
+    它既可恢复、又**必须先解析出账号才做得了**，所以留在那儿没问题。
+    **往这条路上加新拒绝时按这条判据放**：只要是对已经交进来的输入做纯检查，
+    就挪到这里来。
     """
     if not meta["session_id"]:
         reject(f"任务 {task} 没有记到 session id，无法 resume，只能新起一个任务")
@@ -1109,11 +1159,15 @@ def check_can_resume(task, meta, brief_path):
     if not workdir.is_dir():
         reject(f"任务 {task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
                f"codex 会以 os error 2 当场崩，所以这里直接拒。")
-    if not pathlib.Path(brief_path).expanduser().is_file():
+    brief_file = pathlib.Path(brief_path).expanduser()
+    if not brief_file.is_file():
         reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
+    # 第四道：读一遍 brief 正文。`_resume_round` 随后还要再读一次（经
+    # prepend_skill_guard），两次读同一个文件不花钱，换来的是「拒绝排在 INT 之前」。
+    check_brief_has_no_guard(brief_file.read_text())
 
 
-def _resume_round(kind, home, meta, task, brief_path, effort):
+def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
 
     名字是 `_resume_round` 不是 `_resume_with`：`with` 没说清 with 什么，
@@ -1127,10 +1181,12 @@ def _resume_round(kind, home, meta, task, brief_path, effort):
     判据收的就是 `run_codex` 回传的本轮文本，**不用 read_last_round**：本轮的
     拥有者手里有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动
     修掉的整类 bug）。
+
+    `skills` 是本轮的白名单，和 effort 一样每轮重给——白名单是每一轮的事。
     """
     check_can_resume(task, meta, brief_path)
     ensure_isolation(meta["account"])
-    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text())
+    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
     # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
@@ -1158,7 +1214,8 @@ def cmd_resume(args):
     if find_codex_pid(_report_path(home, args.task)) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `codex-agent interrupt-and-resume {args.task}`。")
-    return _resume_round("resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
+                         args.skills)
 
 
 def cmd_interrupt_and_resume(args):
@@ -1183,13 +1240,13 @@ def cmd_interrupt_and_resume(args):
     工作损失多少」，后者在 codex 里根本不可观测。命令名把代价写在脸上，
     工具不替谁做这个决定。
 
-    下面的顺序是**硬约束**，不是排版顺序：四道闸全部走完才允许发信号。
+    下面的顺序是**硬约束**，不是排版顺序：五道闸全部走完才允许发信号。
     """
-    # ────── 四道闸 ──────
+    # ────── 五道闸 ──────
     home, meta = find_meta(args.task)                      # 1. 任务存在？
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    check_can_resume(args.task, meta, args.brief)          # 2/3/4. session id / 目录 / brief
+    check_can_resume(args.task, meta, args.brief)   # 2/3/4/5. session id / 目录 / brief 是文件 / brief 不自带兜底句
     # ────── 以上全过，才允许动手 ──────
 
     # meta 在这里读一次就一直用到 _resume_round。wait_for_exit 之后它已经旧于
@@ -1222,7 +1279,8 @@ def cmd_interrupt_and_resume(args):
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
-    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief,
+                         args.effort, args.skills)
 
 
 def cmd_stop(args):

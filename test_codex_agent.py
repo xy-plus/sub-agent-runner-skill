@@ -794,12 +794,46 @@ class TestIsolation(_HomeSandbox):
         self.assertIn("登录", cm.exception.message)
 
 
-class TestArgv(unittest.TestCase):
-    def test_兜底句被前置且只加一次(self):
-        once = ca.prepend_skill_guard("干活")
-        self.assertTrue(once.startswith(ca.SKILL_GUARD))
-        self.assertEqual(ca.prepend_skill_guard(once), once)
+class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
+    """兜底句**每轮派生**，且**只能由工具写**。
 
+    旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
+    调用方无处声明白名单，只好让 brief 正文去破例。--skill 出现之后那半句就该
+    消失——白名单由 CLI 指定，brief 正文不再是声明渠道。
+
+    断言的是**字面量**，不是 ca.SKILL_GUARD_STEM 拼出来的串：后者两边会一起动，
+    把措辞整个改掉测试照样绿（本仓在这上面栽过五次）。
+    """
+
+    def test_无白名单时的措辞(self):
+        self.assertEqual(ca.build_skill_guard([]), "**不得使用任何 skill。**")
+
+    def test_有白名单时逐行列出每条绝对路径(self):
+        self.assertEqual(
+            ca.build_skill_guard(["/abs/one/SKILL.md", "/abs/two/SKILL.md"]),
+            "**不得使用任何 skill，以下几个除外：**\n"
+            "- /abs/one/SKILL.md\n"
+            "- /abs/two/SKILL.md")
+
+    def test_brief自带兜底句就拒跑_并提示改用参数(self):
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.prepend_skill_guard("**不得使用任何 skill。**\n\n干活", [])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("--no-skill", cm.exception.message)
+        self.assertIn("--skill", cm.exception.message)
+
+    def test_旧那句兜底句也算自带_SKILL_md历史上印过它(self):
+        # 调用方照抄 SKILL.md 开头那句是**可达路径**，不拒就会出现两句互相
+        # 矛盾的兜底句。字面量写死那句旧话：它已经不在代码里了，只能这么钉。
+        with self.assertRaises(ca.Rejected):
+            ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", [])
+
+    def test_SKILL_GUARD常量已经不存在_它不再是每轮同一句话(self):
+        self.assertFalse(hasattr(ca, "SKILL_GUARD"),
+                         "常量留着就是第二个家：派生一份、常量一份，两份必然漂移")
+
+
+class TestArgv(unittest.TestCase):
     def test_run参数完整(self):
         argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief")
         self.assertEqual(argv[:3], ["codex", "exec", "--cd"])
@@ -1746,7 +1780,8 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         三个字段逐个显式写出，不走默认值。
         """
         return argparse.Namespace(
-            task=task, brief=str(self.brief if brief is None else brief), effort="low")
+            task=task, brief=str(self.brief if brief is None else brief), effort="low",
+            skills=[])
 
     def test_在跑时顺序是先打断再确认退出再续跑(self):
         order = []
@@ -1782,6 +1817,28 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_interrupt_and_resume(self._args("t2"))
         self.assertIn("session id", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_brief自带兜底句时绝不发信号_这条纯检查必须前移(self):
+        """spec 的判据精化：**凡是对「调用方已经交给我们的输入」的纯检查，
+        一律在任何不可逆动作之前做完。**
+
+        「brief 里已经有兜底句」完全由调用方交进来的那个文件决定，动手之前就
+        问得出来。留在 prepend_skill_guard 里的话，这条路会先发 INT 把当前轮
+        截断、再因为一个**本可提前发现**的理由拒绝——白烧一轮，即使可恢复
+        也是浪费。所以它进了 check_can_resume，和另外三道闸并排。
+        """
+        ca.write_meta(self.d, "t9", _full_meta("t9", session_id="s9", dir=str(self.workdir)))
+        bad = self.home / "自带兜底句.md"
+        bad.write_text("**不得使用任何 skill。**\n\n顺便把 X 也改了")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args("t9", brief=bad))
+        self.assertIn("--no-skill", cm.exception.message)
         ic.assert_not_called()
         k.assert_not_called()
 
@@ -1884,14 +1941,16 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
 
 class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
-    """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
+    """兜底句是 SKILL.md 印给调用方的**对外承诺**，三条路都必须真的加上。
 
     `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
-    不证明「run 和 resume 真的调了它」。把两处都换成裸 `read_text()` 的突变
-    曾经**全部存活**——一条印出去的承诺，没有任何东西守着。
+    不证明「run / resume / interrupt-and-resume 真的调了它、而且传的是**本轮**
+    的白名单」。把调用点换成裸 `read_text()` 的突变曾经**全部存活**——
+    一条印出去的承诺，没有任何东西守着。
 
-    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），
-    这句是内容层的第二道：万一哪天隔离被绕开，brief 里这句还在。
+    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），这句是
+    内容层的第二道；白名单则是这一道上唯一的开口，所以它长什么样必须钉在
+    **真正送进 codex argv 的那段文本**上，不是钉在派生函数的返回值上。
     """
 
     def setUp(self):
@@ -1900,6 +1959,8 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
         self.brief.write_text("干活")
+        self.skill = self.home / "tdd_SKILL.md"
+        self.skill.write_text("---\nname: tdd\n---\n")
 
     @staticmethod
     def _brief_codex_actually_got(run_it):
@@ -1915,23 +1976,53 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
             run_it()
         return seen["argv"][-1]
 
-    def test_run这条路(self):
+    def _meta_for_resume(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        return d
+
+    def test_run这条路_无白名单(self):
         ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--no-skill"])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
-        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
 
-    def test_resume这条路(self):
-        d = ca.ensure_isolation("default")
-        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+    def test_run这条路_有白名单时路径真的进了argv(self):
+        ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--skill", str(self.skill)])
+        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外：**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn(f"- {self.skill}", brief)
+        self.assertIn("干活", brief)
+
+    def test_resume这条路_有白名单(self):
+        self._meta_for_resume()
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--skill", str(self.skill)])
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
-        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外：**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn(f"- {self.skill}", brief)
+
+    def test_interrupt_and_resume这条路_无白名单(self):
+        self._meta_for_resume()
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--no-skill"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            brief = self._brief_codex_actually_got(
+                lambda: ca.cmd_interrupt_and_resume(args))
+        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
+                        f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn("干活", brief)
 
 
