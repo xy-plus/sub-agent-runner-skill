@@ -618,11 +618,12 @@ class TestPid(unittest.TestCase):
             proc.wait()
 
     def test_任务名里的点不是通配符_不许命中别的任务(self):
-        """`.` 在 `pgrep -f` 的正则里是「任意字符」。
+        """任务名里的 `.` 绝不能被当成通配符。
 
-        任务名 `a` 的报告路径是 `…/reports/a.md`，拿它当模式去匹配，会命中任务
-        `aXmd` 的 `…/reports/aXmd.md`（`a` + 任意字符 + `md`）——2026-09-19 实测
-        `pgrep -f .../a.md` 确实返回了 aXmd 那个进程的 pid。
+        旧实现用 `pgrep -f <报告路径>`，而那是**正则**：任务名 `a` 的
+        `…/reports/a.md` 会命中任务 `aXmd` 的 `…/reports/aXmd.md`
+        （`a` + 任意字符 + `md`）——2026-09-19 实测 `pgrep -f …/a.md` 确实
+        返回了 aXmd 那个进程的 pid。
         后果是实打实的：`codex-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
         而 `run --task a` 会被「还在跑」误拒。
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
@@ -651,9 +652,10 @@ class TestTaskName(unittest.TestCase):
             with self.subTest(good=good):
                 self.assertEqual(ca.task_name(good), good)
 
-    def test_拒会咬到文件系统和pgrep的字符(self):
-        # `../x` 写到 tasks/ 外面、`a/b` 写不出文件、`a|b` 在 pgrep -f 里是正则或，
-        # 会命中无关进程 —— 于是 stop 把 SIGINT 发到别人的 codex 上
+    def test_拒会咬到文件系统的字符(self):
+        # 任务名会被直接拼成三个文件名：`a/b` 写不出文件、`../x` 写到 tasks/ 外面。
+        # （`a|b` 这类正则元字符曾经还会咬反查，那条已经由 /proc 精确匹配解决，
+        #   但限制保留——文件名这条理由依然成立。）
         for bad in ("../escape", "a/b", "a|b", "fix(api)", "", "a b"):
             with self.subTest(bad=bad), self.assertRaises(argparse.ArgumentTypeError):
                 ca.task_name(bad)
