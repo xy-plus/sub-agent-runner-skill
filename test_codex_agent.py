@@ -15,8 +15,14 @@ ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
 ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
                "\x1b[2mcodex_models_manager::manager\x1b[0m\x1b[2m:\x1b[0m "
                "failed to refresh available models: timeout waiting for child process to exit")
-ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-18T16:50:00.000000Z\x1b[0m \x1b[31mERROR\x1b[0m "
-                       "\x1b[2mcodex_core::rollout\x1b[0m\x1b[2m:\x1b[0m failed to persist rollout")
+ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-17T14:35:32.578919Z\x1b[0m \x1b[31mERROR\x1b[0m "
+                       "\x1b[2mcodex_core::session\x1b[0m\x1b[2m:\x1b[0m Failed to create session: "
+                       "thread-store conflict: thread already has an active writer")
+ERR_FATAL = "Error: thread/resume: thread 01a0… already has an active writer (code -32600)"
+ERR_TRACING_ROUTER = ("2026-09-18T16:49:02.380969Z ERROR codex_core::tools::router: "
+                      "apply_patch failed: file changed on disk")
+ERR_TRACING_WS = ("2026-09-18T16:49:02.380969Z ERROR codex_api::endpoint::responses_websocket: "
+                  "websocket closed unexpectedly")
 HEADER = ("Reading additional input from stdin...\n"
           "OpenAI Codex v0.154.0\n"
           "--------\n"
@@ -31,20 +37,36 @@ class TestStripAnsi(unittest.TestCase):
 
 
 class TestRuntimeErrorLines(unittest.TestCase):
-    def test_用户层ERROR行被识别(self):
-        got = ca.runtime_error_lines(ERR_USER_LAYER, ca.TAIL_LINES)
+    def test_形式A用户层ERROR行被识别(self):
+        got = ca.runtime_error_lines(ERR_USER_LAYER)
         self.assertEqual(len(got), 1)
         self.assertIn("usage limit", got[0])
 
-    def test_tracing结构化ERROR行被识别_行首是时间戳不是ERROR(self):
-        # 形态 B：只按行首匹配会整类漏掉，这是 2026-09-19 差点写错的判据
-        got = ca.runtime_error_lines(ERR_TRACING_UNKNOWN, ca.TAIL_LINES)
+    def test_形式B按target分类_未知target计入(self):
+        # 行首是时间戳不是 ERROR：只按行首匹配会把整类结构化日志漏掉
+        got = ca.runtime_error_lines(ERR_TRACING_UNKNOWN)
         self.assertEqual(len(got), 1)
-        self.assertIn("failed to persist rollout", got[0])
+        self.assertIn("thread-store conflict", got[0])
 
-    def test_已知良性行被过滤(self):
-        self.assertEqual(ca.runtime_error_lines(ERR_RECONNECT, ca.TAIL_LINES), [])
-        self.assertEqual(ca.runtime_error_lines(ERR_TRACING, ca.TAIL_LINES), [])
+    def test_形式C顶层致命Error大写E也要认_它正是写锁那条(self):
+        # `^ERROR:` 大小写敏感，匹配不到 `Error:`——而形式 C 正是最该报的那条
+        got = ca.runtime_error_lines(ERR_FATAL)
+        self.assertEqual(len(got), 1)
+        self.assertIn("already has an active writer", got[0])
+
+    def test_良性target被过滤(self):
+        for benign in (ERR_TRACING, ERR_TRACING_ROUTER, ERR_TRACING_WS):
+            with self.subTest(line=benign[:60]):
+                self.assertEqual(ca.runtime_error_lines(benign), [])
+
+    def test_Reconnecting按前缀过滤_后缀有多种写整行会漏(self):
+        for suffix in ("2/5", "5/5", "waiting for network"):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(ca.runtime_error_lines(f"ERROR: Reconnecting... {suffix}"), [])
+        self.assertEqual(ca.runtime_error_lines(ERR_RECONNECT), [])
+
+    def test_codex_core_session不是良性_它是最该报的那类(self):
+        self.assertEqual(len(ca.runtime_error_lines(ERR_TRACING_UNKNOWN)), 1)
 
     def test_子进程输出和brief原文不算运行时ERROR(self):
         noise = "\n".join([
@@ -53,12 +75,24 @@ class TestRuntimeErrorLines(unittest.TestCase):
             "**Test errors?** Fix error, re-run until it fails correctly.",
             "## Warning Signs",
             "error: test failed, to rerun pass `--lib`",
+            "Error handling is covered in section 3.",   # 形式 C 要 `Error:` 才算
         ])
-        self.assertEqual(ca.runtime_error_lines(noise, ca.TAIL_LINES), [])
+        self.assertEqual(ca.runtime_error_lines(noise), [])
 
-    def test_只看末尾N行(self):
-        log = ERR_USER_LAYER + "\n" + "\n".join(f"正常输出 {i}" for i in range(60))
-        self.assertEqual(ca.runtime_error_lines(log, ca.TAIL_LINES), [])
+
+class TestCurrentRound(unittest.TestCase):
+    def test_只扫最后一个分隔符之后_上一轮的错误不算这一轮的(self):
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n" + ERR_FATAL + "\n"
+               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n干净收尾\n")
+        self.assertEqual(ca.runtime_error_lines(log), [])
+
+    def test_本轮自己的错误照样认(self):
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n干净\n"
+               + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n" + ERR_FATAL + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
+
+    def test_没有分隔符时扫全文_老日志和半路接手都还能判(self):
+        self.assertEqual(len(ca.runtime_error_lines(ERR_FATAL)), 1)
 
 
 class TestExtractSessionId(unittest.TestCase):

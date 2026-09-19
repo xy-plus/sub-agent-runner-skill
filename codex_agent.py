@@ -12,45 +12,82 @@ import re
 import subprocess
 from typing import NamedTuple
 
-TAIL_LINES = 50  # 判据只看日志末尾这么多行：中途已恢复的错误不该算失败
 USAGE_LIMIT_MARK = "You've hit your usage limit"
+THREAD_LOCK_MARK = "already has an active writer"
+REPORT_PREVIEW_LINES = 5
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-# codex 自己的运行时日志有两种形态，漏掉任一种都等于判据失效（2026-09-19 实测）：
-#   A 用户层    ：`ERROR: You've hit your usage limit. …`        行首就是 ERROR:
-#   B tracing  ：`2026-09-18T16:49:02.380969Z ERROR codex_x::y: …` 行首是时间戳
-# 而日志里还混着 brief 原文和 codex 转述的子进程输出（cargo 的 error[E0599]、
+ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀
+
+
+def round_separator(kind, task, when_iso):
+    return f"{ROUND_MARK}{kind} {task} {when_iso} ====="
+
+
+# codex 自己的错误有三种锚定形式（2026-09-19 对 106 份真实日志全量统计），
+# 少认一种就等于判据失效：
+#   A 用户层   `ERROR: Reconnecting... 2/5`                  行首是 ERROR:／WARN:   23 行
+#   B tracing `<ISO 时间戳> ERROR codex_core::session: …`     行首是时间戳，带 target 92 行
+#   C 顶层致命 `Error: thread/resume: … active writer`        行首是大写 Error:       5 行
+# 形式 C 首字母是大写 E，`^ERROR:` 大小写敏感、匹配不到它——而它恰恰是「会话被
+# 锁死」那条最该报的错。
+# 日志里还混着 brief 原文和 codex 转述的子进程输出（cargo 的 error[E0599]、
 # pytest 的 `E   KeyError`、markdown 的 `## Warning Signs`），
 # 所以绝不能用裸 grep ERROR —— 会大面积误报。
-_RUNTIME_ERROR_PATTERNS = (
-    re.compile(r"^(ERROR|WARN):\s"),
-    re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(ERROR|WARN)\s+codex\S*:"),
-)
+_ERR_USER = re.compile(r"^(?:ERROR|WARN):\s+(.*)")
+_ERR_TRACING = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:ERROR|WARN)\s+(\S+?):\s")
+_ERR_FATAL = re.compile(r"^Error:\s")          # 形式 C，一律致命，没有白名单
 
-# 已知良性：出现了也不算失败
-_BENIGN = (
-    "failed to refresh available models",  # 模型列表刷新超时，不影响本次运行
-    "Reconnecting...",                     # 网络抖动，codex 自己会重连
+# 形式 B 按 module target 分类，不按自由文本——文本会变，target 不会。
+# 白名单之外一律计入判据，**包括 codex_core::session\***（会话建不起来正是最该报的）。
+_BENIGN_TARGETS = (
+    "codex_models_manager::",                      # 模型列表刷新超时，不影响本次运行
+    "codex_api::endpoint::responses_websocket",    # 连接抖动，codex 自己会重连
+    "rmcp::transport::worker",
+    "codex_core::tools::router",                   # apply_patch 被拒后重打成功
 )
+# 形式 A 的良性只有这一条，且必须按**前缀**匹配：后缀有 `1/5`~`5/5` 和
+# `waiting for network` 多种，写整行字面量会漏掉其余几种。
+_BENIGN_USER = ("Reconnecting...",)
 
 _SESSION_ID = re.compile(r"session id:\s*([0-9a-f-]{36})")
 
 
 def strip_ansi(text):
+    """防御性剥离。有了 `--color never`，日志本来就是纯文本，这里不再承重。"""
     return _ANSI.sub("", text)
 
 
-def runtime_error_lines(log_text, tail_lines):
-    """返回日志末尾 tail_lines 行里的 codex 运行时错误行（已剥 ANSI、已滤良性）。"""
-    lines = strip_ansi(log_text).splitlines()[-tail_lines:]
+def current_round(log_text):
+    """日志是追加的，判据只看最后一个分隔符之后——上一轮的错误不是这一轮的事。"""
+    text = strip_ansi(log_text)
+    cut = text.rfind(ROUND_MARK)
+    return text if cut < 0 else text[cut:]
+
+
+def runtime_error_lines(log_text):
+    """本轮日志里 codex 自己的错误行（已滤掉良性 target 与良性用户层消息）。
+
+    刻意没有「只看末 N 行」的窗口参数。那个窗口过去偷偷承担着「运行中已经恢复
+    过去的错误不算」这个语义，而这件事现在由 target 白名单正经做了，窗口只剩下
+    劣化替代品的身份：留着它，下一个撞上 60 行尾部堆栈的人就会把 50 改成 500，
+    然后每一次已恢复的错误都静默变成 suspect。
+    """
     hits = []
-    for line in lines:
-        if not any(p.search(line) for p in _RUNTIME_ERROR_PATTERNS):
+    for raw in current_round(log_text).splitlines():
+        line = raw.strip()
+        if _ERR_FATAL.match(line):
+            hits.append(line)
             continue
-        if any(b in line for b in _BENIGN):
+        m = _ERR_TRACING.match(line)
+        if m:
+            if not m.group(1).startswith(_BENIGN_TARGETS):
+                hits.append(line)
             continue
-        hits.append(line.strip())
+        m = _ERR_USER.match(line)
+        if m and not m.group(1).startswith(_BENIGN_USER):
+            hits.append(line)
     return hits
 
 
@@ -75,18 +112,19 @@ def judge(report_path, log_path, pid):
         return Verdict("running", f"pid={pid} 存活", [])
 
     log_text = log_path.read_text(errors="replace") if log_path.exists() else ""
-    errors = runtime_error_lines(log_text, TAIL_LINES)
+    round_text = current_round(log_text)
+    errors = runtime_error_lines(log_text)
 
     # “报告没出现＝没正常收尾”——这是 codex 写 -o 的唯一时机。
     # 前提是每轮开跑前把上一轮的报告删掉（见 clear_report），否则旧报告会被
     # 当成本轮的产物，一次失败的运行会被判成 success。
     if not report_path.exists() or not report_path.read_text().strip():
-        if USAGE_LIMIT_MARK in strip_ansi(log_text):
+        if USAGE_LIMIT_MARK in round_text:
             return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
-        return Verdict("suspect", f"报告在，但日志末 {TAIL_LINES} 行有 {len(errors)} 条运行时错误", errors)
+        return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的 codex 错误", errors)
 
     # 报告内容由 brief 决定（要 commit 还是要别的），属于任务层不属于工具层。
     # 工具只把顶层 key 列出来，让调用方自己核对 brief 要的字段在不在。
@@ -94,7 +132,7 @@ def judge(report_path, log_path, pid):
         keys = sorted(json.loads(report_path.read_text()).keys())
     except (json.JSONDecodeError, AttributeError):
         keys = []
-    return Verdict("success", "正常收尾，日志无运行时错误", keys)
+    return Verdict("success", "正常收尾，本轮日志无未分类错误", keys)
 
 
 MODEL = "gpt-6-astra"
