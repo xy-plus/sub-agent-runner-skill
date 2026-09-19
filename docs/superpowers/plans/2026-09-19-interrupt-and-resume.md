@@ -254,9 +254,9 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         args = ca.build_parser().parse_args(["status", "t"])
         seen, texts, real_judge = [], [], ca.judge
 
-        def spy(report_path, round_text):
-            texts.append(round_text)
-            v = real_judge(report_path, round_text)
+        def spy(rd):
+            texts.append(rd.text)
+            v = real_judge(rd)
             seen.append(v)
             return v
 
@@ -428,12 +428,15 @@ def runtime_error_lines(round_text):
 `judge` 换签名：
 
 ```python
-def judge(report_path, round_text):
+def judge(round):
     """唯一的成败判据——**只看产物和本轮日志**。`run`／`resume` 收尾和 `status`
     共用它，避免两处判据漂移。
 
+    收的是一个 `Round`（报告路径 + 本轮文本）而不是两个参数：那两样必须配套，
+    而拆开传时配错是**静默算对**的。理由写在 `Round` 上。
+
     **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
-    不一样：本轮的拥有者拿 `run_codex` 回传的本轮文本，外部观察者只能看最后一轮
+    不一样：本轮的拥有者拿 `run_codex` 回传的 `Round`，外部观察者只能看最后一轮
     （`read_last_round`）。把这件事塞回 judge 里，就只剩「猜」一种做法，
     而那正是这次要修掉的整类 bug。
 
