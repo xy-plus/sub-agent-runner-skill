@@ -67,14 +67,40 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀
 
-# 本轮被信号打断时留在日志里的痕迹。**刻意不以 ROUND_MARK 开头**：
-# read_round／read_last_round 都按 ROUND_MARK 切，这行要是同前缀，它就会被当成
-# 新一轮的开始，本轮前面的错误全被丢掉，判据当场失明。
+# 本轮被信号打断时留在日志里的痕迹。刻意不以 ROUND_MARK 开头——不过这条现在
+# 不再是靠人记住的前缀约定了：两个识别器都整行匹配（见下），互相不可能命中。
 INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断，上下文保留，可 resume -----"
 
 
 def round_separator(kind, task, when_iso):
     return f"{ROUND_MARK}{kind} {task} {when_iso} ====="
+
+
+# 分隔符与痕迹一律**整行**匹配，不是子串。
+#
+# 子串搜索在这个仓库里是真会说谎的：模块 docstring 自己写着「日志里还混着
+# brief 原文和 codex 转述的子进程输出」，而这里的日常就是派 codex 来改
+# codex_agent.py 自己。源码里那两行常量定义一旦被转述进日志，**两个方向都翻车**：
+#   日志里出现 `ROUND_MARK = "===== codex-agent "` 这行源码
+#     → 本轮文本在那里被切断（实测切剩 'ROUND_MARK = "' 共 14 个字符）
+#     → 打断标记被甩到本轮之外 → judge 从 interrupted 翻成 **failed**
+#   日志里出现 `INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断…"` 这行源码
+#     → 一轮真正失败的运行被判成 interrupted、退出码 130
+#     → 照契约做决定的 agent 去 resume 一个**根本没被打断**的失败轮
+# 两条都有回归测试钉着（TestRoundBoundary 里那两条，直接拿源码行当样本）。
+#
+# `\S+ \S+ \S+ =====$` 是精确的：round_separator 产出的 kind／task／when_iso
+# 三段都不含空格——kind 是枚举、任务名字符集（_TASK_NAME）排除空格、
+# isoformat(timespec="seconds") 也没有空格。
+_ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
+
+# 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_codex 的 cause。
+_MARK_LINE = re.compile(r"^" + re.escape(INTERRUPT_MARK) + r"(\s\[.*\])?$", re.M)
+
+
+def has_interrupt_mark(text):
+    """本轮是否真的被打断。整行匹配，不是子串——理由见 _ROUND_LINE 上面那段。"""
+    return _MARK_LINE.search(text) is not None
 
 
 def interrupt_codex(pid, log_path):
@@ -180,7 +206,8 @@ def read_round(log_path, start_offset):
     不会切在多字节字符中间。
     `errors="replace"`：codex 被 INT 打断时可能只写出半截字节，裸 decode 会把
     判据整个打崩。
-    右端截到「起点之后的第一个 ROUND_MARK」，所以后一轮的内容也不会被吞进来。
+    右端截到「起点之后的第一个分隔符**行**」，所以后一轮的内容也不会被吞进来。
+    整行匹配而不是子串搜索：日志里转述到那行源码就会在那里被误切（见 _ROUND_LINE）。
     """
     if not log_path.exists():
         return ""
@@ -188,8 +215,8 @@ def read_round(log_path, start_offset):
         f.seek(start_offset)
         raw = f.read()
     text = strip_ansi(raw.decode("utf-8", "replace"))
-    cut = text.find(ROUND_MARK)
-    return text if cut < 0 else text[:cut]
+    m = _ROUND_LINE.search(text)
+    return text if m is None else text[:m.start()]
 
 
 def read_last_round(log_path):
@@ -202,8 +229,11 @@ def read_last_round(log_path):
     if not log_path.exists():
         return ""
     text = strip_ansi(log_path.read_text(errors="replace"))
-    cut = text.rfind(ROUND_MARK)
-    return text if cut < 0 else text[cut:]
+    # 整行匹配、取最后一个（理由同 read_round）
+    last = None
+    for m in _ROUND_LINE.finditer(text):
+        last = m
+    return text if last is None else text[last.start():]
 
 
 def runtime_error_lines(round_text):
@@ -321,7 +351,7 @@ def judge(round):
         # 任务），而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
         # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
         # 留下 failed to record rollout items），那些照常进 detail，不改状态。
-        if INTERRUPT_MARK in round_text:
+        if has_interrupt_mark(round_text):
             return Verdict("interrupted",
                            "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
@@ -1010,7 +1040,7 @@ def cmd_interrupt_and_resume(args):
         # 上下文全丢，正是本命令要防的事。
         # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
         # 恰好就是最后一轮的事。
-        if INTERRUPT_MARK in read_last_round(log):
+        if has_interrupt_mark(read_last_round(log)):
             _say(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:

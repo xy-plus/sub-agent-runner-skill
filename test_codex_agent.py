@@ -209,6 +209,17 @@ class TestReadLastRound(unittest.TestCase):
         log = self._log(ERR_FATAL + "\n")
         self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
 
+    def test_混进来的ROUND_MARK源码行不许被当成新一轮的开始(self):
+        # status 是外部观察者，它只能看最后一轮。子串搜索会把日志里转述的那行
+        # 源码当成新一轮的开始——本轮的打断标记被甩到「上一轮」去，
+        # status 于是把一轮被打断的运行报成 failed。
+        源码行 = 'ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀'
+        self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
+        log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
+                        + ca.INTERRUPT_MARK + "\n" + 源码行 + "\n")
+        self.assertTrue(ca.has_interrupt_mark(ca.read_last_round(log)),
+                        "最后一轮被那行源码切断了，打断标记被甩掉")
+
     def test_打断标记不能被当成新一轮的开始(self):
         # 它要是以 ROUND_MARK 开头，read_last_round 就从它这里切开，
         # 本轮前面的错误全被丢掉——判据当场失明
@@ -288,6 +299,35 @@ class TestRoundBoundary(unittest.TestCase):
         self.assertEqual(text, "本轮干净\n")
         self.assertEqual(ca.runtime_error_lines(text), [],
                          "后一轮的致命错误被算到了前一轮头上")
+
+    def test_日志里混进ROUND_MARK的源码行_不许被当成轮次分隔符(self):
+        # 这个仓库的日常就是派 codex 改 codex_agent.py 自己，源码行进日志是常态；
+        # 模块 docstring 也写着「日志里还混着 brief 原文和 codex 转述的子进程输出」。
+        # 子串搜索会在这里切断本轮：切剩 'ROUND_MARK = "' 14 个字符，
+        # 打断标记被甩到本轮之外，judge 从 interrupted 翻成 failed。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        源码行 = 'ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀'
+        self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(
+                log, 源码行 + "\n", ca.INTERRUPT_MARK + "\n")
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertIn(源码行, rd.text, "本轮文本被那行源码切断了")
+        self.assertEqual(ca.judge(rd).state, "interrupted")
+
+    def test_日志里混进INTERRUPT_MARK的源码行_不许被当成真打断(self):
+        # 反方向：一轮真正失败的运行，日志里恰好转述了那行常量定义。
+        # 子串搜索会判成 interrupted、退出码 130，而照契约做决定的 agent
+        # 会去 resume 一个根本没被打断的失败轮。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        源码行 = f'INTERRUPT_MARK = "{ca.INTERRUPT_MARK}"'
+        self.assertIn(ca.INTERRUPT_MARK, 源码行, "前提不成立：样本行里没有打断标记")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, 源码行 + "\n")
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(ca.judge(rd).state, "failed")
 
     def test_切的是字节不是字符_中文日志不许错位(self):
         # 日志里全是中文：brief 原文、codex 的中文输出。按字符切会整体错位，
