@@ -63,28 +63,38 @@ def task_name(value):
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
-def _reject_control_chars(flag, value):
+def _reject_control_chars(flag, value, why):
     """控制字符必须在**入口**挡住，不能指望「一般没人这么干」。
 
-    2026-09-19 实测：`--dir` 给一个含制表符和换行的路径，`mkdir`／`resolve()`／
-    `is_dir()` **全都放行**——文件系统这一层根本不管。而这个路径会原样进
-    `status` 的数据行，一个换行就让「一行一任务」不成立，任何切分方案都救不
-    回来（见 status_row）。
-    `--skill` 同理，但坏法不同：兜底句把白名单**逐行**列出来，路径里一个换行
-    就把一条白名单静默劈成两行，codex 读到的是两个都不存在的路径。
+    2026-09-19 实测：给一个含制表符和换行的路径，`mkdir`／`resolve()`／
+    `is_dir()` **全都放行**——文件系统这一层根本不管。
+
+    **`why` 由调用方传，不在这里写死。** 两个调用方坏的不是同一件事：`--dir`
+    进 status 的数据行、不进白名单；`--skill` 进白名单、**不**进 status 的列
+    （skills 刻意不进列，见 new_meta）。合成一句「要进数据行和白名单行」就是
+    对两个调用方各说了一半假话，而 stderr 那一行是 agent 唯一的线索。
     """
     hit = _CONTROL_CHARS.search(value)
     if hit:
         # 这里用 !r：value 已经确定含控制字符，裸插进错误信息会把 stderr 也弄成
         # 多行／带制表符的一坨。skill_path 后面三条的 value 是干净路径，用裸的。
         raise argparse.ArgumentTypeError(
-            f"{flag} {value!r} 含控制字符 {hit.group()!r}（第 {hit.start()} 个字符）。"
-            f"这个值要原样进 status 的数据行和兜底句的白名单行，控制字符会把它们切坏。")
+            f"{flag} {value!r} 含控制字符 {hit.group()!r}（第 {hit.start()} 个字符）。{why}")
 
 
 def work_dir(value):
-    """`--dir` 的 type=。只管控制字符；「是不是目录」归 cmd_run——它要先 expanduser／resolve。"""
-    _reject_control_chars("--dir", value)
+    """`--dir` 的 type=。只管控制字符；「是不是目录」归 cmd_run——它要先 expanduser／resolve。
+
+    **和 cmd_run 里 resolve 之后那道不是重复。** 这一道守的是命令行上那个原始串，
+    还买到两样别的：`..` 把控制字符折叠掉的路径（`/a/x\tb/../SKILL.md` 这种，
+    resolve 之后就没有控制字符了，而**原始串会原样出现在 stderr 和日志里**），
+    以及 argparse 免费的错误格式（`argument --dir: …`，点名是哪个参数）。
+    那一道守的是 resolve 之后的真身——软链一跨，这一道就够不着了。
+    """
+    _reject_control_chars(
+        "--dir", value,
+        "它要原样进 status 的数据行，一个换行就让「一行一任务」不成立，"
+        "任何切分方案都救不回来（见 status_row）。")
     return value
 
 
@@ -100,7 +110,10 @@ def skill_path(value):
     「零工作量」被报成「完成」，且没有任何别的信号救得回来：`cat` 的失败是 shell
     退出码，不匹配 runtime_error_lines 的三种错误形式，judge 结构上看不见它。
     """
-    _reject_control_chars("--skill", value)
+    _reject_control_chars(
+        "--skill", value,
+        "它要逐行进兜底句的白名单，一个换行就把一条静默劈成两条，"
+        "codex 读到的是两个都不存在的路径（见 build_skill_guard）。")
     q = pathlib.Path(value)
     if not q.is_absolute():
         raise argparse.ArgumentTypeError(
@@ -545,6 +558,11 @@ def account_choices():
     扫到坏名字就**拒跑**，不静默跳过：跳过的话这个账号的隔离目录对
     `find_meta`／`all_metas` 也一起消失，住在里面的任务从此 status 看不见、
     而同名 run 又会当它不存在——正是这次改动要消灭的那种静默失效。
+
+    **代价要说清：拒绝半径是整个 CLI。** 本函数挂在 `build_parser()` 的
+    `choices=` 上，所以一个坏目录名会让 `status`／`stop` 也退 2——**连正在跑的
+    任务都停不了**，只能先把那个目录改名。选这一半是因为另一半更坏（静默失效
+    没有任何信号），而这一半的修法是一条 `mv`，且 stderr 直接点名是哪个目录。
     """
     accounts_dir = pathlib.Path.home() / ".codex-accounts"
     extra = sorted(q.name for q in accounts_dir.iterdir() if q.is_dir()) if accounts_dir.is_dir() else []
@@ -661,10 +679,19 @@ def build_skill_guard(skill_paths):
 
     白名单**逐行**列出，所以路径里一个换行就能把一条静默劈成两条
     （见 _reject_control_chars，那条拒绝就是为这里守的）。
+
+    **「除外」后面那句「动手前先逐个读一遍」是承重的，不是客套。**
+    只列路径的话，codex 拿到的是**许可**（你可以用这几个），而不是**指令**
+    （去读）。不读 → 日志里就没有那行 `cat <路径>` → `judge` 结构上看不见 →
+    照报 success，正是本次立项要杀的那类失效（34.9 秒那次）换了个形状。
+    而「刻意不把 skill 软链进隔离目录」的全部论证都架在那行 `cat` 上
+    （见 _add_prompt_round_args 的可观测性那段）——指令没了，那条论证也一起塌。
+    无白名单那一支**刻意不带**这句：没东西可读，加上去只是句废话。
     """
     if not skill_paths:
         return f"**{SKILL_GUARD_STEM}。**"
-    return f"**{SKILL_GUARD_STEM}，以下几个除外：**\n" + "\n".join(f"- {q}" for q in skill_paths)
+    return (f"**{SKILL_GUARD_STEM}，以下几个除外（动手前先逐个读一遍）：**\n"
+            + "\n".join(f"- {q}" for q in skill_paths))
 
 
 def check_brief_has_no_guard(brief_text):
@@ -1114,7 +1141,8 @@ def _tee_until_exit(proc, log, home, task, meta):
 #
 # **刻意不换格式。** 初稿的制表符方案被实测否掉：按 tabstop=8 量四行真实输出
 # 的各列屏幕起始列，[0,16,24,32,40,80] / [0,16,24,32,40,88] / [0,8,16,24,32,40]
-# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]。
+# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]
+# （那是**换列序之前**的四列格式量出来的；定宽的稳定性与列数无关，结论照样成立）。
 #
 # 退出码单独成列：它和 state 是同一份事实的两种编码，但**同源派生**（都来自
 # EXIT[state]），不存在漂移风险。人读词，机器读码。
@@ -1421,6 +1449,22 @@ def cmd_stop(args):
     return EXIT["success"]
 
 
+class _AppendSkillPath(argparse.Action):
+    """`--skill` 往 **tuple** 上拼，不用现成的 `action="append"`。
+
+    argparse 那两件现成零件各有一处毛病，凑在一起就是两条软约定：
+      - `action="append"` 给 list，而 `--no-skill` 的 `const=` 给的是**同一个
+        对象**（跨 parse 共享）。给 `[]` 的话谁原地改一下就污染另一次 parse。
+      - 两支类型还不一样，于是 `args.skills == []` 在一支上成立、另一支上踩空。
+    统一成不可变的 tuple 之后，「别原地改」和「别拿 `== []` 比」都不再需要
+    有人记得——前者结构上做不到，后者两支一致地为 False（要判空写
+    `if not args.skills`）。
+    """
+
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, (getattr(namespace, self.dest) or ()) + (value,))
+
+
 def _add_prompt_round_args(sub):
     """带 prompt 的三条命令共用的「本轮 skill 白名单」。**二选一必填，没有默认值。**
 
@@ -1433,21 +1477,20 @@ def _add_prompt_round_args(sub):
     完全可恢复的（加个参数重跑，零损失），不像 --effort/--account 写错要花钱
     才发现。
 
-    **刻意不把 skill 软链进隔离目录**，理由是可观测性：路径在 brief 里，
-    「codex 到底读没读」在日志里看得见（就是那一行 `cat <路径>`）；软链成能力
-    之后，用没用由它决定、**不可观测**。对一个主张「不骗调用方」的工具，这条是
-    决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
+    **刻意不把 skill 软链进隔离目录**，理由是可观测性：路径在 brief 里、**而且
+    兜底句明文叫它去读**（见 build_skill_guard——那句指令就是这条论证的地基，
+    光给许可不给指令的话「读没读」根本无从观测），于是「codex 到底读没读」在
+    日志里看得见，就是那一行 `cat <路径>`；软链成能力之后，用没用由它决定、
+    **不可观测**。对一个主张「不骗调用方」的工具，这条是决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
     一个」，isolation_home／find_meta／account_choices／ensure_isolation 全线
     要改，换来的保证是零。
     """
+    # 两支都给**不可变的 tuple**，所以 args.skills 的契约就一句话：
+    # 恒为 `tuple[str]`，`--no-skill` 时为空。理由见 _AppendSkillPath。
+    # 序列化不受影响：json.dumps(()) 就是 []，元数据的形状一个字没变。
     g = sub.add_mutually_exclusive_group(required=True)
-    g.add_argument("--skill", action="append", dest="skills", type=skill_path,
+    g.add_argument("--skill", action=_AppendSkillPath, dest="skills", type=skill_path,
                    metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
-    # const 给的是**不可变**的 ()，不是 []：argparse 的 const 在同一个 parser 上
-    # 是同一个对象，给 [] 的话两次 parse 拿到同一个 list，谁原地改一下就污染了
-    # 另一次。于是 args.skills 的契约是「**路径序列**」而不是「list」：
-    # --no-skill 给 ()，--skill 给 argparse 每次新建的 list（那一支不共享）。
-    # 两种都只被遍历和序列化（json.dumps(()) 就是 []，元数据的形状不受影响）。
     g.add_argument("--no-skill", action="store_const", const=(), dest="skills",
                    help="本轮一个 skill 都不给")
 

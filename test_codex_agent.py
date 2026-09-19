@@ -19,6 +19,9 @@
     resume 的三处 flag 差异、任务名字符集、兜底句**三条路**都真的加上且**每轮派生**
     控制字符在入口就挡住（--dir / --skill，文件系统那一层根本不管）
     status 数据行前四列无空白、明细行有缩进——「机器切得开」是断言出来的，不是碰巧
+    兜底句里那句「动手前先逐个读一遍」——**许可不等于指令**，没有指令就没有那行
+    `cat`，judge 看不见「它压根没读」，而「不软链」的论证正架在那行 `cat` 上
+    `--skill` 收下什么就原样还什么（不 resolve）——命令行、brief、日志三处必须同一个串
 
 总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
 凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
@@ -47,6 +50,13 @@
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
     suspect:3, running:4, interrupted:130}，字段清单钉那七个名字，
     边界钉「这段文本从哪来」，别只钉「两边相等」。
+
+**没有任何一条测试允许把真的 codex 叫起来**，这条不再靠「记得包 _no_codex」：
+见本文件的 `setUpModule`，漏包当场喊出来（2026-09-20 真漏过一次）。
+
+写突变脚本时注意 `.pyc` 缓存：CPython 按 (mtime 秒, size) 判新旧，两条**字节数
+相同又在同一秒内**跑的突变会命中上一条的字节码，失败被错误归因。
+一律 `rm -rf __pycache__` + `PYTHONDONTWRITEBYTECODE=1`。
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
@@ -100,6 +110,28 @@ HEADER = ("Reading additional input from stdin...\n"
           "\x1b[1mworkdir:\x1b[0m /home/xy/repo\n"
           "\x1b[1msession id:\x1b[0m 01a0b408-f718-7ff3-8123-d5202551acba\n"
           "--------\n")
+
+
+# 「单测绝不真的把 codex 叫起来」本来是**软约定**——靠每个作者记得包一层
+# _no_codex。2026-09-20 实测漏过一次：一条 cmd_run 的拒绝测试没包，而那道闸
+# 当时还没装上，cmd_run 一路走到 spawn，真的起了 codex（沙箱 HOME 没登录态，
+# 秒退，没花钱——但那是运气，不是设计）。
+# 在这里插一次桩，之后漏包**当场喊出来**，而且不必每个作者记得任何事。
+# 只挡 argv[0] 恰好是 "codex" 的那一种：陪练进程（sleep、python 驱动、
+# 命名成 codex 的假二进制都走绝对路径）一个都不受影响。
+# 真机冒烟（要真起 codex 的那一类）不在本文件里；将来若要加，给它一条显式豁免
+# 并在那里写清为什么。
+_REAL_POPEN_INIT = subprocess.Popen.__init__
+
+
+def setUpModule():
+    """全套测试里没有任何一条允许把真的 codex 叫起来。"""
+    def no_real_codex(self, args, *a, **kw):
+        argv0 = args[0] if isinstance(args, (list, tuple)) else args
+        assert argv0 != "codex", (
+            f"这条测试把真的 codex 叫起来了：{args!r}。少包了一层 _no_codex。")
+        return _REAL_POPEN_INIT(self, args, *a, **kw)
+    subprocess.Popen.__init__ = no_real_codex
 
 
 @contextlib.contextmanager
@@ -848,12 +880,25 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
     def test_无白名单时的措辞(self):
         self.assertEqual(ca.build_skill_guard([]), "**不得使用任何 skill。**")
 
-    def test_有白名单时逐行列出每条绝对路径(self):
+    def test_有白名单时逐行列出每条绝对路径_并且带上去读的指令(self):
+        """**许可不等于指令**——这是立项要杀的那类失效换了个形状。
+
+        只说「这几个除外」，codex 拿到的是「你可以用」，没有任何一句让它去读。
+        不读 → 日志里就没有那行 `cat <路径>` → judge 结构上看不见 → 照报 success，
+        正是 34.9 秒那次的同一种失效。
+        而「不把 skill 软链进隔离目录」的全部论证都架在这行 `cat` 上
+        （见 _add_prompt_round_args），指令没了那条论证也一起塌。
+        """
         self.assertEqual(
             ca.build_skill_guard(["/abs/one/SKILL.md", "/abs/two/SKILL.md"]),
-            "**不得使用任何 skill，以下几个除外：**\n"
+            "**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**\n"
             "- /abs/one/SKILL.md\n"
             "- /abs/two/SKILL.md")
+
+    def test_无白名单时不带这条指令_没东西可读(self):
+        # 正面控制：指令只在有白名单那一支出现。少了它，一个「两支都加指令」的
+        # 实现也全绿，而那句话在无白名单时是句废话（让它去读一个空清单）。
+        self.assertNotIn("读一遍", ca.build_skill_guard([]))
 
     def test_brief自带兜底句就拒跑_并提示改用参数(self):
         with self.assertRaises(ca.Rejected) as cm:
@@ -1399,6 +1444,21 @@ class TestSkillPathArg(unittest.TestCase):
                     ca.skill_path(bad)
                 self.assertIn("控制字符", str(cm.exception))
 
+    def test_收下什么就原样还什么_刻意不resolve(self):
+        """这条是**可观测性论证的地基**，不是洁癖。
+
+        命令行上写的、brief 白名单行里印的、日志里 `cat` 出现的必须是**同一个
+        串**——人和 grep 才对得上「codex 到底读没读那一个」。规范化之后这三者
+        就成了三个不同的串。
+        用 `/./` 而不是靠 /tmp 是不是软链：那种样本在这台机器上恰好相等，
+        `return str(q.resolve())` 的突变会**存活**（实测过）。
+        """
+        q = self._skill_file()
+        weird = f"{q.parent}/./{q.name}"
+        self.assertNotEqual(weird, str(q), "前提不成立：这个样本没制造出任何差别")
+        self.assertTrue(pathlib.Path(weird).is_file(), "前提不成立：带 /./ 的路径打不开")
+        self.assertEqual(ca.skill_path(weird), weird)
+
     def test_每条拒绝都点名是哪个路径(self):
         # 调用方是 agent：它拿到的只有 stderr 那一行，不点名就无从改起
         q = self._skill_file()
@@ -1416,6 +1476,20 @@ class TestSkillPathArg(unittest.TestCase):
 
 
 class TestWorkDirArg(unittest.TestCase):
+    def test_两个调用方的拒绝各说各的_不许混成一句(self):
+        # stderr 那一行是 agent 唯一的线索。混成一句「要进 status 的数据行和
+        # 兜底句的白名单行」就是对两个调用方**各说了一半假话**：--dir 不进白名单，
+        # --skill 不进 status 的列（skills 刻意不进列，见 new_meta）。
+        # 本仓刚在 ensure_isolation 上吃过「错理由比没理由更危险」的亏。
+        with self.assertRaises(argparse.ArgumentTypeError) as d:
+            ca.work_dir("/tmp/a\tb")
+        with self.assertRaises(argparse.ArgumentTypeError) as k:
+            ca.skill_path("/abs/a\tb/SKILL.md")
+        self.assertIn("status", str(d.exception))
+        self.assertNotIn("白名单", str(d.exception))
+        self.assertIn("白名单", str(k.exception))
+        self.assertNotIn("status", str(k.exception))
+
     def test_收一个正常目录路径(self):
         d = pathlib.Path(tempfile.mkdtemp())
         self.assertEqual(ca.work_dir(str(d)), str(d))
@@ -1609,24 +1683,27 @@ class TestSkillWhitelistFlags(_HomeSandbox):
             with self.subTest(cmd=cmd):
                 self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
 
-    def test_no_skill给的是不可变序列_store_const的常量是跨parse共享的(self):
-        # argparse 的 `const=` 在同一个 parser 上是**同一个对象**：给 [] 的话，
-        # 两次 parse 拿到同一个 list，谁原地改一下就污染了另一次。
-        # 生产路径今天不改它，但「结构上改不了」比「现在没人改」强一个量级。
+    def test_两支都给不可变序列_args_skills只有一种类型(self):
+        """`args.skills` 的类型只能有**一种**，而且哪一支都改不动。
+
+        argparse 现成的两件零件都有毛病：`const=` 在同一个 parser 上是**同一个
+        对象**（给 `[]` 的话两次 parse 共享一个 list，谁原地改一下就污染另一次），
+        `action="append"` 给的又是 list。两支类型不同，调用方写
+        `args.skills == []` 会在一支上踩空——而那是最可能的下一个误用。
+        统一成 tuple：两条软约定（别原地改、别拿 `== []` 比）一起消失。
+        """
         parser = ca.build_parser()
-        a = parser.parse_args(self._argv("run", "--no-skill")).skills
-        b = parser.parse_args(self._argv("resume", "--no-skill")).skills
-        self.assertEqual(a, ())
-        with self.assertRaises(AttributeError):
-            a.append("/x/SKILL.md")
-        self.assertEqual(b, (), "另一次 parse 被污染了")
-        # 反面：--skill 那一支的 list 是 argparse 每次新建的，本来就不共享。
-        # 这条是**正面控制**：没有它，上面那半在「两支都是 ()」的假实现上也绿。
-        c = parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills
-        self.assertEqual(c, [str(self.skill_a)])
-        c.append("/x/SKILL.md")
-        self.assertEqual(parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills,
-                         [str(self.skill_a)], "append 那一支的 list 居然跨 parse 共享")
+        empty = parser.parse_args(self._argv("run", "--no-skill")).skills
+        one = parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills
+        self.assertEqual(empty, ())
+        self.assertEqual(one, (str(self.skill_a),))
+        for got in (empty, one):
+            with self.subTest(got=got), self.assertRaises(AttributeError):
+                got.append("/x/SKILL.md")
+        # 跨 parse 不许渗：拼在一个共享对象上的话，第二次会带上第一次那条
+        self.assertEqual(
+            parser.parse_args(self._argv("resume", "--skill", str(self.skill_b))).skills,
+            (str(self.skill_b),), "上一次 parse 的 --skill 渗过来了")
 
     def test_skill可重复且保持给定顺序(self):
         parser = ca.build_parser()
@@ -1634,7 +1711,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
             with self.subTest(cmd=cmd):
                 args = parser.parse_args(self._argv(
                     cmd, "--skill", str(self.skill_a), "--skill", str(self.skill_b)))
-                self.assertEqual(args.skills, [str(self.skill_a), str(self.skill_b)])
+                self.assertEqual(args.skills, (str(self.skill_a), str(self.skill_b)))
 
     def test_status和stop不收这两个参数_它们不带prompt(self):
         # 这条**前后都绿**，它守的是「别顺手给 status 也加上」：白名单是发 prompt
@@ -1665,7 +1742,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
                 good = self._argv(cmd, "--skill", str(self.skill_a))
-                self.assertEqual(parser.parse_args(good).skills, [str(self.skill_a)],
+                self.assertEqual(parser.parse_args(good).skills, (str(self.skill_a),),
                                  "前提不成立：好的那条都过不去，坏的被拒就说明不了任何事")
                 with self.assertRaises(SystemExit):
                     parser.parse_args(self._argv(cmd, "--skill", "relative/SKILL.md"))
@@ -2138,9 +2215,12 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--skill", str(self.skill)])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外：**"),
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn(f"- {self.skill}", brief)
+        # 钉在**真正送进 argv 的那段文本**上：许可送到了不等于指令送到了，
+        # 而没有指令就没有那行 `cat`，judge 看不见「它压根没读」
+        self.assertIn("动手前先逐个读一遍", brief)
         self.assertIn("干活", brief)
 
     def test_resume这条路_有白名单(self):
@@ -2150,9 +2230,10 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
              "--skill", str(self.skill)])
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外：**"),
+        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
         self.assertIn(f"- {self.skill}", brief)
+        self.assertIn("动手前先逐个读一遍", brief)
 
     def test_interrupt_and_resume这条路_无白名单(self):
         self._meta_for_resume()
@@ -2909,6 +2990,12 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
     SIGTERM(15) 前面。所以「收到第一个就退出」的写法在 codex 同时挨了 TERM 和
     INT 时照样只记到 INT——测试会在 start_new_session 被删掉时照样绿。
     实测过：那样写的版本，去掉 start_new_session 和改成转发 TERM 两个突变都杀不掉。
+
+    **它是全套里唯一一条会偶发的测试**，因为它等的是真进程被真的调度到：
+    2026-09-20 在跑突变套件（机器满载）时 10 次里红过 1 次，而空载下连跑 40 次
+    零失败。红了先重跑一次再查——两次都红才是真的坏了。
+    刻意不把那几个 deadline 往上加：10 秒对空载已经宽出两个量级，加大只是把
+    那个数字换一换，换不来任何保证，却会让真的挂死多等好几秒。
     """
 
     FAKE_CODEX = (
