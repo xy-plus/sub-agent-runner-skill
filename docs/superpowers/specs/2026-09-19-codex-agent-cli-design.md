@@ -193,6 +193,26 @@ codex 填的字段。工具只管「有没有正常收尾」，并把报告的�
 | `resume N` | 先跑判据，状态是 `running` 就**拒绝**（对还在跑的会话 resume，报错和 SIGTERM 锁死一模一样，处置却相反：一个该等，一个该弃） |
 | `stop N` | **只发 `SIGINT`**，只发给本任务的真实 PID。永不裸 `kill`（SIGTERM 会让 thread 永久锁死、再也 resume 不了），永不 `pkill -f`（共享机器会误杀，且模式会匹配到发命令的 shell 自己） |
 
+### 谁停了包装器都一样：codex 只会收到 INT
+
+`stop` 只发 SIGINT，挡住的只是「用户主动停」。还有一条路没挡：**harness 停掉那个后台 Bash
+任务**（TaskStop、会话结束）时包装器吃到 SIGTERM，而 codex 默认与包装器同进程组，
+会被同一发组信号直接打到 —— 会话永久锁死。
+
+2026-09-19 实测（包装器**不**转发信号，向整个进程组发 TERM）：
+
+| codex 的进程组 | 结果 |
+|---|---|
+| 与包装器同组（`Popen` 默认） | codex **收到 SIGTERM** 并退出 → 永久锁死 |
+| 独立会话（`start_new_session=True`） | codex **什么都没收到**，继续跑 |
+
+所以两件事必须一起做，缺一个洞就还在：
+
+1. `subprocess.Popen(..., start_new_session=True)` —— 把 codex 挡在组信号之外。
+2. 包装器给 SIGTERM 和 SIGINT **都**装 handler，统一转发 **SIGINT** 给 codex，再等它退出。
+
+合起来的保证：**无论谁用什么信号停包装器，codex 收到的永远是 INT，上下文永远可 resume。**
+
 ## 10. 测试
 
 | 层 | 内容 | 成本 |
