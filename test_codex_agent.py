@@ -785,6 +785,27 @@ class TestRunGuards(_HomeSandbox):
         self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
         self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
 
+    def test_run也要校验隔离不变量_resume那一半补过了这一半漏了(self):
+        # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
+        # 这条没人守的话，config.toml 被软链回主配置、auth.json 指错账号，
+        # 主路径上全查不出来——而主路径才是绝大多数运行走的那条。
+        d = ca.ensure_isolation("default")
+        (d / "config.toml").unlink()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(task="t"))
+        self.assertIn("软链", cm.exception.message)
+
+    def test_同账号已结束的同名任务允许复用_只提示不拒绝(self):
+        # 刻意不一律拒绝：工具没有清理命令，一律拒绝等于任务名一次性，
+        # tasks/ 只能手工去删。已结束 + 同账号这一格是安全的——报告会被清掉、
+        # 日志是追加的，历史不丢。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex() as popen:
+            ca.cmd_run(self._args(task="t"))
+        self.assertTrue(popen.called, "同账号、已结束的同名任务被拒了，它应该允许复用")
+
     def test_开跑前三件事全在spawn之前做完(self):
         # 顺序反了每一件都会坏事：
         #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
@@ -890,6 +911,58 @@ class TestResumeGuards(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
             ca.cmd_resume(self._args("t3"))
         self.assertFalse((d / "reports" / "t3.md").exists())
+
+
+class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
+    """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
+
+    `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
+    不证明「run 和 resume 真的调了它」。把两处都换成裸 `read_text()` 的突变
+    曾经**全部存活**——一条印出去的承诺，没有任何东西守着。
+
+    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），
+    这句是内容层的第二道：万一哪天隔离被绕开，brief 里这句还在。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+
+    @staticmethod
+    def _brief_codex_actually_got(run_it):
+        """codex argv 的最后一项就是 brief 正文。"""
+        seen = {}
+
+        def grab(*a, **k):
+            seen["argv"] = a[0]
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = grab
+            run_it()
+        return seen["argv"][-1]
+
+    def test_run这条路(self):
+        ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
+
+    def test_resume这条路(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
+        self.assertTrue(brief.startswith(ca.SKILL_GUARD), f"codex 实际收到的是：{brief[:60]!r}")
+        self.assertIn("干活", brief)
 
 
 class TestExitCodeContract(_HomeSandbox):
