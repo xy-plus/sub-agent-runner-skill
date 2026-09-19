@@ -76,21 +76,41 @@ def round_separator(kind, task, when_iso):
     return f"{ROUND_MARK}{kind} {task} {when_iso} ====="
 
 
-def note_interrupt(log_path):
-    """在信号处理器里往日志追一行打断标记。
+def interrupt_codex(pid, log_path):
+    """发 SIGINT 并在日志留痕。这两件事必须一起发生，所以焊在同一个函数里。
 
-    为什么值得为它多写一个函数：把 TERM 转成 INT 保住了上下文，却没人告诉
-    下一个读判据的人「这轮是被打断的」。2026-09-19 真机复现过——`stop t` 刚
-    打印完「上下文保留，可 resume」，紧接着 `status t` 就说
-    `failed —— 报告缺失或为空＝没正常收尾`，退出码 1，两句话自相矛盾。
+    拆开放就会漏，而且**已经漏过一次**：`cmd_stop` 用裸 `os.kill` 打给 codex，
+    而写痕迹的函数只在包装器自己的信号处理器里被调用，于是 stop 这条路上痕迹
+    永远不写。2026-09-19 实测三行互相矛盾：stop 打印「上下文保留，可 resume」、
+    包装器收尾判 `failed —— 报告缺失或为空＝没正常收尾`（退出码 1）、
+    日志里 INTERRUPT_MARK 计数 **0**。而 agent 看到 failed 会从头重跑，
+    把保着的上下文和 token 一起扔掉。
     前台误跑被 2 分钟超时杀掉时同理：那正是「run_in_background 编不进去」
     那条缓解措施最需要说话的时刻。
 
-    用 O_APPEND + 单次 os.write：小写入在 Linux 上是原子的，不会和 tee 循环
-    的缓冲写互相撕裂；也刻意不碰那个已经打开的文件对象——信号处理器随时可能
-    插在它的 write 中间。
-    写不进去就算了：保住 codex 的上下文优先于留痕。
+    **只发 INT，永不 TERM**：SIGTERM 会让 thread 永久锁死，之后 resume 永远报
+    thread-store conflict，等多久都不释放，上下文全丢。
+    「INT 之后仍然可以 resume」2026-09-19 在 codex 0.154.0 上真机复验过：
+    run → INT → resume 跑通，两轮 session id 完全相同、token 从 3,216 接着涨到
+    3,989，追问「被打断前你成功创建了哪几个文件」它自己答得出——恢复的是语义上
+    的上下文，不只是一段计费记录。
+    这条是单点：start_new_session、统一转发 INT、cmd_stop、interrupt-and-resume、
+    以及「前台误跑也能活」那条缓解措施，全都架在它上面。换 codex 大版本时值得重验。
+
+    **返回值刻意不给。**「它本来就没在跑」这件事由调用方在**调用之前**用
+    `find_codex_pid` 判，那才是判它的地方；给个 bool 出来只是多一个「谁检查」
+    的滥用面。这里的 ProcessLookupError 只是「刚好在这一瞬退出了」——
+    信号没送出去就不该留下假痕迹，所以直接返回。
+
+    留痕用 O_APPEND + 单次 os.write：小写入在 Linux 上是原子的，不会和 tee 循环
+    的缓冲写互相撕裂；也刻意不碰那个已经打开的文件对象——信号处理器随时可能插在
+    它的 write 中间。写不进去就算了（吞掉 OSError）：INT 已经发出去了，保住
+    codex 的上下文优先于留痕。这个降级方向正是「可观测的失效不许拖垮存活」。
     """
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return
     try:
         fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
@@ -671,15 +691,11 @@ def run_codex(kind, home, task, meta, make_argv):
                                 start_new_session=True)
 
         def forward_as_sigint(signum, frame):
-            # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
+            # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume，
+            # 而且日志里一定留下痕迹——之后跑判据的人（包括另一个进程里的 status）
+            # 才知道这轮该 resume 而不是重跑。
             # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
-            try:
-                proc.send_signal(signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            # 顺手留痕，让之后跑判据的人（包括另一个进程里的 status）知道
-            # 这轮是被打断的，处置是 resume 而不是重跑。
-            note_interrupt(_log_path(home, task))
+            interrupt_codex(proc.pid, _log_path(home, task))
 
         # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
         # 而不还原，等于把本函数的副作用留给了整个进程的余生。
@@ -823,18 +839,10 @@ def cmd_stop(args):
     if pid is None:
         print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]
-    # 只发 SIGINT。SIGTERM 会让 thread 永久锁死，之后 resume 永远报
-    # thread-store conflict，等多久都不释放，上下文全丢。
-    #
-    # 「INT 之后仍然可以 resume」这条最初是 2026-09-08 的结论，2026-09-19 在
-    # **codex 0.154.0** 上真机复验过：run → stop(INT) → resume 跑通，两轮
-    # session id 完全相同、token 从 3,216 接着涨到 3,989；最有力的一条是追问
-    # 「被打断前你成功创建了哪几个文件」，codex 自己答得出「s1.txt，s2.txt 当时
-    # 尚未确认完成，s3.txt 未执行」——恢复的是**语义上的上下文**，不只是一段
-    # 计费记录，它知道自己被打断在哪一步。
-    # 这条是单点：start_new_session、统一转发 INT、本函数、以及「前台误跑也能
-    # 活」那条缓解措施，四件事全都架在它上面。换 codex 大版本时值得重验一次。
-    os.kill(pid, signal.SIGINT)
+    # 发 INT 与留痕焊在 interrupt_codex 里，这条路不可能只做一半。
+    # 上面 `pid is None` 那一支正是「调用之前判它在不在跑」的地方，
+    # 所以 interrupt_codex 不需要回一个 bool 让这里再判一遍。
+    interrupt_codex(pid, _log_path(home, args.task))
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
@@ -889,7 +897,7 @@ def main():
 
     能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
     包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
-    仍可 resume，日志里还留下一行打断标记（见 note_interrupt）告诉下一个人该
+    仍可 resume，日志里还留下一行打断标记（见 interrupt_codex）告诉下一个人该
     resume 而不是重跑。于是误用的代价从「会话永久锁死、上下文全丢」降到
     「这一轮没拿到完成通知」——可恢复，且判据会把话说清楚。
 

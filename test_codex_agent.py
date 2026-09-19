@@ -1507,13 +1507,16 @@ class TestSignalSafety(unittest.TestCase):
         self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
     def test_包装器收到SIGTERM时向codex转发的是SIGINT(self):
+        # 转发走 interrupt_codex（内部是 os.kill），发信号和留痕焊在一起，
+        # 转发这条路不可能只做一半。
         with mock.patch.object(ca.subprocess, "Popen") as popen, \
-             mock.patch.object(ca.signal, "signal") as sigsig:
+             mock.patch.object(ca.signal, "signal") as sigsig, \
+             mock.patch.object(ca.os, "kill") as kill:
             self._run_once(popen)
             handled = {c.args[0] for c in sigsig.call_args_list}
             self.assertEqual(handled, {signal.SIGTERM, signal.SIGINT, signal.SIGHUP})
             sigsig.call_args_list[0].args[1](signal.SIGTERM, None)
-        popen.return_value.send_signal.assert_called_with(signal.SIGINT)
+        kill.assert_called_once_with(popen.return_value.pid, signal.SIGINT)
 
 
 class TestRunCodexStreaming(unittest.TestCase):
@@ -1570,6 +1573,95 @@ class TestRunCodexStreaming(unittest.TestCase):
             proc.kill()
             proc.wait()
             proc.stderr.close()
+
+
+class TestInterruptCodex(unittest.TestCase):
+    """发 INT 和留痕是同一事件的两面，拆开就是一句「记得也写一下标记」的软约定。
+
+    而它**已经漏过一次**：cmd_stop 用裸 os.kill 打给 codex，写痕迹的
+    note_interrupt 只在包装器自己的信号处理器里被调用，于是 stop 这条路上
+    痕迹永远不写。2026-09-19 实测的三行：
+        stop 打印:  已向 rv-probe1 (pid=602545) 发 SIGINT，上下文保留，可 resume
+        包装器收尾: failed —— 报告缺失或为空＝没正常收尾        ← 退出码 1
+        日志里 INTERRUPT_MARK 计数: 0
+    """
+
+    def setUp(self):
+        self.log = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        self.log.write_text("")
+
+    def test_发出信号的同时一定留痕(self):
+        # 陪练进程必须**先报到再挨打**：Popen 一返回就发 INT 的话，信号会落在
+        # 解释器启动途中，那时 SIGINT 还是 SIG_DFL，进程直接被信号打死
+        # （returncode -2），于是「它是被 INT 正常收走的」这条断言测的其实是
+        # 一场竞态而不是本函数。同一套「等它真的就位」在
+        # TestSignalSafetyRealProcesses 里也是承重的。
+        ready = self.log.parent / "陪练就位.txt"
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import pathlib,signal,sys,time\n"
+                                 "signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))\n"
+                                 "pathlib.Path(sys.argv[1]).write_text('ok')\n"
+                                 "time.sleep(30)", str(ready)])
+        try:
+            deadline = time.time() + 10
+            while time.time() < deadline and not ready.exists():
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(),
+                            "前提不成立：陪练进程没装上 INT 处理器，这条测不到「被 INT 正常收走」")
+            self.assertTrue(ca.pid_alive(proc.pid), "前提不成立：陪练进程没起来")
+            ca.interrupt_codex(proc.pid, self.log)
+            self.assertIn(ca.INTERRUPT_MARK, self.log.read_text())
+            proc.wait(timeout=5)
+            self.assertEqual(proc.returncode, 0, "它该是被 INT 正常收走的")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_进程刚好已经退出时不留假痕迹(self):
+        # 信号没送出去就不该说「它被打断了」——假痕迹会让判据把一轮正常失败
+        # 说成「接着 resume 即可」
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        self.assertFalse(ca.pid_alive(dead.pid),
+                         "前提不成立：陪练进程还活着，这条测的就不是「已退出」")
+        ca.interrupt_codex(dead.pid, self.log)
+        self.assertEqual(self.log.read_text(), "")
+
+    def test_只发INT绝不发TERM(self):
+        # SIGTERM 会让 thread 永久锁死，之后 resume 永远报 thread-store conflict，
+        # 等多久都不释放，上下文全丢
+        with mock.patch.object(ca.os, "kill") as k:
+            ca.interrupt_codex(4242, self.log)
+        k.assert_called_once_with(4242, signal.SIGINT)
+
+    def test_刻意不给返回值(self):
+        """「它本来就没在跑」由调用方在**调用之前**用 find_codex_pid 判，
+        那才是判它的地方。给个 bool 出来，就多出一个「谁检查」的滥用面。
+        """
+        with mock.patch.object(ca.os, "kill"):
+            self.assertIsNone(ca.interrupt_codex(4242, self.log))
+
+
+class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
+    """三条打断路径必须都留痕。漏一条就会出现「stop 说可 resume、status 说 failed」。
+
+    forward_as_sigint 那条由 TestSignalSafetyRealProcesses 用真信号钉着
+    （它断言日志里出现 INTERRUPT_MARK），这里补 stop 这条——正是漏掉的那条。
+    """
+
+    def test_stop这条路也留痕(self):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t"))
+        log = ca._log_path(d, "t")
+        log.write_text("")
+        args = ca.build_parser().parse_args(["stop", "t"])
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca.os, "kill") as k:
+            ca.cmd_stop(args)
+        k.assert_called_once_with(4242, signal.SIGINT)
+        self.assertIn(ca.INTERRUPT_MARK, log.read_text(),
+                      "stop 只发信号不留痕 → status 会把被打断的轮次报成 failed")
 
 
 class TestStop(_HomeSandbox):
