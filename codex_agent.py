@@ -92,6 +92,13 @@ def round_separator(kind, task, when_iso):
 # `\S+ \S+ \S+ =====$` 是精确的：round_separator 产出的 kind／task／when_iso
 # 三段都不含空格——kind 是枚举、任务名字符集（_TASK_NAME）排除空格、
 # isoformat(timespec="seconds") 也没有空格。
+#
+# **整行匹配自带一条新前提：这两行必须落在行首。** 它由**写者**保证，不是读者猜
+# ——两个写入点（interrupt_codex 留痕、run_codex 写分隔符）各自在前面补换行。
+# 前提不成立是常态而非边角：日志末尾由 _tee_until_exit 的 log.write(chunk) 留下，
+# 而 read1(1024) 的边界是任意的，codex 流式输出被 INT 截在半行很常见。
+# 这条前提要是塌了，judge 会从 interrupted(130) 退回 failed(1)——
+# 正是这整轮改动要消灭的那个 bug 从第三层绕回来。
 _ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
 
 # 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_codex 的 cause。
@@ -153,7 +160,16 @@ def interrupt_codex(pid, log_path, cause):
     try:
         fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
-            os.write(fd, (INTERRUPT_MARK + f" [{cause}]\n").encode())
+            # **无条件前置换行**：整行匹配要求这行落在行首，而没有任何一方
+            # 保证它——痕迹追在日志末尾，而日志末尾是 tee 最后一次 write 留下的，
+            # `read1(1024)` 的边界是任意的：codex 流式输出被 INT 截在半行是
+            # **常态，不是边角**。接在半行后面的痕迹，判据当场认不出，
+            # judge 从 interrupted(130) 退回 failed(1)——正是本轮要消灭的那个 bug。
+            # O_APPEND 下无法「先读末字节再决定要不要补」：读和写之间别的进程
+            # 可能插入。所以无条件补。多一个空行是纯外观代价，换来「这一行一定
+            # 在行首」是**事实而不是指望**。
+            # **不要把这个空行优化掉**——去掉它缺陷当场复活（有回归钉着）。
+            os.write(fd, ("\n" + INTERRUPT_MARK + f" [{cause}]\n").encode())
         finally:
             os.close(fd)
     except OSError:
@@ -788,6 +804,13 @@ def run_codex(kind, home, task, meta, make_argv):
     # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
     with open(_log_path(home, task), "ab") as log:
+        # 分隔符也必须落在行首，理由同 interrupt_codex 的前置换行：上一轮的
+        # 尾巴可能被 INT 截在半行，分隔符接上去就不在行首，_ROUND_LINE 认不出，
+        # read_last_round 于是把两轮连成一轮，上一轮的错误算到这一轮头上。
+        # 文件刚以 "ab" 打开，tell() 就是文件长度——**非空才补**，
+        # 新日志的开头不该有空行。
+        if log.tell() > 0:
+            log.write(b"\n")
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
         # 本轮的起点：分隔符之后的第一个字节。

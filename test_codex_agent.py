@@ -352,6 +352,50 @@ class TestRoundBoundary(unittest.TestCase):
             rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual(ca.judge(rd).state, "failed")
 
+    def test_codex最后一块输出没有换行时_痕迹仍然落在行首(self):
+        """整行匹配给自己引入了一条新前提：**这行必须落在行首**。而没有任何一方
+        保证它——痕迹由 interrupt_codex 用 O_APPEND 追在日志末尾，日志末尾就是
+        `_tee_until_exit` 最后一次 `log.write(chunk)` 留下的，而 **read1(1024) 的
+        边界是任意的**：codex 流式输出被 INT 截在半行是**常态，不是边角**。
+
+        接在半行后面的痕迹，整行匹配当场认不出，judge 从 interrupted(130) 退回
+        failed(1)——正是这整轮改动要消灭的那个 bug，绕了一圈从第三层回来。
+        修法与本轮设计原则同源：**写者保证，不是读者猜。**
+        """
+        d = self._home()
+        log = ca._log_path(d, "t")
+        半行 = "codex 正输出到一半就被打断"
+        self.assertFalse(半行.endswith("\n"), "前提不成立：这块输出有换行结尾，测不到半行")
+
+        def spawn(*a, **k):
+            with open(log, "ab") as f:
+                f.write(半行.encode())          # 最后一块输出没有换行结尾
+            with mock.patch.object(ca.os, "kill"):
+                ca.interrupt_codex(4242, log, "interrupt-and-resume")
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = spawn
+            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertTrue(ca.has_interrupt_mark(rd.text),
+                        "痕迹被接在半行后面，整行匹配认不出它")
+        self.assertEqual(ca.judge(rd).state, "interrupted")
+        self.assertEqual(ca.EXIT[ca.judge(rd).state], 130)
+
+    def test_上一轮尾巴没有换行时_下一轮分隔符仍然落在行首(self):
+        # 同一条前提的另一个方向：分隔符接在上一轮的半行后面，_ROUND_LINE 认不出，
+        # read_last_round 就把两轮连成一轮——上一轮的错误算到这一轮头上。
+        d = self._home()
+        log = ca._log_path(d, "t")
+        尾巴 = "上一轮被截在半行"
+        self.assertFalse(尾巴.endswith("\n"), "前提不成立：尾巴有换行，测不到")
+        log.write_bytes(尾巴.encode())
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertNotIn(尾巴, ca.read_last_round(log),
+                         "分隔符没落在行首，上一轮的尾巴被算进了这一轮")
+
     def test_切的是字节不是字符_中文日志不许错位(self):
         # 日志里全是中文：brief 原文、codex 的中文输出。按字符切会整体错位，
         # 切出来的开头是半截字节——判据读到的「本轮」根本不是本轮。
@@ -2186,6 +2230,10 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
         "for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n"
         "    signal.signal(s, record)\n"
         "sys.stdout.write('session id: 01a0b408-f718-7ff3-8123-d5202551acba\\n')\n"
+        # 刻意留一个**没有换行结尾**的半行：read1(1024) 的边界是任意的，
+        # codex 被 INT 截在半行是常态。痕迹要是接在它后面而不是行首，
+        # 整行匹配就认不出来——下面的断言走 has_interrupt_mark 才照得到这件事。
+        "sys.stdout.write('半行输出，没有换行')\n"
         "sys.stdout.flush()\n"
         "deadline = time.time() + 30\n"
         "while time.time() < deadline:\n"
@@ -2241,7 +2289,11 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
             while time.time() < deadline and ca.INTERRUPT_MARK not in log.read_text():
                 time.sleep(0.05)
             text = log.read_text()
-            self.assertIn(ca.INTERRUPT_MARK, text)
+            # 走 has_interrupt_mark 而不是 `INTERRUPT_MARK in text`：子串断言
+            # 正好绕开了要测的那件事（痕迹有没有落在行首）。假 codex 上面刻意
+            # 留了个半行，所以这条现在真的照得到。
+            self.assertTrue(ca.has_interrupt_mark(text),
+                            "痕迹没落在行首，判据认不出这是一轮被打断的运行")
             # 痕迹必须**追加**：这条路的日志此刻已经有分隔符和 banner 了，
             # 去掉 O_APPEND 会从 0 覆盖写，把它们抹掉（session id 一没，
             # resume 再也回不来），而只断言「痕迹在里面」的话照样绿。
