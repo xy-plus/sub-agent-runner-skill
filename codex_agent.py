@@ -968,6 +968,111 @@ def find_codex_pid(report_path):
     return None
 
 
+# **PID 复用的余量是 445,255 倍，所以这里零行代码去防它。** 启动时刻的分辨率是
+# 10ms（CLK_TCK=100），要让两副身份撞车就得在同一个 10ms 刻度内把同一个 PID 发两次，
+# 而 PID 是顺序分配、绕完 pid_max 才回头：
+#     pid_max 4,194,304 → 10ms 内绕完一圈需 4.19 亿次 fork/秒
+#     本机实测 fork 速率 942 次/秒（绕一圈 1.2 小时）→ 余量 445,255 倍
+# **别用「writer 陪跑整轮所以够长」来论证它——那个论证是错的**：write_meta 在
+# Popen **之前**，Popen 一炸 writer 几毫秒就死。真正兜底的就是上面那个余量。
+def _read_stat_fields(pid):
+    """`/proc/<pid>/stat` 里的 `(运行状态, 启动时刻)`，都是 `str`；进程不在了返回 `None`。
+
+    **整文件读 bytes，从最后一个 `)` 之后切。禁止按行读、禁止 split() 全文。**
+    `comm` 是进程自己用 `prctl(PR_SET_NAME)` 设的**任意 15 字节**：空格、括号、
+    制表符、**裸换行**全都进得去（2026-09-20 实测 comm=`we ird)\\nx`，那时这个文件
+    **按行读得到 2 行**，而第一行里最后一个 `)` 落在 comm 内部，切出来的字段列表
+    长度是 0，下标 19 当场 IndexError）。它瞎得很安静——只在别人给进程改过名时才发作。
+
+    **state 和 starttime 必须同一次读取出来**：分成两个函数会读两次 `/proc`，
+    进程正好在两次之间变僵尸时，starttime 对得上、state 却是存活期那次的，
+    「僵尸算停了」那一行当场失效。
+
+    `tail[0]` 是 stat 的第 3 字段（state），`tail[19]` 是第 22 字段（starttime）：
+    前两个字段 pid 和 comm 已经被切掉了，所以下标是 `22 - 2 - 1`。
+
+    **这一对答的是两个不同的问题，别混成一个。** `starttime` 和 pid 合起来是
+    **身份**（「是不是同一个进程」），它在进程的一生里恒定不变——僵尸期也一样。
+    `state` 是**另一个维度**（「它还在干活吗」），R 和 S 都是「还在」，而且会
+    随时来回变。2026-09-20 实跑踩过：拿整个元组去比对「改名前后解析是否一致」，
+    陪练刚好从 R 翻到 S，测试就随机红一次——比对身份只许比身份那一半。
+
+    `pid` 收 `str`：元数据里存的就是 `str`，全模块只留这一种传法。
+    """
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        # 进程随时可能退出（ENOENT），/proc 也可能读到一半没了——一律当「不在了」
+        return None
+    tail = raw[raw.rindex(b")") + 1:].split()
+    return tail[0].decode(), tail[19].decode()
+
+
+def _writer_identity():
+    """**本进程**的身份 `(pid, 启动时刻)`，由 `run_codex` 盖进元数据。
+
+    **成对返回，拿不到半截**：半截身份等于退回裸 PID，而裸 PID 挡不住复用。
+
+    **类型问题用构造消掉，不用校验。** 落盘的那个值和比对时拿来对照的那个值
+    都出自 `_read_stat_fields`，两边恒为 `str`，类型不匹配从构造上无从发生。
+    （要是让它们各自产生，实测「存 int 比 str」会让 `"20096556" != 20096556`
+    恒成立，一个还在排干的任务被**静默判死**——而 `_load_meta` 今天的设计注释
+    明写「只校验键在不在」，为这两个字段开一道非对称的类型校验会把那条原则破掉。）
+
+    只有 writer 记身份，codex 那侧继续用 `find_codex_pid` 现场反查。分界线是
+    **有没有现场特征**：codex 有（comm=codex、argv 里有报告路径），而「还有没有人
+    往日志里写字」没有任何现场特征。现场事实不依赖「有人记得写下来」，而 writer
+    正是这条链上唯一会死的那个进程——所以只有它必须自报。
+
+    读不到自己就直接炸：`/proc` 读不到自己意味着本工具的全部存活判定
+    （`find_codex_pid` 也在内）都不成立，没有第二条路可走。
+    """
+    pid = str(os.getpid())
+    fields = _read_stat_fields(pid)
+    if fields is None:
+        raise RuntimeError(f"/proc/{pid}/stat 读不到自己——本工具的全部存活判定都架在 /proc 上")
+    return pid, fields[1]
+
+
+def _previous_writer_alive(home, task):
+    """磁盘上那份元数据记的那个进程，现在还在吗。
+
+    **名字答的就是它知道的事实**：不是「还有人写日志吗」——那是调用方拿它去回答的
+    问题。收 `(home, task)` 不收 dict：只有一个调用点，而收 dict 就可以传错任务，
+    传错了它会一声不吭地答「停了」。
+
+    四条判停，缺一不可：
+
+        文件不在        没有上一轮
+        记的就是本进程  那一轮的 writer 就是我自己，见下
+        启动时刻对不上  PID 被复用了（裸 os.kill 在这里会说「活着」）
+        state == "Z"    僵尸
+
+    **第四条是承重梁，不是锦上添花。** 实测：僵尸期的 `starttime` 与存活期
+    **完全相同**，`os.kill(pid, 0)` 也照样「成功」——没有这一行，等的就变成
+    「等它被父进程回收」，而回收时机归 harness 的 bash/node 管，是第三方。
+    spec 的版本小史里 v4 就是栽在这条前提上。
+    """
+    q = meta_path(home, task)
+    if not q.exists():
+        return False
+    previous = _load_meta(q)
+    # **本进程不算「上一轮的 writer」。** 写日志的包装器就是跑 run_codex 的这个
+    # 进程（tee 循环在它自己身上），所以它一落盘，磁盘上那副身份就是它自己。
+    # 同一个进程再进一次 run_codex，直问「那个进程还在吗」就恒答「还在」——
+    # 它在等自己，等到超时为止，而失败模式是 **60 秒静默挂起**（等待排在分隔符
+    # 之前，屏幕和日志都是死的）。这一行不是注释能代替的：靠下一个人记得，
+    # 就等于把「本工具存在的理由」交回给软约定。
+    # 反过来也安全：本进程若真有 tee 循环在跑，它此刻就不可能站在这里。
+    if (previous["writer_pid"], previous["writer_start"]) == _writer_identity():
+        return False
+    fields = _read_stat_fields(previous["writer_pid"])
+    if fields is None:
+        return False
+    state, start = fields
+    return start == previous["writer_start"] and state != "Z"
+
+
 # 打断之后最多等它收尾这么久。**是上界不是等待时长**——一确认退出就立刻往下走。
 # 实测锚点（2026-09-19，codex 0.154.0，effort low，sleep 工具调用执行中被打断）：
 # INT → PID 消失分别是 **1.854 秒**和 **0.964 秒**。60 秒是 30~60 倍余量——

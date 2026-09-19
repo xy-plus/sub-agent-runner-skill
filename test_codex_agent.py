@@ -115,6 +115,14 @@ HEADER = ("Reading additional input from stdin...\n"
           "--------\n")
 
 
+# 一副**必定停了**的 writer 身份：`pid_max` 这个值内核从不分配（分配区间是
+# [1, pid_max)），2026-09-20 实测 /proc/sys/kernel/pid_max = 4194304。
+# 前提在 setUpModule 里断言一次——默认元数据要是悄悄变成「还在写」，一大批
+# 「上一轮早停了」的测试会静默测到另一条分支上去。
+GONE_PID = str(2 ** 22)
+GONE_START = "1"
+
+
 # 「单测绝不真的把 codex 叫起来」本来是**软约定**——靠每个作者记得包一层
 # _no_codex。2026-09-20 实测漏过一次：一条 cmd_run 的拒绝测试没包，而那道闸
 # 当时还没装上，cmd_run 一路走到 spawn，真的起了 codex（沙箱 HOME 没登录态，
@@ -129,6 +137,10 @@ _REAL_POPEN_INIT = subprocess.Popen.__init__
 
 def setUpModule():
     """全套测试里没有任何一条允许把真的 codex 叫起来。"""
+    assert not pathlib.Path(f"/proc/{GONE_PID}").exists(), (
+        f"前提不成立：/proc/{GONE_PID} 居然存在。换一个必定不存在的 pid，"
+        f"否则一批「上一轮早停了」的测试会静默测到另一条分支上。")
+
     def no_real_codex(self, args, *a, **kw):
         argv0 = args[0] if isinstance(args, (list, tuple)) else args
         assert argv0 != "codex", (
@@ -165,6 +177,69 @@ def _full_meta(task, **over):
             "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00"}
     meta.update(over)
     return meta
+
+
+# ── 陪练进程的四个助手。**必须是模块级的，不许挂在某个 TestCase 上。**
+# 三个测试类都要用它们，而跨类写成 `TestPid._wait_argv(self, …)` 会在 `self`
+# 上找不到兄弟方法当场炸——炸点在陪练的 `kill()` **之前**，于是 `finally` 里的
+# `wait()` 会永久挂住一个 `tail -f`，**整套测试跟着挂死**（原型上挂过两次）。
+def _fake_codex(tmp):
+    """把一个真二进制命名成 codex —— comm 就会报 codex。"""
+    fake = tmp / "codex"
+    fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
+    fake.chmod(0o755)
+    return fake
+
+
+def _argv_of(pid):
+    return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
+
+
+def _wait_argv(test, proc, needle):
+    """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            if needle in _argv_of(proc.pid):
+                return
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        time.sleep(0.05)
+    test.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
+
+
+def _wait_zombie(test, pid):
+    """等陪练真的变成僵尸，返回它的启动时刻。
+
+    **这条路上不许再建第二个 `subprocess.Popen`**：`Popen.__init__` 会调
+    `subprocess._cleanup()`，顺手把这个僵尸回收掉，测试于是测到另一条分支上去。
+    """
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        fields = ca._read_stat_fields(str(pid))
+        if fields is not None and fields[0] == "Z":
+            return fields[1]
+        time.sleep(0.01)
+    test.fail(f"陪练 {pid} 始终没变成僵尸，本测试验证不了任何东西")
+
+
+def _live_writer(test):
+    """起一个**真的还活着的别的进程**，返回可直接落盘的那一对 writer 身份。
+
+    要「上一轮还在写」的测试一律用它，**不许拿本进程的身份充数**：
+    `_previous_writer_alive` 对本进程恒答「停了」（见那一行注释），
+    拿自己当陪练的测试会测到另一条分支上去。
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    test.addCleanup(proc.wait)
+    test.addCleanup(proc.kill)          # LIFO：先 kill 再 wait，绝不挂死
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        fields = ca._read_stat_fields(str(proc.pid))
+        if fields is not None and fields[0] != "Z":
+            return {"writer_pid": str(proc.pid), "writer_start": fields[1]}
+        time.sleep(0.01)
+    test.fail("陪练没起来，本测试验证不了任何东西")
 
 
 class _HomeSandbox(unittest.TestCase):
@@ -1245,6 +1320,184 @@ class TestMetaShape(_HomeSandbox):
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
 
+class TestProcessIdentity(unittest.TestCase):
+    """进程身份 = PID + `/proc/<pid>/stat` 第 22 字段（启动时刻）。
+
+    裸 PID 判不了 PID 复用：同一个 PID 换了个进程，`os.kill(pid, 0)` 一样说「活着」。
+    """
+
+    def test_身份成对返回_两半都是str(self):
+        # 两半必须同时拿到：分开取就会出现「记了 PID 没记启动时刻」的半截身份，
+        # 而半截身份等于退回裸 PID。
+        # 两半都是 str，是因为**写入和比对共用这同一个产生点**——类型不匹配
+        # 从构造上就无从发生，所以 _load_meta 不必给这两个字段加非对称的类型校验。
+        ident = ca._writer_identity()
+        self.assertEqual(len(ident), 2)
+        self.assertEqual(ident[0], str(os.getpid()))
+        self.assertTrue(all(isinstance(v, str) for v in ident),
+                        f"身份必须是 str：{ident!r}——比对是字符串比对，int 会把活着的任务判死")
+
+    def test_启动时刻取的是stat的第22字段(self):
+        """判据是**独立算出来的**，不是拿被测函数自己的切法当参照。
+
+        第 22 字段是「开机以来的滴答数」，所以「进程年龄 = 开机至今 − 启动时刻」
+        必须落在一个很小的正数区间里。左右两个邻居都被这条挡住：
+        第 21 字段 itrealvalue 恒为 0（年龄 = 整个开机时长），
+        第 23 字段 vsize 是字节数（2026-09-20 实测 18,898,944，年龄算出来是几万秒）。
+        """
+        滴答每秒 = os.sysconf("SC_CLK_TCK")
+        开机至今 = int(float(pathlib.Path("/proc/uptime").read_text().split()[0]) * 滴答每秒)
+        启动时刻 = int(ca._writer_identity()[1])
+        self.assertGreater(启动时刻, 0, "第 21 字段(itrealvalue)恒为 0——下标写小了")
+        年龄 = 开机至今 - 启动时刻
+        self.assertGreaterEqual(年龄, 0, "启动时刻比开机至今还晚，切到别的字段上去了")
+        self.assertLess(年龄, 300 * 滴答每秒,
+                        "本测试进程不可能活了 5 分钟以上（整套测试实跑 ~5 秒）——下标写大了")
+
+    def test_comm含空格括号制表符和裸换行时仍然解析正确(self):
+        """`comm` 是进程自己用 `prctl(PR_SET_NAME)` 设的**任意 15 字节**。
+
+        2026-09-20 实测 comm = `we ird)\\nx` 时 `/proc/<pid>/stat` **按行读会得到 2 行**，
+        而第一行里最后一个 `)` 落在 comm **内部**——按行读切出来的字段列表长度是 **0**，
+        下标 19 当场 IndexError；就算侥幸不炸，切出来的「启动时刻」也是 comm 的碎片。
+        这种瞎法很安静：只在别人给进程改过名的时候才发作。
+        参照物是**改名之前**读到的启动时刻，由独立的一次读取得到。
+
+        **刻意只比启动时刻，不比运行状态。** 状态是真会变的（陪练刚写完 `after`
+        正要进 `sleep`，读到 R 还是 S 全看撞上哪一刻）——2026-09-20 实跑撞到过
+        一次，整条测试于是变成随机红。状态那一半改钉「长度是 1」：/proc 的
+        state 字段恒为单个字符，而切错了拿到的是 comm 的碎片（`raw.index` 那个
+        突变切出来的是 `x)`），照样红。
+        """
+        陪练 = subprocess.Popen(
+            [sys.executable, "-c",
+             "import ctypes, sys, time\n"
+             "sys.stdout.write('before\\n'); sys.stdout.flush()\n"
+             "sys.stdin.readline()\n"
+             "ctypes.CDLL('libc.so.6').prctl(15, b'we ird)\\nx', 0, 0, 0)\n"
+             "sys.stdout.write('after\\n'); sys.stdout.flush()\n"
+             "time.sleep(30)\n"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(陪练.stdout.readline(), b"before\n", "前提不成立：陪练没起来")
+            改名前 = ca._read_stat_fields(str(陪练.pid))
+            self.assertIsNotNone(改名前, "前提不成立：陪练的 /proc 读不到")
+            陪练.stdin.write(b"go\n")
+            陪练.stdin.flush()
+            self.assertEqual(陪练.stdout.readline(), b"after\n", "前提不成立：陪练没改成名")
+            raw = pathlib.Path(f"/proc/{陪练.pid}/stat").read_bytes()
+            self.assertIn(b"\n", raw[:raw.rindex(b")")],
+                          "前提不成立：comm 里没有裸换行，这条测不到「不许按行读」")
+            self.assertEqual(len(raw.splitlines()), 2,
+                             "前提不成立：这个文件按行读只有一行，那按行读的突变杀不掉")
+            改名后 = ca._read_stat_fields(str(陪练.pid))
+            self.assertEqual(改名后[1], 改名前[1],
+                             "comm 里的空格/括号/制表符/裸换行把启动时刻切偏了")
+            self.assertEqual(len(改名后[0]), 1,
+                             f"切出来的不是运行状态而是 comm 的碎片：{改名后[0]!r}")
+        finally:
+            陪练.kill()
+            陪练.wait()
+            陪练.stdin.close()
+            陪练.stdout.close()
+
+    def test_进程不在了返回None(self):
+        self.assertIsNone(ca._read_stat_fields(GONE_PID))
+
+
+class TestPreviousWriterAlive(_HomeSandbox):
+    """「上一轮那个进程还在吗」——名字就是它答的那个问题。
+
+    **它不答「还有人写日志吗」**：那是它被用来回答的问题，不是它知道的事实。
+    只有 `_wait_previous_round_ends` 一个调用点，所以设为私有，且收 `(home, task)`
+    ——收 dict 就可以传错任务，而传错了它会一声不吭地答「停了」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def _写盘(self, **over):
+        # 两个身份键在本 Task 里由 over 显式给全（_full_meta 到 Task 2 才有默认值）
+        meta = _full_meta("t")
+        meta.update(over)
+        ca.write_meta(self.d, "t", meta)
+
+    def test_没有上一轮就判停了(self):
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_上一轮的writer还活着就判还在(self):
+        # 反面也要有：一个永远返回 False 的实现也能让上面那条全绿。
+        self._写盘(**_live_writer(self))
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"))
+
+    def test_同一个PID但启动时刻对不上就判停了_防PID复用(self):
+        # 自然情况下撞同一副 (PID, 10ms 刻度) 的余量是 445,255 倍，造不出来也不该造。
+        # 但**比对逻辑本身**两行就测完了，而它正是那道防线。
+        陪练 = _live_writer(self)
+        self._写盘(**陪练)
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算活着")
+        self._写盘(writer_pid=陪练["writer_pid"],
+                   writer_start=str(int(陪练["writer_start"]) + 1))
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_进程不在了就判停了(self):
+        self._写盘(writer_pid=GONE_PID, writer_start=GONE_START)
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_元数据记的是本进程时判停了_否则同一进程连跑两轮会等自己(self):
+        """**本进程不算「上一轮的 writer」**，而这一条得是代码不是注释。
+
+        写日志的包装器就是跑 `run_codex` 的那个进程（tee 循环在它自己身上），
+        所以它一落盘，磁盘上那副身份就是**它自己**。同一个进程再进一次
+        `run_codex`，按「进程还在吗」直问就恒答「还在」——它在等自己，等到超时
+        为止。失败模式是**60 秒静默挂起**（等待排在分隔符之前，屏幕和日志都是
+        死的），而「别让调用方遇到静默挂起」正是本工具存在的理由，所以这条
+        必须编进代码里，不能只写在注释里指望下一个人记得。
+        """
+        本进程 = dict(zip(("writer_pid", "writer_start"), ca._writer_identity()))
+        # 前提用 _read_stat_fields 表达，**不碰谓词本身**：谓词正是突变要改的那个。
+        self.assertIsNotNone(ca._read_stat_fields(本进程["writer_pid"]),
+                             "前提不成立：本进程居然读不到自己，那这条测的是另一条分支")
+        self._写盘(**本进程)
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_僵尸writer判停了_它的starttime和存活期完全一样(self):
+        """**这条钉的是承重梁，不是锦上添花。**
+
+        僵尸已经不执行任何代码、fd 全关，日志不可能再长。而它骗得过另外两道：
+        `starttime` 和存活期**完全相同**（本测试当场断言这一点），`os.kill(pid,0)`
+        也照样「成功」。去掉 `state == "Z"` 那一行，等的就变成「等它被父进程回收」
+        ——那归 harness 的 bash/node 管，是第三方，正是 v4 被否掉的那条前提。
+
+        这条测试里**不许再建第二个 `subprocess.Popen`**（见 `_wait_zombie`）。
+        """
+        僵尸 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.05)"])
+        try:
+            存活期 = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                fields = ca._read_stat_fields(str(僵尸.pid))
+                if fields is None:
+                    break
+                if fields[0] == "Z":
+                    僵尸期 = fields[1]
+                    break
+                存活期 = fields[1]
+                time.sleep(0.005)
+            else:
+                self.fail(f"陪练 {僵尸.pid} 始终没变成僵尸，本测试验证不了任何东西")
+            self.assertIsNotNone(存活期, "前提不成立：没在存活期读到过，比不了")
+            self.assertEqual(僵尸期, 存活期,
+                             "前提不成立：僵尸期的 starttime 居然变了——那这一行就不承重了")
+            os.kill(僵尸.pid, 0)   # 前提：裸 PID 对僵尸「成功」；抛异常就是前提变了
+            self._写盘(writer_pid=str(僵尸.pid), writer_start=僵尸期)
+            self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+        finally:
+            僵尸.wait()
+
+
 class TestPid(unittest.TestCase):
     def test_自己的进程判定为存活(self):
         self.assertTrue(ca.pid_alive(os.getpid()))
@@ -1263,44 +1516,20 @@ class TestPid(unittest.TestCase):
         # 没法真拿别人的账号起进程，就反过来做：把「当前用户」换成别人，
         # 我们自己这个 comm=codex、argv 对得上的进程就该落选。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
         proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertEqual(ca.find_codex_pid(mark), proc.pid)   # 前提：本来找得到
             with mock.patch.object(ca.os, "getuid", return_value=os.getuid() + 12345):
                 self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
             proc.wait()
-
-    @staticmethod
-    def _argv_of(pid):
-        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
-
-    def _wait_argv(self, proc, needle):
-        """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            try:
-                if needle in self._argv_of(proc.pid):
-                    return
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-            time.sleep(0.05)
-        self.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
-
-    @staticmethod
-    def _fake_codex(tmp):
-        """把一个真二进制命名成 codex —— comm 就会报 codex。"""
-        fake = tmp / "codex"
-        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
-        fake.chmod(0o755)
-        return fake
 
     def test_只认comm是codex的进程_别的进程不算(self):
         # 2026-09-19 实测：按报告路径反查会命中发命令的 bash 自己（comm=bash），
@@ -1310,7 +1539,7 @@ class TestPid(unittest.TestCase):
         mark = "/tmp/codex-agent-selftest-不存在的报告.md"
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
@@ -1319,14 +1548,14 @@ class TestPid(unittest.TestCase):
     def test_comm真是codex的进程会被找到_反向也要成立(self):
         # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
         proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertEqual(ca.find_codex_pid(mark), proc.pid)
         finally:
             proc.kill()
@@ -1341,7 +1570,7 @@ class TestPid(unittest.TestCase):
         所以比对必须是**元素相等**，不是子串包含。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mine = str(tmp / "reports" / "mine.md")
         others = str(tmp / "reports" / "others.md")
@@ -1350,7 +1579,7 @@ class TestPid(unittest.TestCase):
         proc = subprocess.Popen([str(fake), "-f", mine, brief], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, brief)
+            _wait_argv(self, proc, brief)
             self.assertEqual(ca.find_codex_pid(mine), proc.pid)   # 前提：自己找得到自己
             self.assertIsNone(ca.find_codex_pid(others))
         finally:
@@ -1369,7 +1598,7 @@ class TestPid(unittest.TestCase):
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         victim = str(tmp / "reports" / "aXmd.md")   # 任务 aXmd 的报告路径
         hunter = str(tmp / "reports" / "a.md")      # 任务 a 的报告路径
@@ -1377,7 +1606,7 @@ class TestPid(unittest.TestCase):
         proc = subprocess.Popen([str(fake), "-f", victim], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, victim)
+            _wait_argv(self, proc, victim)
             # 前提：它找得到自己，否则下面那条断言是空的
             self.assertEqual(ca.find_codex_pid(victim), proc.pid)
             self.assertIsNone(ca.find_codex_pid(hunter))
