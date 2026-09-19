@@ -271,10 +271,13 @@ def judge(report_path, round_text, pid):
             return Verdict("failed",
                            "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
                            errors)
-        # 排在上面两条之后：那两条意味着 resume 也救不回来（换账号／新起任务），
-        # 而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
+        # 排在额度上限和写锁之后：那两条意味着 resume 也救不回来（换账号／新起
+        # 任务），而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
+        # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
+        # 留下 failed to record rollout items），那些照常进 detail，不改状态。
         if INTERRUPT_MARK in round_text:
-            return Verdict("failed", "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
+            return Verdict("interrupted",
+                           "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
@@ -564,20 +567,35 @@ def find_codex_pid(report_path):
 # 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你。
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 
-# 四个状态，按「最该放行 → 最该拦住调用方」排序，退出码和严重度都从这**一份**
-# 派生——两份清单必然漂移。
+# 五个状态回答的是同一个问题：**接下来该干什么**。
+#   success 0 不用干什么 / running 4 等 / interrupted 5 **接着 resume** /
+#   suspect 3 去看一眼 / failed 1 查原因并重跑
+# interrupted 的处置和其余四个都不同，所以它是一个状态，不是 failed 下的一条理由。
+#
+# 它推翻的是一个写明了理由的旧决定：`assertEqual(v.state, "failed")  # 产物确实
+# 没出来，状态不变`。正面回应——产物没出来是事实，但状态回答的不是「产物出来没
+# 有」，而是「接下来该干什么」，五个状态都是按这个轴分的。
+# 值得动退出码，是因为 harness 的完成通知**只搬退出码、不搬 stdout**：reason 再
+# 准确也到不了做决定的那一方，而在唯一到得了的那个通道上，interrupted 和 failed
+# 此前是同一个数字、处置却相反。实测代价：被打断的探针已烧掉 28,107 tokens，
+# 退出码 1 会让照契约做决定的 agent 从头重跑，那 28k 连同保住的上下文一起扔掉。
+#
+# 顺序即严重度（越靠后越该拦住调用方），退出码和严重度都从这**一份**派生——
+# 两份清单必然漂移。**interrupted 必须排在 running 之后**：在跑的任务会自己好，
+# 被打断的永远不会自己好——它在等人动手。status 列一批任务时若被 running 盖住，
+# 调用方会去「等」一个永远不会自己好的东西。
 # 严重度不能直接拿退出码比：suspect 的码(3)比 failed(1)大，按码取 max 会让一个
-# 真失败被一个 suspect 盖过去。
+# 真失败被一个 suspect 盖过去；码值与顺序无关。
 # 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
 # 悄悄落成 0，`codex-agent status t && deploy` 就会在任务还在跑的时候部署。
-# 2 不在表里，留给参数错误与护栏拒绝（见 USAGE_ERROR）。
+# 2 永久留给参数错误与护栏拒绝（见 USAGE_ERROR），不进这张表。
 #
 # 退出码值得这么较真，是因为它**真的会被人看见**：实测 harness 给后台任务的
 # 完成通知里直接带着退出码（exit 3 的那条通知写的就是
 # `failed with exit code 3`）。所以「run 收尾自己跑一遍判据、退出码＝判据结论」
 # 这件事等于把结论直接送到了调用方眼前——happy path 下根本不用再敲 status，
 # 而 `exit 1 ≠ 失败` 这条最反直觉的知识也就被彻底消化掉了。
-_STATES = (("success", 0), ("running", 4), ("suspect", 3), ("failed", 1))
+_STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), ("failed", 1))
 EXIT = dict(_STATES)
 _SEVERITY = [name for name, _ in _STATES]
 

@@ -66,6 +66,12 @@ ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-17T14:35:32.578919Z\x1b[0m \x1b[31mERROR\
                        "\x1b[2mcodex_core::session\x1b[0m\x1b[2m:\x1b[0m Failed to create session: "
                        "thread-store conflict: thread already has an active writer")
 ERR_FATAL = "Error: thread/resume: thread 01a0… already has an active writer (code -32600)"
+# 被 INT 打断几乎必然留下这一行。它的 target 是 codex_core::session，而那个
+# target 刻意不在良性白名单里（非打断场景下它仍该被看见），所以它会照常进 detail。
+# 注意它**不含** THREAD_LOCK_MARK／USAGE_LIMIT_MARK——那两条的处置是换账号／
+# 新起任务，和「接着 resume」相反，混用会让这条测试悄悄变成另一条的副本。
+ERR_ROLLOUT_ON_INTERRUPT = ("2026-09-19T12:00:00.000000Z ERROR codex_core::session: "
+                            "failed to record rollout items: thread 01a0… not found")
 ERR_TRACING_ROUTER = ("2026-09-18T16:49:02.380969Z ERROR codex_core::tools::router: "
                       "apply_patch failed: file changed on disk")
 ERR_TRACING_WS = ("2026-09-18T16:49:02.380969Z ERROR codex_api::endpoint::responses_websocket: "
@@ -464,9 +470,14 @@ class TestJudge(unittest.TestCase):
         """2026-09-19 真机复现：`stop t` 刚打印完「上下文保留，可 resume」，
         紧接着 `status t` 就说 `failed —— 报告缺失或为空＝没正常收尾`，退出码 1。
         两句话自相矛盾，而调用方拿不到那条唯一有用的信息。
+
+        它推翻的是一个写明了理由的旧决定（`assertEqual(v.state, "failed")  # 产物
+        确实没出来，状态不变`）。正面回应：产物没出来是事实，但状态回答的不是
+        「产物出来没有」，而是「接下来该干什么」——五个状态都是按这个轴分的，
+        而被打断的处置（接着 resume）和其余四个都不同。
         """
         v = self._judge(ca.INTERRUPT_MARK + "\n")
-        self.assertEqual(v.state, "failed")     # 状态这一维在 Task 2 才改
+        self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
 
     def test_撞额度上限比被打断更该被说出来(self):
@@ -477,6 +488,73 @@ class TestJudge(unittest.TestCase):
         # codex 被 SIGINT 打断时可能只写出半截字节
         self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
         self.assertEqual(self._judge().state, "success")
+
+
+class TestInterruptedIsItsOwnState(unittest.TestCase):
+    """被打断的轮次该做的事是**接着 resume**，和其余四态都不同，所以它是第五个状态。
+
+    只把 reason 写对是不够的：harness 的完成通知**只搬退出码，不搬 stdout**，
+    reason 字符串再准确也到不了做决定的那一方；能到的只有那个数字。而在这唯一
+    到得了的通道上，interrupted 和 failed 目前是同一个值，处置却相反。
+    损失可量化：审查的探针被打断时已烧掉 28,107 tokens，退出码 1 会让照 SKILL.md
+    契约做决定的 agent 从头重跑，那 28k 连同保住的上下文一起扔掉。
+    """
+
+    def setUp(self):
+        self.report = pathlib.Path(tempfile.mkdtemp()) / "t.md"
+
+    def test_五个状态的退出码逐个钉死(self):
+        # 绝对值。写成 EXIT["x"] == EXIT["x"] 那种自指是空测试，本仓栽过。
+        self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3,
+                                   "running": 4, "interrupted": 5})
+
+    def test_护栏拒绝的码不与任何判据结论相撞(self):
+        self.assertEqual(ca.USAGE_ERROR, 2)
+        self.assertNotIn(ca.USAGE_ERROR, set(ca.EXIT.values()))
+
+    def test_严重度顺序的绝对值(self):
+        self.assertEqual(ca._SEVERITY,
+                         ["success", "running", "interrupted", "suspect", "failed"])
+
+    def test_worse在running和interrupted之间取interrupted(self):
+        """单独钉一条——少钉一对，_SEVERITY 就能被悄悄重排。
+
+        在跑的任务会自己好，**被打断的永远不会自己好**：它在等人动手。
+        status 列一批任务时若被 running 盖住，调用方会去「等」一个
+        永远不会自己好的东西。
+        """
+        self.assertEqual(ca._worse("running", "interrupted"), "interrupted")
+        self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
+
+    def test_有打断标记且无报告时状态是interrupted(self):
+        v = ca.judge(self.report, ca.INTERRUPT_MARK + "\n", None)
+        self.assertEqual(v.state, "interrupted")
+        self.assertEqual(ca.EXIT[v.state], 5)
+        self.assertIn("resume", v.reason)
+
+    def test_额度上限和写锁仍然是failed_它们resume救不回来(self):
+        # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
+        for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
+            with self.subTest(mark=mark):
+                v = ca.judge(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n", None)
+                self.assertEqual(v.state, "failed")
+                self.assertEqual(ca.EXIT[v.state], 1)
+
+    def test_打断与错误行共存时状态取interrupted_错误行照常进detail(self):
+        """被 INT 打断几乎必然留下
+        `ERROR codex_core::session: failed to record rollout items: thread … not found`，
+        而 codex_core::session 刻意不在良性白名单里（它在非打断场景下仍该被看见）。
+        优先级：状态取 interrupted（处置是 resume），错误行照常进 detail。
+        """
+        # 前提：这条错误行不许自带额度／写锁标记，否则命中的是上面那条分支，
+        # 这条测试就悄悄变成 test_额度上限和写锁仍然是failed 的副本。
+        for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
+            self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
+                             "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
+        v = ca.judge(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n", None)
+        self.assertEqual(v.state, "interrupted")
+        self.assertEqual(len(v.detail), 1)
+        self.assertIn("codex_core::session", v.detail[0])
 
 
 class TestIsolation(_HomeSandbox):
@@ -1309,9 +1387,10 @@ class TestExitCodeContract(_HomeSandbox):
                     "Failed to create session: thread-store conflict")
 
     def test_退出码的绝对值是对外契约(self):
-        self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3, "running": 4})
+        self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3, "running": 4,
+                                   "interrupted": 5})
         self.assertEqual(ca.USAGE_ERROR, 2)
-        # 护栏拒绝必须和四个判据结论都区分得开
+        # 护栏拒绝必须和五个判据结论都区分得开
         self.assertNotIn(ca.USAGE_ERROR, ca.EXIT.values())
 
     def test_run_正常收尾退出0(self):
