@@ -5,7 +5,10 @@ description: 把有明确规划的执行类任务（照 DoD 写代码、对抗�
 
 # codex-agent
 
-把**有明确规划的执行类任务**派给 codex 干，claude 只编排。Prompt 写进 `brief.md`。
+**本 skill 一旦激活，默认就不再开 claude 子代理了**——执行类的活交给 codex，
+claude 只编排。同时开两边等于白烧 claude 的 token，那正是这个 skill 要省的东西。
+
+把**有明确规划的执行类任务**派给 codex 干。Prompt 写进 `brief.md`。
 
 命令怎么拼、隔离目录怎么建、进程怎么判活、成败怎么判、信号怎么发，全部由
 `codex_agent.py` 保证，本文件只讲**人／模型才能决定的事**。
@@ -13,7 +16,7 @@ description: 把有明确规划的执行类任务（照 DoD 写代码、对抗�
 ## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
 
 ```bash
-codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort low --account default --no-skill
+codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <档位> --account default --no-skill
 ```
 
 五个带值参数**全必填**，外加 `--skill`/`--no-skill` 二选一，没有默认值。
@@ -25,21 +28,26 @@ codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort low
 
 | 档 | 派什么 |
 |---|---|
-| `low` | 确定性执行：照 DoD 改代码、批量重构、补测试、跑闸收集结果。**大多数任务到这一档就够** |
+| `low` | 确定性执行：照 DoD 改代码、批量重构、补测试、跑闸收集结果 |
 | `medium` | 要做取舍：读一段陌生代码再改、设计一个小接口、线索明确的 debug |
 | `high` | 要权衡：跨模块改动、方案对比、对抗审查 |
 | `xhigh` | 真难：根因不明的 bug、要推翻前提的设计 |
 | `max` | 研究类：没有已知解法、判据要自己找 |
 
-**默认从 `low` 起，不够再往上。** 一上来就 `max` 又贵又慢，而 `low` 这一档本身已经不弱——
-用高档位换不来正确性，只换来更长的等待。
+**按任务性质选，别默认往低了挑。** 2026-09 查证：`gpt-6-astra` 就是这五档
+（没有 `minimal`、没有 `ultra`，那些是别的模型的）；外部建议的通用默认是 `high`，
+`xhigh`/`max` 留给架构决策和难 debug。
+
+**选低了不是省钱，是重跑一轮。** 整个档位的价差只有约 4 倍（`low` 约 $0.82/任务 →
+`max` 约 $3.26），而档位不够导致的返工要搭进一整轮的时间和 token。
+上面那张表是按「这活需要做多少判断」分的——照它挑，不要因为省而降档。
 
 ## 另外四条命令
 
 ```bash
 codex-agent status [任务名]        # 省略则列出全部
-codex-agent resume <任务名> --brief follow.md --effort low --no-skill
-codex-agent interrupt-and-resume <任务名> --brief msg.md --effort low --no-skill
+codex-agent resume <任务名> --brief follow.md --effort <档位> --no-skill
+codex-agent interrupt-and-resume <任务名> --brief msg.md --effort <档位> --no-skill
 codex-agent stop <任务名>          # 上下文保留，之后还能 resume
 ```
 
@@ -54,12 +62,13 @@ codex-agent stop <任务名>          # 上下文保留，之后还能 resume
 已做的部分**留在上下文里不会白做**（实测：打断后续跑，追问它被打断前成功建了
 哪几个文件，它自己答得出，磁盘上也确实只有那几个），但当前这一轮的收尾会没有。
 
-## 调用方仍需要知道的三件事
+## 调用方仍需要知道的四件事
 
 | 事 | 内容 |
 |---|---|
 | 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
 | brief | 只收**文件路径**，不收内联字符串。**skill 禁令那句话归工具所有，不要自己写进 brief**——写了当场拒跑 |
+| 账号 | `--account` 在 `default` / `acct2` / `acct3` 之间选（可选项由 `~/.codex-accounts/` 扫出来，加一个账号就自动认）。**撞上额度上限时换一个**——判据会直接告诉你是额度问题。每个账号有各自独立的隔离目录，互不干扰 |
 | 给它 skill | `--skill <SKILL.md 的绝对路径>`，可重复；一个都不给就 `--no-skill`。**路径写错当场拒跑**，不会再静默跑出一个「零工作量的成功」。它给的是**许可**——工具会叫 codex 动手前先读一遍，但**什么时候按它办事仍要 brief 自己说**。不要往共享目录里放东西 |
 
 codex 不靠谱 → 换 claude 子代理。
