@@ -577,7 +577,23 @@ def shared_skill_root():
 
 
 def ensure_isolation(account):
-    """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。"""
+    """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。
+
+    **它挡的是动机，不是能力**——这条必须写明白，否则下一个人会拿它去推错结论。
+    2026-09-19 实测：`collaboration.spawn_agent` 等六个工具**恒在**，
+    `--disable multi_agent` **无效**（加与不加，codex 报的工具清单逐字相同）；
+    `skip_host_skill_discovery` 也不影响服务端那 5 个 skill（两次清单逐字吻合）。
+    真正被挡住的是**主目录那一侧**：23 个 skill、2 个 MCP、3 个 hook 全部看不见。
+    服务端那 5 个与「想去编排」无关，**刻意不管**（关它们是解决不存在的问题）。
+    `~/.agents/skills` 放哨兵文件确实会被 codex 列出来——所以下面那条
+    「共享扫描根非空即拒跑」是**承重的**，不是防御性编程。
+
+    顺带记下一条被审查推翻的错理由：曾经写过「不把 skill 软链进来，是因为
+    codex 看见流程类 skill 就想去编排」——**对精选集不成立**（只软链
+    test-driven-development 时，codex 够不着 subagent-driven-development，
+    那个口子打不开）。不软链的真理由在 _add_prompt_round_args 里：可观测性 +
+    奥卡姆。留着一条错理由比没有理由更危险。
+    """
     d = isolation_home(account)
     # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
     # 写失败（log 末尾只留一行 Failed to write last message file），而判据是

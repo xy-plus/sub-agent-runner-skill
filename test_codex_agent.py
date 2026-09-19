@@ -16,11 +16,13 @@
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
     退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
-    resume 的三处 flag 差异、任务名字符集、兜底句两条路都真的加上
+    resume 的三处 flag 差异、任务名字符集、兜底句**三条路**都真的加上且**每轮派生**
+    控制字符在入口就挡住（--dir / --skill，文件系统那一层根本不管）
+    status 数据行前四列无空白、明细行有缩进——「机器切得开」是断言出来的，不是碰巧
 
 总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
 凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
-地绿。这条是四次踩出来的，四次还都是同一个病——断言的两边一起动：
+地绿。这条是五次踩出来的，五次还都是同一个病——断言的两边一起动：
 
     1. 陪练进程写成 `sleep 5 <mark>`，而 sleep 收到多余参数会立刻退出。
        进程根本不存在，于是把承重的 comm 过滤整个删掉，测试照样绿。
@@ -33,6 +35,14 @@
        不钉「这个结论是从哪段日志得出的」。后来的一轮往同一个日志追加分隔符，
        判据被致盲，而这条测试照样绿——回归锁要同时钉住**结论**和**边界**
        （见 TestRoundBoundary：正面钉拥有者的本轮文本，反面钉「猜边界当场失明」）。
+    5. `test_文档仍然保留代码替不了的那部分` 只断言「某个词出现过」。把 effort
+       分档表整张删掉，`--effort low` 那行还在，`effort` 这个词照样搜得到——
+       实测这条突变**存活**过。反向判据也要钉具体内容。
+       2026-09-20 加 `--skill`/`--no-skill` 那条时**原样又踩一次**：写成
+       `assertIn("--skill", skill)`，而把表格里那一行的两个参数整个删掉之后，
+       启动示例和「外加 --skill/--no-skill 二选一」那句里它们还在，突变存活。
+       改成钉**配对**（`--skill` 与「绝对路径」同行、`--no-skill` 与「二选一」
+       同行）并让每条事实在文档里只有一个家，两个突变才各自变红。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
     suspect:3, running:4, interrupted:130}，字段清单钉那七个名字，
@@ -40,7 +50,7 @@
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
-行数（现在 61 行）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+行数（现在 65 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
 删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以只能
 interrupt-and-resume、退出码怎么读），正好把这次重写的目的做反。
 这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
@@ -1242,6 +1252,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
         r"session id|session_id": "extract_session_id / 元数据",
         r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
+        r"不得使用任何 skill": "build_skill_guard（兜底句由 --skill/--no-skill 每轮派生）",
     }
 
     def test_没有一条代码级约束泄漏进文档(self):
@@ -1284,6 +1295,16 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
         # 在途工作损失多少，后者在 codex 里根本不可观测
         self.assertIn("值不值", skill)
+        # 白名单是**对外契约**：给哪几个 skill 是判断力，代码替不了。
+        # 钉的是**配对**，不是「这两个词出现过」——实测过那种写法是空的：
+        # 把表格里「给它 skill」整行的两个参数删掉，`--no-skill` 在启动那行的
+        # 示例命令里还在，`--skill` 在「外加 --skill/--no-skill 二选一」里也还在，
+        # 于是删掉承重内容照样全绿（这正是本文件开头第 5 条踩过的坑）。
+        # 两条各钉一个家，删任一处都红：
+        self.assertRegex(skill, r"--skill[^\n]*绝对路径",
+                         "「--skill 收的是 SKILL.md 的绝对路径」这条没了")
+        self.assertRegex(skill, r"(--no-skill[^\n]*二选一|二选一[^\n]*--no-skill)",
+                         "「--skill/--no-skill 二选一必填」这条契约没了")
 
 
 class TestTaskName(unittest.TestCase):
@@ -1525,7 +1546,7 @@ class TestInterruptAndResumeParser(_HomeSandbox):
                                    "--effort", "low", "--no-skill", bad, "x"])
 
     def test_子命令接到的确实是这条命令的实现(self):
-        # Task 5 的测试是直接拿 Namespace 调命令体的，接错了函数它测不出来。
+        # TestInterruptAndResumeOrder 是直接拿 Namespace 调命令体的，接错了函数它测不出来。
         # 这里是命令行到实现之间唯一那根线。
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low", "--no-skill"])
@@ -1849,9 +1870,10 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
 
     def _args(self, task="t", brief=None):
-        """这一类测的是**命令体的执行顺序**，不是参数表——参数表归 Task 6，
-        那里用真 parser 从命令行一路验下来。所以这里直接搭 Namespace：
-        三个字段逐个显式写出，不走默认值。
+        """这一类测的是**命令体的执行顺序**，不是参数表——参数表归
+        TestInterruptAndResumeParser 和 TestSkillWhitelistFlags，那里用真 parser
+        从命令行一路验下来。所以这里直接搭 Namespace：四个字段逐个显式写出，
+        不走默认值（skills 也照写，缺省成空就等于替调用方做了决定）。
         """
         return argparse.Namespace(
             task=task, brief=str(self.brief if brief is None else brief), effort="low",
