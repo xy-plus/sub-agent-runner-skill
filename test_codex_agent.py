@@ -344,6 +344,55 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
 
 
+class TestFixedArgs(unittest.TestCase):
+    """两条命令都必须带上的固定参数。
+
+    这些是「调用方碰不到、也就不可能漏掉」的那一批，但没人测就等于没锁：
+    审查实测把 approval_policy / project_doc_max_bytes / --disable plugins /
+    --skip-git-repo-check 逐个删掉，测试一个都不响。
+    主线和 resume **各跑一遍**——两条命令的参数集不一样，只测一条会漏。
+    """
+
+    CASES = {
+        "run": lambda: ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "brief"),
+        "resume": lambda: ca.build_resume_argv("/abs/repo", "s1", "low", "/d/reports/t.md", "brief"),
+    }
+
+    def test_批准策略永远是never_否则会停下来等人点确认(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn('approval_policy="never"', build())
+
+    def test_不读仓库的AGENTS_md_那是隔离的一部分(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn("project_doc_max_bytes=0", build())
+
+    def test_plugins被禁掉(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                argv = build()
+                self.assertEqual(argv[argv.index("--disable") + 1], "plugins")
+
+    def test_跳过git仓库检查_否则非仓库目录起不来(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn("--skip-git-repo-check", build())
+
+    def test_模型固定且就是这一个(self):
+        # 绝对值：写成 `== ca.MODEL` 的话，改掉 MODEL 两边一起动，等于没测
+        self.assertEqual(ca.MODEL, "gpt-6-astra")
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                argv = build()
+                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-astra")
+
+    def test_难度分档如实传给codex(self):
+        for name, build in self.CASES.items():
+            with self.subTest(cmd=name):
+                self.assertIn('model_reasoning_effort="low"', build())
+
+
 class TestMeta(_HomeSandbox):
     def test_元数据写入后能跨隔离目录查回来_home走返回值不是魔法键(self):
         d = ca.ensure_isolation("default")
@@ -684,6 +733,26 @@ class TestRunGuards(_HomeSandbox):
         self.assertTrue(popen.called)
         self.assertFalse((d / "reports" / "t.md").exists())
 
+    def test_dir相对路径被转成绝对_相对路径启动即崩(self):
+        # --cd 给相对路径，codex 启动即崩（log 无 banner + os error 2）。
+        # 转绝对这一步要是没了，工具就把这个坑原样传给了 codex。
+        ca.ensure_isolation("default")
+        seen = {}
+        os.chdir(self.home)
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
+             "--effort", "low", "--account", "default"])
+        def grab(*a, **k):
+            seen["argv"] = a[0]
+            return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
+
+        with _no_codex() as popen:
+            popen.side_effect = grab
+            ca.cmd_run(args)
+        cd = seen["argv"][seen["argv"].index("--cd") + 1]
+        self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
+        self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
+
     def test_开跑前三件事全在spawn之前做完(self):
         # 顺序反了每一件都会坏事：
         #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
@@ -759,6 +828,18 @@ class TestResumeGuards(_HomeSandbox):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t4"))
         self.assertIn("不在了", cm.exception.message)
+
+    def test_resume也要校验隔离不变量_spec要求每次run和resume都查(self):
+        # spec §6 写的是「每次 run/resume 都校验」。resume 这条路上不查的话，
+        # config.toml 被软链回主配置、auth.json 指错账号，全都查不出来。
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
+        (d / "config.toml").unlink()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_resume(self._args("t5"))
+        self.assertIn("软链", cm.exception.message)
 
     def test_resume开跑前也要删报告_秒死于写锁时才不会误判成功(self):
         d = ca.ensure_isolation("default")
@@ -917,6 +998,13 @@ class TestSignalSafety(unittest.TestCase):
         with mock.patch.object(ca.subprocess, "Popen") as popen:
             self._run_once(popen)
         self.assertIs(popen.call_args.kwargs["start_new_session"], True)
+
+    def test_stdin接DEVNULL_否则codex等stdin永久挂死(self):
+        # 日志只剩 "Reading additional input from stdin" + 进程 0% CPU，
+        # 而那种 log 和「还在思考」长得一模一样，判不出来。
+        with mock.patch.object(ca.subprocess, "Popen") as popen:
+            self._run_once(popen)
+        self.assertIs(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
 
     def test_包装器收到SIGTERM时向codex转发的是SIGINT(self):
         with mock.patch.object(ca.subprocess, "Popen") as popen, \
