@@ -2092,6 +2092,52 @@ class TestInterruptCodex(unittest.TestCase):
                 self.assertTrue(ca.has_interrupt_mark(self.log.read_text()),
                                 f"带上 [{cause}] 之后判据认不出这是打断了")
 
+    def test_短写也要把痕迹写完整_半截痕迹比没有痕迹更坏(self):
+        """`os.write` 的返回值不能丢：它可能**短写**（磁盘满／配额耗尽）。
+
+        `except OSError: pass` 那条降级只挡「一个字节都没写进去」，挡不住
+        「写进去一半」。复核用 RLIMIT_FSIZE 逼出过真实短写：84 字节只写进 60，
+        痕迹被截断 → has_interrupt_mark 认不出 → judge 从 interrupted(130)
+        退回 failed(1)。
+        而**半截痕迹比没有痕迹更坏**：它既骗不过 _MARK_LINE，又污染了本轮文本。
+        """
+        self.log.write_text(self.HEAD)
+        真write = os.write
+        每次只写几个字节 = []
+
+        def 短写(fd, data):
+            每次只写几个字节.append(len(data))
+            return 真write(fd, data[:7])      # 每次只吞 7 字节
+
+        with mock.patch.object(ca.os, "kill"), \
+             mock.patch.object(ca.os, "write", side_effect=短写):
+            ca.interrupt_codex(4242, self.log, "stop")
+        self.assertGreater(len(每次只写几个字节), 1,
+                           "前提不成立：一次就写完了，这条测不到短写")
+        self.assertTrue(ca.has_interrupt_mark(self.log.read_text()),
+                        "痕迹被短写截断了，判据认不出这是一轮被打断的运行")
+        self._assert_appended("短写补齐之后")
+
+    def test_写不进去时不许把信号路径挂死(self):
+        """补写循环的代价是「`os.write` 返回 0 就转不出去」——而这是在**信号
+        处理器**里跑的，挂死比留半截痕迹坏得多（codex 的 tee 循环再也收不了尾）。
+
+        真磁盘写满时内核抛 OSError（EFBIG），不返回 0；但这个前提不该靠指望，
+        所以结构上就不让它转下去。
+        """
+        self.log.write_text(self.HEAD)
+        调用次数 = []
+
+        def 永远写不进去(fd, data):
+            调用次数.append(1)
+            if len(调用次数) > 50:
+                self.fail("os.write 返回 0 时转不出去——信号路径被挂死了")
+            return 0
+
+        with mock.patch.object(ca.os, "kill"), \
+             mock.patch.object(ca.os, "write", side_effect=永远写不进去):
+            ca.interrupt_codex(4242, self.log, "stop")   # 必须能返回
+
     def test_非法cause当场被挡住_而且信号还没发出去(self):
         """docstring 里写「cause ∈ {…}」挡不住任何东西，散文不是约束。
 

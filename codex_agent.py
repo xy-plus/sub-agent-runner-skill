@@ -188,6 +188,26 @@ def interrupt_codex(pid, log_path, cause):
     try:
         fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
         try:
+            # `os.write` 可能**短写**（磁盘满／配额耗尽，这台机器根盘本来就紧张）。
+            # 返回值一丢，痕迹就被截成半截——而**半截痕迹比没有痕迹更坏**：
+            # 它既骗不过 _MARK_LINE，又污染了本轮文本。
+            # 实测 RLIMIT_FSIZE 逼出短写：84 字节只写进 60，judge 从 130 退回 1。
+            # 下面那句 `except OSError: pass` 的降级只挡「一个字节都没写进去」，
+            # 挡不住「写进去一半」，所以这里必须循环写完。
+            #
+            # **循环覆盖的是「暂时只吞了一部分」，不是「真的没地方写了」。**
+            # 磁盘真满时内核在中途抛 EFBIG，`except OSError` 接住，日志里仍然
+            # 留着半截痕迹（实测 RLIMIT_FSIZE=100：文件停在 100 字节，
+            # has_interrupt_mark 认不出）。这是**刻意不再补救**的：
+            #   · 判据结论上，半截痕迹和没有痕迹一样都落到 failed，不更坏
+            #   · 想清干净就得 ftruncate 回原长度，而 O_APPEND 下别的进程随时
+            #     可能已经追加在我们后面——截它一刀比留半行脏字严重得多
+            # 一句话：盘满时这行痕迹会丢，上下文不丢，codex 照样可 resume。
+            #
+            # `written == 0` 要跳出去：这段跑在**信号处理器**里，挂死比留半截
+            # 坏得多（codex 的 tee 循环再也收不了尾）。内核不会返回 0，
+            # 但这条前提不值得用一个死循环去赌。
+            #
             # **无条件前置换行**：整行匹配要求这行落在行首，而没有任何一方
             # 保证它——痕迹追在日志末尾，而日志末尾是 tee 最后一次 write 留下的，
             # `read1(1024)` 的边界是任意的：codex 流式输出被 INT 截在半行是
@@ -197,7 +217,12 @@ def interrupt_codex(pid, log_path, cause):
             # 可能插入。所以无条件补。多一个空行是纯外观代价，换来「这一行一定
             # 在行首」是**事实而不是指望**。
             # **不要把这个空行优化掉**——去掉它缺陷当场复活（有回归钉着）。
-            os.write(fd, ("\n" + INTERRUPT_MARK + f" [{cause}]\n").encode())
+            data = ("\n" + INTERRUPT_MARK + f" [{cause}]\n").encode()
+            while data:
+                written = os.write(fd, data)
+                if not written:          # 转不出去就走人，见上面「挂死」那段
+                    break
+                data = data[written:]
         finally:
             os.close(fd)
     except OSError:
@@ -839,7 +864,20 @@ def run_codex(kind, home, task, meta, make_argv):
         # 尾巴可能被 INT 截在半行，分隔符接上去就不在行首，_ROUND_LINE 认不出，
         # read_last_round 于是把两轮连成一轮，上一轮的错误算到这一轮头上。
         # 文件刚以 "ab" 打开，tell() 就是文件长度——**非空才补**，
-        # 新日志的开头不该有空行。
+        # 新日志的开头不该有空行（那条 startswith(ROUND_MARK) 的断言也才保得住）。
+        #
+        # 这个 tell() 是个**快照**，它正确靠的是「日志为空时不存在第二个写者」。
+        # 这条事实散在别处四个地方，所以在这里列出来——不列的话，下一个人得靠
+        # 读另外四个函数才能确认这里没问题，而「读者根据别处的事实推断」正是
+        # 本轮修掉的那三层 bug 的共同形状：
+        #   1. cmd_run 撞见同名任务还在跑就拒绝，所以不会有两个 run 共写一份日志
+        #   2. interrupt_codex 只在 os.kill **成功之后**才写，而能被 kill 的 codex
+        #      必然已经有过一轮分隔符 → 日志非空
+        #   3. cmd_stop / cmd_interrupt_and_resume 都先 find_meta，查不到就拒绝；
+        #      查得到就说明至少跑过一轮 → 日志非空
+        #   4. interrupt_codex 的写入恒以 \n 结尾，所以它留下的末尾永远在行首，
+        #      不会让后来的 tell() 看到一个「非空但不在行首」的状态
+        # 仓内不可达。哪天加了新的写者（比如并发的同名任务），先回来看这四条。
         if log.tell() > 0:
             log.write(b"\n")
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
