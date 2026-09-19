@@ -1,6 +1,7 @@
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 import codex_agent as ca
 
@@ -111,3 +112,53 @@ class TestJudge(unittest.TestCase):
         v = ca.judge(self.report, self.log, None)
         self.assertEqual(v.state, "suspect")
         self.assertEqual(len(v.detail), 1)
+
+
+class TestIsolation(unittest.TestCase):
+    def setUp(self):
+        self.home = pathlib.Path(tempfile.mkdtemp())
+        self.p = mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home))
+        self.p.start()
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("{}")
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+
+    def tearDown(self):
+        self.p.stop()
+
+    def test_账号可选项来自实际目录扫描(self):
+        self.assertEqual(ca.account_choices(), ["default", "acct2"])
+
+    def test_default账号映射到不带后缀的隔离目录(self):
+        self.assertEqual(ca.isolation_home("default"), self.home / ".codex-subagent")
+        self.assertEqual(ca.isolation_home("acct2"), self.home / ".codex-subagent-acct2")
+
+    def test_首次使用自动建齐目录与配置(self):
+        d = ca.ensure_isolation("acct2")
+        self.assertTrue((d / "skills").is_dir())
+        self.assertTrue((d / "plugins").is_dir())
+        self.assertTrue((d / "config.toml").is_file())
+        self.assertTrue((d / "auth.json").is_symlink())
+        self.assertIn("danger-full-access", (d / "config.toml").read_text())
+
+    def test_config是软链就拒跑_隔离会失效(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        with self.assertRaises(SystemExit) as cm:
+            ca.ensure_isolation("default")
+        self.assertIn("软链", str(cm.exception))
+
+    def test_已有的config不被覆盖(self):
+        d = self.home / ".codex-subagent"
+        d.mkdir()
+        (d / "config.toml").write_text('model = "自定义"\n')
+        ca.ensure_isolation("default")
+        self.assertIn("自定义", (d / "config.toml").read_text())
+
+    def test_账号没登录态就拒跑(self):
+        (self.home / ".codex-accounts" / "acct3").mkdir()
+        with self.assertRaises(SystemExit) as cm:
+            ca.ensure_isolation("acct3")
+        self.assertIn("登录", str(cm.exception))

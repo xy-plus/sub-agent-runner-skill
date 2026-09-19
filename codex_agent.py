@@ -6,6 +6,7 @@
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
 """
 import json
+import pathlib
 import re
 from typing import NamedTuple
 
@@ -92,3 +93,61 @@ def judge(report_path, log_path, pid):
     except (json.JSONDecodeError, AttributeError):
         keys = []
     return Verdict("success", "正常收尾，日志无运行时错误", keys)
+
+
+MODEL = "gpt-6-astra"
+
+# 隔离目录自己的 config，绝不软链主配置。
+# 2026 年踩过：`codex-acct` 把 config.toml 软链到主配置，一用就把 MCP、plugins、
+# hooks、memories 全带回来，隔离当场失效。账号和隔离是正交的两件事，要组合。
+CONFIG_BASELINE = f'''model = "{MODEL}"
+model_reasoning_effort = "medium"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+service_tier = "default"
+'''
+
+
+def account_choices():
+    """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。"""
+    accounts_dir = pathlib.Path.home() / ".codex-accounts"
+    extra = sorted(p.name for p in accounts_dir.iterdir() if p.is_dir()) if accounts_dir.is_dir() else []
+    return ["default"] + extra
+
+
+def isolation_home(account):
+    base = pathlib.Path.home()
+    return base / ".codex-subagent" if account == "default" else base / f".codex-subagent-{account}"
+
+
+def auth_source(account):
+    base = pathlib.Path.home()
+    return base / ".codex" / "auth.json" if account == "default" else base / ".codex-accounts" / account / "auth.json"
+
+
+def ensure_isolation(account):
+    """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。"""
+    d = isolation_home(account)
+    # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
+    # 写失败（log 末尾只留一行 Failed to write last message file），而判据是
+    # “报告没出现＝没正常收尾”——一次成功的运行会被判成失败。2026-09-13 连踩两次。
+    for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+
+    config = d / "config.toml"
+    if config.is_symlink():
+        raise SystemExit(
+            f"{config} 是软链——隔离会失效（软链主配置会把 MCP/plugins/hooks 全带回来）。\n"
+            f"请删掉它，重跑本命令会生成一份独立的安全基线配置。")
+    if not config.exists():
+        config.write_text(CONFIG_BASELINE)
+
+    src = auth_source(account)
+    if not src.exists():
+        raise SystemExit(f"账号 {account} 没有登录态（{src} 不存在）。先跑 `codex-acct login {account}`。")
+    auth = d / "auth.json"
+    if not (auth.is_symlink() and auth.resolve() == src.resolve()):
+        if auth.exists() or auth.is_symlink():
+            auth.unlink()
+        auth.symlink_to(src)
+    return d
