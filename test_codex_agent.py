@@ -35,7 +35,7 @@
        （见 TestRoundBoundary：正面钉拥有者的本轮文本，反面钉「猜边界当场失明」）。
 
     解药一律是**再钉一条绝对值断言**：退出码钉 {success:0, failed:1,
-    suspect:3, running:4, interrupted:130}，字段清单钉那六个名字，
+    suspect:3, running:4, interrupted:130}，字段清单钉那七个名字，
     边界钉「这段文本从哪来」，别只钉「两边相等」。
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
@@ -109,7 +109,7 @@ def _no_codex():
 def _full_meta(task, **over):
     """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
     meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "session_id": None, "started_at": "2026-09-19T00:00:00"}
+            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00"}
     meta.update(over)
     return meta
 
@@ -978,7 +978,7 @@ class TestMetaShape(_HomeSandbox):
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
     # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
-    FIELDS = {"task", "account", "dir", "effort", "session_id", "started_at"}
+    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at"}
 
     def test_字段清单的绝对值(self):
         self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
@@ -987,9 +987,12 @@ class TestMetaShape(_HomeSandbox):
         self.assertIn("session_id", self.FIELDS)
         # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
         self.assertNotIn("pid", self.FIELDS)
+        # 白名单是「最后一次调用给了什么」，要审计就读这个字段——它刻意不进
+        # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
+        self.assertIn("skills", self.FIELDS)
 
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low")),
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", [])),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
@@ -1003,6 +1006,47 @@ class TestMetaShape(_HomeSandbox):
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
                          set(ca.REQUIRED_META_KEYS))
+
+    def test_run落盘的skills就是命令行给的那几条(self):
+        d = ca.ensure_isolation("default")
+        skill = self.home / "tdd_SKILL.md"
+        skill.write_text("---\nname: tdd\n---\n")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--skill", str(skill)])
+        with _no_codex():
+            ca.cmd_run(args)
+        self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
+
+    def test_resume刷新skills_元数据描述的是最后一次调用(self):
+        d = ca.ensure_isolation("default")
+        first, second = self.home / "a_SKILL.md", self.home / "b_SKILL.md"
+        for q in (first, second):
+            q.write_text("---\nname: x\n---\n")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir),
+                                         skills=[str(first)]))
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "high",
+             "--skill", str(second)])
+        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+            ca.cmd_resume(args)
+        meta = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertEqual(meta["skills"], [str(second)], "skills 没跟着 effort 一起刷新")
+        self.assertEqual(meta["effort"], "high", "前提不成立：effort 本来就该刷新")
+
+    def test_interrupt_and_resume也把skills接了进去(self):
+        # _resume_round 是两条路共用的，但接线是各自的：这条命令传成 [] 或漏传，
+        # 上面那条测试一个字都测不出来。
+        d = ca.ensure_isolation("default")
+        skill = self.home / "c_SKILL.md"
+        skill.write_text("---\nname: x\n---\n")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+             "--skill", str(skill)])
+        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+            ca.cmd_interrupt_and_resume(args)
+        self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
 
 class TestPid(unittest.TestCase):

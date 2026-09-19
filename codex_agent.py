@@ -705,14 +705,18 @@ def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def new_meta(task, account, workdir, effort):
+def new_meta(task, account, workdir, effort, skills):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
 
     刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
     留着它只会诱导别人犯这个设计本来要防的错。
+
+    `skills` 记的是**最后一次调用**的白名单，与 effort／started_at 同一条原则
+    （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
+    skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
     return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "session_id": None, "started_at": _now_iso()}
+            "skills": skills, "session_id": None, "started_at": _now_iso()}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
@@ -720,7 +724,7 @@ def new_meta(task, account, workdir, effort):
 # 够不着，工具还会建议「删掉它重新 run」——会话就此丢掉。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "").keys())
+REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", []).keys())
 
 
 def _load_meta(path):
@@ -1088,7 +1092,8 @@ def cmd_run(args):
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
     verdict = judge(run_codex("run", home, args.task,
-                              new_meta(args.task, args.account, str(workdir), args.effort),
+                              new_meta(args.task, args.account, str(workdir),
+                                       args.effort, args.skills),
                               lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
     _print_verdict(args.task, verdict)
     print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
@@ -1187,9 +1192,10 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     check_can_resume(task, meta, brief_path)
     ensure_isolation(meta["account"])
     brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
-    # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
+    # 元数据描述的是**最后一次调用**：effort、白名单、开跑时间一起刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
+    meta["skills"] = skills
     meta["started_at"] = _now_iso()
     verdict = judge(run_codex(kind, home, task, meta,
                               lambda r: build_resume_argv(meta["dir"], meta["session_id"],
