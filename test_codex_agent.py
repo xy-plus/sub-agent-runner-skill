@@ -1283,6 +1283,149 @@ class TestResumeGuards(_HomeSandbox):
         self.assertFalse((d / "reports" / "t3.md").exists())
 
 
+class TestInterruptAndResumeOrder(_HomeSandbox):
+    """所有拒绝都必须发生在**发信号之前**。
+
+    INT 发出去就收不回来。先打断、再发现没 session id，那一轮白毁**且拿不回来**
+    （没 session id 就没法 resume）。这个窗口真实可达——session_id 要等 codex
+    第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起那几秒
+    正是最可能被打断的时候（刚发现 brief 写错）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "msg.md"
+        self.brief.write_text("顺便把 X 也改了")
+        self.d = ca.ensure_isolation("default")
+        ca.write_meta(self.d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        ca._log_path(self.d, "t").write_text(
+            ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
+
+    def _args(self, task="t", brief=None):
+        """这一类测的是**命令体的执行顺序**，不是参数表——参数表归 Task 6，
+        那里用真 parser 从命令行一路验下来。所以这里直接搭 Namespace：
+        三个字段逐个显式写出，不走默认值。
+        """
+        return argparse.Namespace(
+            task=task, brief=str(self.brief if brief is None else brief), effort="low")
+
+    def test_在跑时顺序是先打断再确认退出再续跑(self):
+        order = []
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex",
+                               side_effect=lambda *a: order.append("打断")), \
+             mock.patch.object(ca, "wait_for_exit",
+                               side_effect=lambda *a: order.append("等退出") or True), \
+             mock.patch.object(ca, "_resume_with",
+                               side_effect=lambda *a: order.append("续跑") or 0):
+            self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
+        self.assertEqual(order, ["打断", "等退出", "续跑"], "顺序反了就会撞写锁")
+
+    def test_没在跑时不发信号直接续跑(self):
+        # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca, "_resume_with", return_value=0):
+            self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
+        ic.assert_not_called()
+
+    def test_没有session_id时绝不发信号_那一轮白毁且拿不回来(self):
+        ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args("t2"))
+        self.assertIn("session id", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_工作目录没了时绝不发信号(self):
+        ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
+                                               dir=str(self.home / "已经删了的worktree")))
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args("t3"))
+        self.assertIn("不在了", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_brief不是文件时绝不发信号(self):
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args(brief=self.home / "根本没有这个文件.md"))
+        self.assertIn("不是文件", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_任务不存在时绝不发信号(self):
+        with mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args("no-such-task"))
+        self.assertIn("没有这个任务", cm.exception.message)
+        ic.assert_not_called()
+        k.assert_not_called()
+
+    def test_等不到退出就拒绝续跑且绝不升级信号(self):
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex"), \
+             mock.patch.object(ca, "wait_for_exit", return_value=False), \
+             mock.patch.object(ca, "_resume_with") as rw:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.cmd_interrupt_and_resume(self._args())
+        rw.assert_not_called()
+        self.assertEqual(cm.exception.code, 2)      # 绝对值：护栏拒绝就是 2
+        self.assertIn("稍后", cm.exception.message)
+
+    def test_本轮已有打断痕迹时只等不发第二发INT(self):
+        """超时的处置是「稍后重试」，而重试就是再跑一遍这条命令 → 又一次
+        interrupt_codex → 第二发 INT。很多 CLI 把第二发 Ctrl-C 当强退；
+        codex 是不是这样**完全没验过**。如果是，就可能走成不干净退出 →
+        写锁不释放 → 上下文全丢，正是本命令要防的事。
+        「永不升级信号」在单次调用内成立，被重试路径绕过去了。
+        """
+        with open(ca._log_path(self.d, "t"), "a") as f:
+            f.write(ca.INTERRUPT_MARK + "\n")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
+             mock.patch.object(ca, "_resume_with", return_value=0):
+            self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
+        ic.assert_not_called()
+        w.assert_called_once()   # 不发信号，但照样要等
+
+    def test_上一轮的打断痕迹不算数_本轮还是要发INT(self):
+        # 反面钉一道：判据必须只看**本轮**。看全文的话，一个被打断过的任务
+        # 之后永远发不出 INT 了。
+        log = ca._log_path(self.d, "t")
+        log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
+                       + ca.INTERRUPT_MARK + "\n"
+                       + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净\n")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
+             mock.patch.object(ca, "_resume_with", return_value=0):
+            ca.cmd_interrupt_and_resume(self._args())
+        ic.assert_called_once()
+
+    def test_日志分隔符写的是interrupt_and_resume_而不是resume(self):
+        # 日志要看得出这一轮是被插话打断后续上的
+        seen = {}
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "run_codex",
+                               side_effect=lambda kind, *a, **k: seen.update(kind=kind) or 0), \
+             mock.patch.object(ca, "judge", return_value=ca.Verdict("success", "ok", [])):
+            ca.cmd_interrupt_and_resume(self._args())
+        self.assertEqual(seen["kind"], "interrupt-and-resume")
+
+
 class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
     """兜底句是 SKILL.md 印给调用方的**对外承诺**，两条路都必须真的加上。
 

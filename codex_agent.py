@@ -836,37 +836,116 @@ def cmd_status(args):
     return EXIT[worst]
 
 
+def check_can_resume(task, meta, brief_path):
+    """续跑的三道闸。**只拒绝，不产生任何副作用**，所以可以在发信号之前先跑一遍。
+
+    抽成独立函数，是因为 `interrupt-and-resume` 必须把**全部**拒绝跑在发信号
+    之前：INT 发出去就收不回来，先打断、再发现没 session id，那一轮白毁**且拿
+    不回来**（没 session id 就没法 resume）。这个窗口真实可达——session_id 要等
+    codex 第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起
+    那几秒正是最可能被打断的时候（刚发现 brief 写错）。
+
+    `_resume_with` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
+    两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
+    """
+    if not meta["session_id"]:
+        reject(f"任务 {task} 没有记到 session id，无法 resume，只能新起一个任务")
+    workdir = pathlib.Path(meta["dir"])
+    if not workdir.is_dir():
+        reject(f"任务 {task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
+               f"codex 会以 os error 2 当场崩，所以这里直接拒。")
+    if not pathlib.Path(brief_path).expanduser().is_file():
+        reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
+
+
+def _resume_with(kind, home, meta, task, brief_path, effort):
+    """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
+
+    它只管「已经确定停了之后怎么续」，**不判断该不该停**——`cmd_resume` 在调它
+    之前拒绝还在跑的任务，`cmd_interrupt_and_resume` 在调它之前把它打断并确认
+    退出。这条边界是刻意的：要不要停是调用方的判断，怎么续是工具的事。
+
+    `kind` 进日志分隔符，所以日志里看得出这一轮是被插话打断后续上的。
+    判据用 `run_codex` 回传的偏移，**不用 read_last_round**：本轮的拥有者手里
+    有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动修掉的整类 bug）。
+    """
+    check_can_resume(task, meta, brief_path)
+    ensure_isolation(meta["account"])
+    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text())
+    # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
+    # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
+    meta["effort"] = effort
+    meta["started_at"] = _now_iso()
+    start_offset = run_codex(kind, home, task, meta,
+                             lambda r: build_resume_argv(meta["dir"], meta["session_id"],
+                                                         effort, r, brief))
+    verdict = judge(_report_path(home, task),
+                    read_round(_log_path(home, task), start_offset), None)
+    _print_verdict(task, verdict)
+    return EXIT[verdict.state]
+
+
 def cmd_resume(args):
     home, meta = find_meta(args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    report = _report_path(home, args.task)
     # resume 之前必须确认真的退出了：对还在跑的会话 resume，报的错和 SIGTERM 锁死
     # 一模一样（thread-store conflict），而处置完全相反——一个该等，一个该弃。
-    if find_codex_pid(str(report)) is not None:
-        reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。等它结束，或先 stop。")
-    if not meta["session_id"]:
-        reject(f"任务 {args.task} 没有记到 session id，无法 resume，只能新起一个任务")
-    workdir = pathlib.Path(meta["dir"])
-    if not workdir.is_dir():
-        reject(f"任务 {args.task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
-               f"codex 会以 os error 2 当场崩，所以这里直接拒。")
-    brief_file = pathlib.Path(args.brief).expanduser()
-    if not brief_file.is_file():
-        reject(f"--brief {args.brief} 不是文件")
+    # 本命令刻意**不替调用方打断**：要打断请用 interrupt-and-resume，
+    # 那个名字把代价写在脸上。
+    if find_codex_pid(str(_report_path(home, args.task))) is not None:
+        reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
+               f"等它结束，或用 `codex-agent interrupt-and-resume {args.task}`。")
+    return _resume_with("resume", home, meta, args.task, args.brief, args.effort)
 
-    ensure_isolation(meta["account"])
-    brief = prepend_skill_guard(brief_file.read_text())
-    # 元数据描述的是**最后一次调用**：effort 和开跑时间都刷新。
-    # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
-    meta["effort"] = args.effort
-    meta["started_at"] = _now_iso()
-    start_offset = run_codex("resume", home, args.task, meta,
-                             lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                         args.effort, r, brief))
-    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
-    _print_verdict(args.task, verdict)
-    return EXIT[verdict.state]
+
+def cmd_interrupt_and_resume(args):
+    """打断当前轮 + 确认它真的退出了 + 用新消息续跑，三件事不可分。
+
+    它唯一独有的收益：**护栏只会拒绝，不会替你等。** `cmd_resume` 早就拦住了
+    「对还在跑的会话 resume」（实测 stop 之后 0.164 秒 resume，拿到的是干净的
+    exit 2 拒绝，不是 thread-store conflict），但调用方拿到 exit 2 之后得自己
+    写重试循环——间隔多少、上界多少、超时了怎么办，全是软约定，每个调用方现编
+    一遍，编错了没人告诉他。收走这个循环就是这条命令存在的全部理由。
+
+    **要不要为此打断，仍然是调用方的判断**：那要知道「这条信息值多少」和「在途
+    工作损失多少」，后者在 codex 里根本不可观测。命令名把代价写在脸上，
+    工具不替谁做这个决定。
+
+    下面的顺序是**硬约束**，不是排版顺序：四道闸全部走完才允许发信号。
+    """
+    # ────── 四道闸 ──────
+    home, meta = find_meta(args.task)                      # 1. 任务存在？
+    if meta is None:
+        reject(f"没有这个任务：{args.task}")
+    check_can_resume(args.task, meta, args.brief)          # 2/3/4. session id / 目录 / brief
+    # ────── 以上全过，才允许动手 ──────
+
+    report, log = _report_path(home, args.task), _log_path(home, args.task)
+    pid = find_codex_pid(str(report))
+    if pid is None:
+        # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
+        # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
+        print(f"[codex-agent] {args.task} 本来就没在跑，直接续跑")
+    else:
+        # 超时的处置是「稍后重试」，而重试就是再跑一遍这条命令——不加这道判断，
+        # 重试就会发出**第二发 INT**。很多 CLI 把第二发 Ctrl-C 当强退，codex
+        # 是不是这样完全没验过；如果是，就走成不干净退出 → 写锁不释放 →
+        # 上下文全丢，正是本命令要防的事。
+        # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
+        # 恰好就是最后一轮的事。
+        if INTERRUPT_MARK in read_last_round(log):
+            print(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
+                  f"只等它退出，不再发第二发 INT")
+        else:
+            interrupt_codex(pid, log)
+            print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
+        if not wait_for_exit(str(report), INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
+            reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
+                   f"还在收尾。稍后重跑这条命令即可——它不会再发第二发 INT。"
+                   f"绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。")
+        print("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
+    return _resume_with("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
 
 
 def cmd_stop(args):
