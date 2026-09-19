@@ -13,6 +13,8 @@
     进程反查的三道过滤（uid / comm / argv 元素精确相等）
     开跑前三件事的顺序（落元数据、清旧报告、写轮次分隔符，全在 spawn 之前）
     防陈旧报告（clear_report）、日志追加而非覆盖、**轮次边界由拥有者记下而非推测**
+    **一轮开跑前先确认上一轮安静了**——写日志的（writer，自报身份）和占会话的
+        （codex，现场反查）都停了才走；只看任一边都实测踩过（早放行／孤儿 codex）
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
     退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
@@ -1266,9 +1268,19 @@ class TestMetaShape(_HomeSandbox):
         # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
         self.assertIn("skills", self.FIELDS)
 
+    def test_构造器自己就把写者记进去(self):
+        """`new_meta` 产出的是「一份此刻开始的任务的完整记录」，**写者是谁是这份
+        记录的一部分**，所以它自己去拿，不收参数。
+
+        收参数的那版实测是**不可观测**的：`run_codex` 在 write_meta 前会盖一次，
+        传垃圾进来落盘的仍是真身份——于是「传反了」（两个都是 str，starttime
+        长得就像个 pid）永远没人发现。不可观测的参数就是给误用留的口子。
+        """
+        meta = ca.new_meta("t", "default", "/abs/x", "low", ())
+        self.assertEqual((meta["writer_pid"], meta["writer_start"]), ca._writer_identity())
+
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", (),
-                                         *ca._writer_identity())),
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
@@ -1289,9 +1301,8 @@ class TestMetaShape(_HomeSandbox):
         # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
         for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                ca.new_meta("t", "default", "/abs/x", "low", bad, *ca._writer_identity())
-        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", (),
-                                     *ca._writer_identity())["skills"], ())
+                ca.new_meta("t", "default", "/abs/x", "low", bad)
+        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
 
     def test_run落盘的writer身份就是本进程(self):
         d = ca.ensure_isolation("default")
@@ -1622,6 +1633,37 @@ class TestPid(unittest.TestCase):
             proc.kill()
             proc.wait()
 
+    def test_僵尸codex不进候选集_argv过滤是承重的不是保险(self):
+        """僵尸的 `cmdline` 是**空的**（2026-09-20 实测），所以 argv 元素比对
+        自然把它挡在外面——`comm` 那时还是 `codex`，`pid_alive` 也还说「活着」。
+
+        这条行为**没有名字**，却是「僵尸 codex 不该再收信号」的全部依靠，
+        也是 `_wait_previous_round_ends` 里「只看 codex 会早放行」那句话的成因。
+        补这条测试就是给它一个家。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = _fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        pathlib.Path(mark).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_argv(self, proc, mark)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid, "前提不成立：活着时就找不到它")
+            proc.kill()
+            _wait_zombie(self, proc.pid)
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/comm").read_bytes().strip(), b"codex",
+                             "前提不成立：僵尸的 comm 变了，那挡住它的就不是 argv 过滤")
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"",
+                             "前提不成立：僵尸的 cmdline 不空，这条测的就不是那件事")
+            self.assertTrue(ca.pid_alive(proc.pid),
+                            "前提不成立：裸 PID 对僵尸都说「死了」，那它本来就挡得住")
+            self.assertIsNone(ca.find_codex_pid(mark))
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_任务名里的点不是通配符_不许命中别的任务(self):
         """任务名里的 `.` 绝不能被当成通配符。
 
@@ -1664,7 +1706,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
     OWNED_BY_CODE = {
         r"--cd": "build_run_argv / build_resume_argv",
         r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
-        r"/proc|pgrep|pkill": "find_codex_pid",
+        r"/proc|pgrep|pkill": "find_codex_pid / _previous_writer_alive",
         r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
         r"mkdir -p": "ensure_isolation",
         r"--color": "build_run_argv（resume 不认它）",
@@ -3221,6 +3263,18 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
         self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
         self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
 
+    def test_没有元数据但codex还在跑_不许放行(self):
+        """「文件不在就直接放行」是**多余且开洞**的。
+
+        多余：`_previous_writer_alive` 自己第一件事就是查文件在不在。
+        开洞：那条早返回**连 codex 那一半都跳过了**——元数据被手删（或换账号
+        重跑把它挪走）而上一轮的 codex 还占着会话时，当场放行，新一轮直接撞上
+        它的写锁。两个条件一个都不能少，没有「文件不在」这条例外。
+        """
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242):
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
     def test_两个都停了才放行(self):
         self._写盘()
         self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立：默认身份居然还在写")
@@ -3457,9 +3511,10 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
     于是包装器的话会一直躺在缓冲区里，到退出才随 atexit 一起吐出来——排在
     codex 整轮输出**之后**。
 
-    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 和
-    `已确认退出` 两句都排在 codex 整轮输出的最后面，而它们要说的恰恰是
-    「此刻正在发生什么」。wait_for_exit 卡住的那 60 秒里，屏幕上更是一个字都没有。
+    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 排在 codex
+    整轮输出的最后面，而它要说的恰恰是「此刻正在发生什么」。最吃这条的是
+    `_wait_previous_round_ends` 那句「上一轮还在收尾，最多等 N 秒」——它排在本轮
+    分隔符之前，日志里此刻什么都没有，屏幕再不出声，那就是个彻头彻尾的静默挂起。
 
     **钉的是裸 `print`，不是某个助手函数。** 收一个 `_say()` 不解决问题，只是把
     软约定上移一层：每个调用点都得记得用它，新加一行裸 print 照样静默错序——
