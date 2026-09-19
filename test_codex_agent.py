@@ -1636,6 +1636,37 @@ class TestExitCodeContract(_HomeSandbox):
     def test_resume_报告在但有未分类错误退出3(self):
         self.assertEqual(self._resume("干完了", self.UNCLASSIFIED), 3)
 
+    def _interrupt_and_resume(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
+        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_interrupt_and_resume(args)
+
+    # 新命令的四态绝对值。run 和 resume 在这里都有 0/1/3，新命令此前一条都没有——
+    # TestInterruptAndResumeOrder 全把 _resume_round 或 judge mock 掉了，
+    # 接线错了它们一个都测不出来。这四条走**真实** _resume_round。
+    def test_interrupt_and_resume_正常收尾退出0(self):
+        self.assertEqual(self._interrupt_and_resume("干完了"), 0)
+
+    def test_interrupt_and_resume_没留下报告退出1(self):
+        self.assertEqual(self._interrupt_and_resume(None), 1)
+
+    def test_interrupt_and_resume_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._interrupt_and_resume("干完了", self.UNCLASSIFIED), 3)
+
+    def test_interrupt_and_resume_续跑那轮又被打断退出5(self):
+        self.assertEqual(self._interrupt_and_resume(None, ca.INTERRUPT_MARK), 5)
+
+    def test_run_被打断退出5(self):
+        # 整个改动 A 的验收点：harness 的完成通知只搬退出码，于是 5 这个数字是
+        # 「接着 resume，别重跑」唯一到得了调用方的形式。
+        # 2026-09-19 真机复现过这条通知：`[exited with code 5]`。
+        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 5)
+
     def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t"))
