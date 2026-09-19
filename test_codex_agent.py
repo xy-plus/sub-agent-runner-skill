@@ -1643,6 +1643,45 @@ class TestInterruptCodex(unittest.TestCase):
             self.assertIsNone(ca.interrupt_codex(4242, self.log))
 
 
+class TestWaitForExit(unittest.TestCase):
+    def test_进程退出后返回True(self):
+        with mock.patch.object(ca, "find_codex_pid", side_effect=[4242, 4242, None]):
+            self.assertTrue(ca.wait_for_exit("/x/reports/t.md", 5, 0.01))
+
+    def test_一直不退则超时返回False(self):
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242):
+            self.assertFalse(ca.wait_for_exit("/x/reports/t.md", 0.05, 0.01))
+
+    def test_等待期间绝不发任何信号(self):
+        # 超时的正确处置是告诉调用方稍后再来，不是加大火力。
+        # 升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca.os, "kill") as k:
+            ca.wait_for_exit("/x/reports/t.md", 0.05, 0.01)
+        k.assert_not_called()
+
+    def test_超时是上界不是等待时长(self):
+        # 一确认退出就立刻往下走，不把 timeout 睡满
+        started = time.monotonic()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            self.assertTrue(ca.wait_for_exit("/x/reports/t.md", 30, 0.01))
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_两个常量的绝对值_并且余量对得上实测(self):
+        """常量必须是**模块级**的，不是函数默认参数：测试要把它压到 0.3 秒，
+        而仓库规范本来就不许用默认缺省值。
+
+        60 秒的实测锚点（codex 0.154.0、effort low、sleep 工具调用执行中被打断）：
+        INT → PID 消失分别是 1.854 秒和 0.964 秒。这里把「30~60 倍余量」这个
+        **理由**也钉住——只钉 60 这个数字的话，下一个人把实测值改了没人拦。
+        """
+        self.assertEqual(ca.INTERRUPT_EXIT_TIMEOUT, 60)
+        self.assertEqual(ca.INTERRUPT_POLL_INTERVAL, 0.2)
+        self.assertGreaterEqual(ca.INTERRUPT_EXIT_TIMEOUT, 1.854 * 30)
+        self.assertLess(ca.INTERRUPT_POLL_INTERVAL, 0.964,
+                        "轮询间隔比实测最快的退出还长，等于把等待时间凭空拉长一轮")
+
+
 class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
     """三条打断路径必须都留痕。漏一条就会出现「stop 说可 resume、status 说 failed」。
 

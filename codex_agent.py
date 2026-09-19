@@ -14,6 +14,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from typing import NamedTuple
 
 # 护栏拒绝走独立退出码。裸 `raise SystemExit("人话")` 的退出码是 1，和
@@ -580,6 +581,43 @@ def find_codex_pid(report_path):
         if pid_alive(pid):
             return pid
     return None
+
+
+# 打断之后最多等它收尾这么久。**是上界不是等待时长**——一确认退出就立刻往下走。
+# 实测锚点（2026-09-19，codex 0.154.0，effort low，sleep 工具调用执行中被打断）：
+# INT → PID 消失分别是 **1.854 秒**和 **0.964 秒**。60 秒是 30~60 倍余量——
+# 够大到不会误杀正常收尾，够小到卡住时调用方不会被无限期挂着。
+# 两个数字写在这里，是因为没有它们下一个人会随手改这个 60。
+#
+# 必须是**模块级常量**而不是函数默认参数：测试要把它 patch 成 0.3 秒；
+# 也正合仓库规范「不要默认缺省值」——调用方每次都显式传，不可能漏。
+INTERRUPT_EXIT_TIMEOUT = 60
+INTERRUPT_POLL_INTERVAL = 0.2
+
+
+def wait_for_exit(report_path, timeout, poll_interval):
+    """轮询真实 PID 直到它真的退出。返回是否在 timeout 之内退出。
+
+    这是 `interrupt-and-resume` **唯一独有的收益**：护栏只会拒绝，不会替你等。
+    `cmd_resume` 早就拦住了「对还在跑的会话 resume」（实测 stop 之后 0.164 秒
+    resume，拿到的是干净的 exit 2 拒绝，不是 thread-store conflict），但调用方
+    拿到 exit 2 之后得自己写重试循环——间隔多少、上界多少、超时了怎么办，全是
+    软约定，每个调用方现编一遍，编错了没人告诉他。把这个循环收进来就是它存在
+    的全部理由。
+
+    存活判据与 `status` 同一套（扫 /proc + argv 元素精确比对 + comm + 同用户），
+    不另起一份——两份判据必然漂移。
+
+    **只轮询，不发任何信号。** 超时的正确处置是让调用方稍后再来，不是加大火力：
+    升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if find_codex_pid(report_path) is None:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
 
 
 # codex 全集是 minimal/low/medium/high/xhigh/max/ultra，这五档是**刻意裁剪**。
