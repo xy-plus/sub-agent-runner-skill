@@ -180,14 +180,16 @@ class TestRoundBoundary(unittest.TestCase):
         self.assertIn("正常收尾", ca.read_round(log, 0))
 ```
 
-再新增 `TestRoundBoundaryWiring`（3 条，钉**接线**——光把函数写对、调用点接错，bug 原样还在）：
+再新增 `TestRoundBoundaryWiring`（4 条，钉**接线**——光把函数写对、调用点接错，bug 原样还在）：
 
 ```python
 class TestRoundBoundaryWiring(_HomeSandbox):
     """谁用哪种边界，是这次改动的全部意义所在。
 
     单元层的 read_round 全绿、cmd_run 却接成 read_last_round —— bug 一点没修。
-    所以三条路各钉一条：run 用自己的偏移、resume 用自己的偏移、status 用最后一轮。
+    所以四条各钉一条：run 和 resume 用 run_codex 回传的本轮文本、status 不在跑时
+    用最后一轮、status **还在跑时根本不读日志**（judge 那一支用不到它，而 status
+    是轮询用的热路径）。
     """
 
     def setUp(self):
@@ -496,7 +498,7 @@ def judge(report_path, round_text):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**123 个全绿**。加减账：116 − 3（`TestCurrentRound` 整类删掉）− 15（`TestJudge` 整类重写）＋ 4（`TestReadLastRound`）＋ 12（新 `TestJudge`）＋ 6（`TestRoundBoundary`）＋ 3（`TestRoundBoundaryWiring`）＝ 123。
+Expected: PASS，**124 个全绿**。加减账：116 − 3（`TestCurrentRound` 整类删掉）− 15（`TestJudge` 整类重写）＋ 4（`TestReadLastRound`）＋ 12（新 `TestJudge`）＋ 6（`TestRoundBoundary`）＋ 4（`TestRoundBoundaryWiring`）＝ 124。
 
 - [ ] **Step 5: 突变复验**（三个突变逐个做，做完还原）
 
@@ -669,7 +671,7 @@ _STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), (
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**131 个全绿**（123 + `TestInterruptedIsItsOwnState` 7 条 + `test_run_被打断退出5` 1 条）。
+Expected: PASS，**132 个全绿**（124 + `TestInterruptedIsItsOwnState` 7 条 + `test_run_被打断退出5` 1 条）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -886,7 +888,7 @@ def interrupt_codex(pid, log_path):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**136 个全绿**（131 + 新 5：`TestInterruptCodex` 4 条 + `TestEveryInterruptPathLeavesAMark` 1 条。初稿写的 135／新 4 漏了后者，Task 4~7 的预期数跟着一路偏小 1，已全部改正）。
+Expected: PASS，**137 个全绿**（132 + 新 5：`TestInterruptCodex` 4 条 + `TestEveryInterruptPathLeavesAMark` 1 条。初稿写的 135／新 4 漏了后者，Task 4~7 的预期数跟着一路偏小 1，已全部改正）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -1019,7 +1021,7 @@ def wait_for_exit(report_path, timeout, poll_interval):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**141 个全绿**（136 + 新 5）。
+Expected: PASS，**142 个全绿**（137 + 新 5）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -1384,7 +1386,7 @@ def cmd_interrupt_and_resume(args):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**151 个全绿**（141 + 新 10）。此刻 `codex-agent interrupt-and-resume`
+Expected: PASS，**152 个全绿**（142 + 新 10）。此刻 `codex-agent interrupt-and-resume`
 在命令行上**还是不存在的**，这是对的：Task 6 才把它接上去。
 
 - [ ] **Step 5: 突变复验**（三个，全部是承重约束）
@@ -1554,7 +1556,7 @@ Expected: FAIL，`argument cmd: invalid choice: 'interrupt-and-resume'`
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**160 个全绿**（151 + `TestInterruptAndResumeParser` 5 条 + `TestExitCodeContract` 里新命令的四态绝对值 4 条）。
+Expected: PASS，**161 个全绿**（152 + `TestInterruptAndResumeParser` 5 条 + `TestExitCodeContract` 里新命令的四态绝对值 4 条）。
 
 - [ ] **Step 5: 自检 CLI**
 
@@ -1675,7 +1677,7 @@ Expected: PASS。新写的文字里不许出现 `OWNED_BY_CODE` 的任何一个�
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**160 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
+Expected: PASS，**161 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
 
 - [ ] **Step 6: 突变复验**
 
