@@ -221,6 +221,30 @@ class TestJudge(unittest.TestCase):
     def test_清报告对还没有报告的任务也成立(self):
         ca.clear_report(self.report)   # 不存在也不许抛
 
+    def test_被INT打断的那轮_reason要告诉人可以resume(self):
+        """2026-09-19 真机复现：`stop t` 刚打印完「上下文保留，可 resume」，
+        紧接着 `status t` 就说 `failed —— 报告缺失或为空＝没正常收尾`，退出码 1。
+        两句话自相矛盾，而调用方拿不到那条唯一有用的信息：这轮是被打断的，
+        接着 resume 就行，不用重跑。
+        """
+        self.log.write_text(ca.INTERRUPT_MARK + "\n")
+        v = ca.judge(self.report, self.log, None)
+        self.assertEqual(v.state, "failed")     # 产物确实没出来，状态不变
+        self.assertIn("resume", v.reason)       # 但处置得说清楚
+
+    def test_打断标记不能被当成新一轮的开始(self):
+        # 它要是以 ROUND_MARK 开头，current_round 就会从它这里切开，
+        # 本轮前面的错误全被丢掉——判据当场失明
+        log = (ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
+               + ERR_FATAL + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(len(ca.runtime_error_lines(log)), 1)
+        self.assertFalse(ca.INTERRUPT_MARK.startswith(ca.ROUND_MARK))
+
+    def test_撞额度上限比被打断更该被说出来(self):
+        # 两个都命中时，「换账号」比「可以 resume」更接近真正的处置
+        self.log.write_text(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertIn("额度", ca.judge(self.report, self.log, None).reason)
+
     def test_非UTF8的报告不许把判据打崩(self):
         # codex 被 SIGINT 打断时可能只写出半截字节
         self.report.write_bytes(b"\xff\xfe" + "干完了".encode())
@@ -1147,6 +1171,13 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
             self.assertTrue(mark.exists(), "假 codex 什么信号都没收到——转发没装上")
             self.assertEqual(mark.read_text(), "SIGINT",
                              "codex 收到了 INT 以外的信号——会话会被永久锁死")
+            # 转发的同时要在日志里留下痕迹，否则下一个读判据的人只会看到
+            # 「报告缺失＝没正常收尾」，而正确处置其实是 resume
+            deadline = time.time() + 5
+            log = d / "logs" / "t.log"
+            while time.time() < deadline and ca.INTERRUPT_MARK not in log.read_text():
+                time.sleep(0.05)
+            self.assertIn(ca.INTERRUPT_MARK, log.read_text())
         finally:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)

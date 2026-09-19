@@ -58,9 +58,39 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀
 
+# 本轮被信号打断时留在日志里的痕迹。**刻意不以 ROUND_MARK 开头**：
+# current_round 是按 ROUND_MARK 往回切的，这行要是同前缀，它就会被当成新一轮
+# 的开始，本轮前面的错误全被丢掉，判据当场失明。
+INTERRUPT_MARK = "----- codex-agent 本轮被 INT 打断，上下文保留，可 resume -----"
+
 
 def round_separator(kind, task, when_iso):
     return f"{ROUND_MARK}{kind} {task} {when_iso} ====="
+
+
+def note_interrupt(log_path):
+    """在信号处理器里往日志追一行打断标记。
+
+    为什么值得为它多写一个函数：把 TERM 转成 INT 保住了上下文，却没人告诉
+    下一个读判据的人「这轮是被打断的」。2026-09-19 真机复现过——`stop t` 刚
+    打印完「上下文保留，可 resume」，紧接着 `status t` 就说
+    `failed —— 报告缺失或为空＝没正常收尾`，退出码 1，两句话自相矛盾。
+    前台误跑被 2 分钟超时杀掉时同理：那正是「run_in_background 编不进去」
+    那条缓解措施最需要说话的时刻。
+
+    用 O_APPEND + 单次 os.write：小写入在 Linux 上是原子的，不会和 tee 循环
+    的缓冲写互相撕裂；也刻意不碰那个已经打开的文件对象——信号处理器随时可能
+    插在它的 write 中间。
+    写不进去就算了：保住 codex 的上下文优先于留痕。
+    """
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+        try:
+            os.write(fd, (INTERRUPT_MARK + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 # codex 自己的错误有三种锚定形式（2026-09-19 对 106 份真实日志全量统计），
@@ -186,6 +216,10 @@ def judge(report_path, log_path, pid):
             return Verdict("failed",
                            "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
                            errors)
+        # 排在上面两条之后：那两条意味着 resume 也救不回来（换账号／新起任务），
+        # 而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
+        if INTERRUPT_MARK in round_text:
+            return Verdict("failed", "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
@@ -544,6 +578,9 @@ def run_codex(kind, home, task, meta, make_argv):
                 proc.send_signal(signal.SIGINT)
             except ProcessLookupError:
                 pass
+            # 顺手留痕，让之后跑判据的人（包括另一个进程里的 status）知道
+            # 这轮是被打断的，处置是 resume 而不是重跑。
+            note_interrupt(_log_path(home, task))
 
         # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
         # 而不还原，等于把本函数的副作用留给了整个进程的余生。
