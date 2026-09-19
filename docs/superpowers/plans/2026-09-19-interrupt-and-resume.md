@@ -4,7 +4,7 @@
 
 **Goal:** 交付 spec 里拆开的两块。**改动 A**：让判据说真话——轮次边界记下来而不是推测（A-1）、打断必留痕（A-2）、`interrupted` 是第五态（A-3）。**改动 B**：新命令 `interrupt-and-resume`，把「打断 → 确认退出 → 续跑」焊成一个动作，把那个每个调用方都要现编一遍的等待循环收进代码。B 依赖 A（没有 A，B 续跑之后被打断的那一轮仍会发出假的 `failed` 通知），所以一起交付，但分开验收。
 
-**Architecture:** A-1 是一次结构性重构，先做：`run_codex` 回传本轮起始偏移，新增 `read_round(log_path, start_offset)` 与 `read_last_round(log_path)`，`judge` 改收**已经划好的本轮文本**而不是日志路径；本轮的拥有者（`cmd_run` / `_resume_with`）用自己的偏移，外部观察者（`cmd_status`）用最后一轮。A-2 把 `note_interrupt` 并进 `interrupt_codex`，三条打断路径全部走它。A-3 给 `_STATES` 加第五态。B 在此之上加 `wait_for_exit`、`check_can_resume`、`_resume_with` 和 `cmd_interrupt_and_resume`。
+**Architecture:** A-1 是一次结构性重构，先做：`run_codex` 回传本轮起始偏移，新增 `read_round(log_path, start_offset)` 与 `read_last_round(log_path)`，`judge` 改收**已经划好的本轮文本**而不是日志路径；本轮的拥有者（`cmd_run` / `_resume_round`）用自己的偏移，外部观察者（`cmd_status`）用最后一轮。A-2 把 `note_interrupt` 并进 `interrupt_codex`，三条打断路径全部走它。A-3 给 `_STATES` 加第五态。B 在此之上加 `wait_for_exit`、`check_can_resume`、`_resume_round` 和 `cmd_interrupt_and_resume`。
 
 **Tech Stack:** Python 3 stdlib（`codex_agent.py` 新增 `import time`）。零第三方依赖。
 
@@ -32,11 +32,11 @@
 **Interfaces:**
 - Consumes: 现有 `ROUND_MARK`、`strip_ansi`、`round_separator`、`_log_path`
 - Produces（确切签名）：
-  - `run_codex(kind: str, home: pathlib.Path, task: str, meta: dict, make_argv) -> int` —— 返回本轮在日志中的**字节**起始偏移
+  - `run_codex(kind: str, home: pathlib.Path, task: str, meta: dict, make_argv) -> str` —— 返回**本轮的日志文本**（内部用字节偏移切，但偏移不外泄）
   - `read_round(log_path: pathlib.Path, start_offset: int) -> str` —— `[start_offset, 之后第一个 ROUND_MARK)`
   - `read_last_round(log_path: pathlib.Path) -> str` —— 外部观察者用
   - `runtime_error_lines(round_text: str) -> list` —— 不再自己切轮次，只认传进来的这一段
-  - `judge(report_path: pathlib.Path, round_text: str, pid) -> Verdict`
+  - `judge(report_path: pathlib.Path, round_text: str) -> Verdict` —— **不收 pid**，存活与否由调用方判
 - Removes: `current_round(log_text)` —— 它的两个职责分别由 `read_round` / `read_last_round` 接走，留着就是第二个家
 
 - [ ] **Step 1: 写失败的测试**
@@ -98,70 +98,71 @@ class TestRoundBoundary(unittest.TestCase):
             (d / sub).mkdir()
         return d
 
-    def test_run_codex返回的偏移正好是本轮内容的起点(self):
+    def _spawn_writing(self, log, *chunks):
+        """假 codex：spawn 的那一刻往日志追加这几段。
+
+        **必须在 run_codex 返回之前写**——本轮文本的快照就在它返回那一刻取走。
+        写在 with 块外面的话，右端截断那条根本测不到。
+        """
+        def spawn(*a, **k):
+            with open(log, "ab") as f:
+                for c in chunks:
+                    f.write(c.encode())
+            return mock.DEFAULT
+        return spawn
+
+    def test_run_codex回传的就是本轮的日志文本_上一轮的不带进来(self):
         d = self._home()
         log = ca._log_path(d, "t")
         log.write_bytes("上一轮的尾巴\n".encode())
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        # 绝对值：此刻日志 = 上一轮 + 本轮分隔符行，偏移必须正好落在文件末尾
-        self.assertEqual(offset, len(log.read_bytes()))
-        with open(log, "ab") as f:
-            f.write("本轮的内容\n".encode())
-        self.assertEqual(ca.read_round(log, offset), "本轮的内容\n")
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(text, "本轮的内容\n")
 
     def test_后来的轮次不能把前一轮判瞎_这是P1的回归锁(self):
         d = self._home()
         log, report = ca._log_path(d, "t"), ca._report_path(d, "t")
-
-        def spawn(*a, **k):
-            # 本轮被 INT 打断：只留下打断标记，没有报告
-            with open(log, "ab") as f:
-                f.write((ca.INTERRUPT_MARK + "\n").encode())
-            return mock.DEFAULT
-
+        # 本轮被 INT 打断（只留痕、没有报告），而判据还没跑，interrupt-and-resume
+        # 已经把下一轮的分隔符追了进去——实测两者落在同一秒内。
         with _no_codex() as popen:
-            popen.side_effect = spawn
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            popen.side_effect = self._spawn_writing(
+                log, ca.INTERRUPT_MARK + "\n",
+                ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
+                + "\n干净收尾\n")
+            round_text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
 
-        # 判据还没跑，interrupt-and-resume 已经把下一轮的分隔符追了进去（实测同一秒内）
-        with open(log, "ab") as f:
-            f.write((ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
-                     + "\n干净收尾\n").encode())
-
-        self.assertIn("resume", ca.judge(report, ca.read_round(log, offset), None).reason)
+        self.assertEqual(ca.judge(report, round_text).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotIn("resume", ca.judge(report, ca.read_last_round(log), None).reason)
+        self.assertNotEqual(ca.judge(report, ca.read_last_round(log)).state, "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
         d = self._home()
         log = ca._log_path(d, "t")
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        with open(log, "ab") as f:
-            f.write("本轮干净\n".encode())
-            f.write((ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n").encode())
-            f.write((ERR_FATAL + "\n").encode())
-        text = ca.read_round(log, offset)
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(
+                log, "本轮干净\n",
+                ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n",
+                ERR_FATAL + "\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual(text, "本轮干净\n")
         self.assertEqual(ca.runtime_error_lines(text), [],
                          "后一轮的致命错误被算到了前一轮头上")
 
-    def test_偏移是字节数不是字符数_中文日志不许错位(self):
+    def test_切的是字节不是字符_中文日志不许错位(self):
         # 日志里全是中文：brief 原文、codex 的中文输出。按字符切会整体错位，
         # 切出来的开头是半截字节——判据读到的「本轮」根本不是本轮。
         d = self._home()
         log = ca._log_path(d, "t")
         log.write_bytes("上一轮写了很多中文内容\n".encode())
-        with _no_codex():
-            offset = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        with open(log, "ab") as f:
-            f.write("本轮第一行\n".encode())
+        with _no_codex() as popen:
+            popen.side_effect = self._spawn_writing(log, "本轮第一行\n")
+            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         raw = log.read_bytes()
         self.assertNotEqual(len(raw), len(raw.decode()),
                             "前提不成立：日志里没有多字节字符，这条测不到错位")
-        self.assertEqual(ca.read_round(log, offset), "本轮第一行\n")
+        self.assertEqual(text, "本轮第一行\n")
 
     def test_日志还没有时读回空串_不许抛(self):
         d = self._home()
@@ -235,6 +236,11 @@ class TestRoundBoundaryWiring(_HomeSandbox):
     def test_status用的是最后一轮_外部观察者只能看最后一轮(self):
         # 反向钉一道：status 没有偏移可用，它只能看最后一轮，也**只该**看最后一轮。
         # 接成别的（比如从头扫）会把上一轮的打断标记算到这一轮头上。
+        #
+        # spy 的是 judge 而不是 _print_verdict：cmd_status 自己排版、根本不走
+        # _print_verdict（patch 它只会拿到空列表，seen[0] 当场 IndexError，
+        # 是条连跑都跑不起来的空测试）。spy 还顺手把**传给判据的那段文本**也
+        # 钉住了——这正是「谁用哪种边界」的本体。
         d = ca.ensure_isolation("default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
@@ -242,15 +248,24 @@ class TestRoundBoundaryWiring(_HomeSandbox):
                        + ca.INTERRUPT_MARK + "\n"
                        + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净收尾\n")
         args = ca.build_parser().parse_args(["status", "t"])
-        seen = []
+        seen, texts, real_judge = [], [], ca.judge
+
+        def spy(report_path, round_text):
+            texts.append(round_text)
+            v = real_judge(report_path, round_text)
+            seen.append(v)
+            return v
+
         with mock.patch.object(ca, "find_codex_pid", return_value=None), \
-             mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.append(v)):
+             mock.patch.object(ca, "judge", side_effect=spy):
             ca.cmd_status(args)
+        self.assertEqual(len(seen), 1, "前提不成立：judge 没被调到，这条什么都没测")
+        self.assertNotIn(ca.INTERRUPT_MARK, texts[0], "status 把上一轮的打断标记读进了本轮")
         self.assertNotIn("resume", seen[0].reason,
                          "上一轮的打断标记被算到了这一轮头上")
 ```
 
-最后把 `TestJudge` 改成收文本（15 条 → 13 条：`test_打断标记不能被当成新一轮的开始` 挪去 `TestReadLastRound`、`test_非UTF8的日志不许把判据打崩` 挪去 `TestRoundBoundary`）：
+最后把 `TestJudge` 改成收文本（15 条 → 12 条：`test_打断标记不能被当成新一轮的开始` 挪去 `TestReadLastRound`、`test_非UTF8的日志不许把判据打崩` 挪去 `TestRoundBoundary`、`test_PID还活着就是running_不看产物` 随 `pid` 参数一起删——它要保的那件事已由 `TestExitCodeContract` 里 **status 还在跑退出 4** 那条端到端钉着，更硬）：
 
 ```python
 class TestJudge(unittest.TestCase):
@@ -260,11 +275,8 @@ class TestJudge(unittest.TestCase):
         self.d = pathlib.Path(tempfile.mkdtemp())
         self.report = self.d / "t.md"
 
-    def _judge(self, round_text="正常收尾\n", pid=None):
-        return ca.judge(self.report, round_text, pid)
-
-    def test_PID还活着就是running_不看产物(self):
-        self.assertEqual(self._judge(pid=12345).state, "running")
+    def _judge(self, round_text="正常收尾\n"):
+        return ca.judge(self.report, round_text)
 
     def test_报告缺失是failed(self):
         v = self._judge()
@@ -378,7 +390,7 @@ def read_last_round(log_path):
     """最后一轮。**只给外部观察者用**（`status`）——它手里没有偏移。
 
     这是它诚实的上界：它本来就只能看到最后一轮，说不出更多。
-    本轮的拥有者（cmd_run / _resume_with）绝不该用它：拥有者手里有事实，
+    本轮的拥有者（cmd_run / _resume_round）绝不该用它：拥有者手里有事实，
     用这个就等于把事实换回推测。
     """
     if not log_path.exists():
@@ -412,20 +424,23 @@ def runtime_error_lines(round_text):
 `judge` 换签名：
 
 ```python
-def judge(report_path, round_text, pid):
-    """唯一的成败判据。`run`／`resume` 收尾和 `status` 共用它，避免两处判据漂移。
+def judge(report_path, round_text):
+    """唯一的成败判据——**只看产物和本轮日志**。`run`／`resume` 收尾和 `status`
+    共用它，避免两处判据漂移。
 
     **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
-    不一样：本轮的拥有者手里有 `run_codex` 回传的起始偏移（`read_round`），
-    外部观察者只能看最后一轮（`read_last_round`）。把这件事塞回 judge 里，
-    就只剩「猜」一种做法，而那正是这次要修掉的整类 bug。
+    不一样：本轮的拥有者拿 `run_codex` 回传的本轮文本，外部观察者只能看最后一轮
+    （`read_last_round`）。把这件事塞回 judge 里，就只剩「猜」一种做法，
+    而那正是这次要修掉的整类 bug。
+
+    **存活与否不在这里判**：那是进程的事，不是产物的事。三个调用点里有两个
+    恒传 `None`，说明它本来就属于剩下那一家（status）。留着它还要白烧：
+    `pid is not None` 那一支根本不碰 round_text，读出来直接丢，而 status 的
+    热路径恰恰是轮询**还在跑**的任务。
 
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
     """
-    if pid is not None:
-        return Verdict("running", f"pid={pid} 存活", [])
-
     errors = runtime_error_lines(round_text)
     # errors="replace"：codex 被 SIGINT 打断时可能只写出半截字节，
     # 裸 read_text 会 UnicodeDecodeError 把判据整个打崩。
@@ -439,41 +454,49 @@ def judge(report_path, round_text, pid):
     with open(_log_path(home, task), "ab") as log:
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
-        # 本轮的起点：分隔符之后的第一个字节。**这是本函数唯一的返回值。**
+        # 本轮的起点：分隔符之后的第一个字节。
         # O_APPEND 下每次 write 都是「原子地跳到末尾再写」，所以即使别的进程
-        # 正往同一个日志追加（note 留痕、另一轮的分隔符），这个位置依然精确
+        # 正往同一个日志追加（留痕、另一轮的分隔符），这个位置依然精确
         # 指向**我们自己刚写的那行之后**——拥有者的边界由此成为事实而非推测。
         start_offset = log.tell()
 
         ...   # spawn、信号转发、tee 全部原样不动
 
-    return start_offset
+    # 回传**本轮的日志文本**而不是偏移。偏移是可以被悄悄丢掉的：调用方忘了接，
+    # 唯一还能拿到本轮文本的路就是 read_last_round——正好是这次要修的那个 bug。
+    # 文本丢不掉，它就是 judge 的参数。（铁律 2：把约束做进签名本身。）
+    # 副带好处：快照在 codex 退出那一刻取走，比「调用方稍后自己读」窗口更小。
+    return read_round(_log_path(home, task), start_offset)
 ```
 
 三个调用点：
 
 ```python
 # cmd_run 里
-    start_offset = run_codex("run", home, args.task,
-                             new_meta(args.task, args.account, str(workdir), args.effort),
-                             lambda r: build_run_argv(str(workdir), args.effort, r, brief))
-    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
+    verdict = judge(report,
+                    run_codex("run", home, args.task,
+                              new_meta(args.task, args.account, str(workdir), args.effort),
+                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
 
-# cmd_resume 里（Task 5 会把这段抽成 _resume_with，这里先就地改）
-    start_offset = run_codex("resume", home, args.task, meta,
-                             lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                         args.effort, r, brief))
-    verdict = judge(report, read_round(_log_path(home, args.task), start_offset), None)
+# cmd_resume 里（Task 5 会把这段抽成 _resume_round，这里先就地改）
+    verdict = judge(report,
+                    run_codex("resume", home, args.task, meta,
+                              lambda r: build_resume_argv(meta["dir"], meta["session_id"],
+                                                          args.effort, r, brief)))
 
-# cmd_status 里：外部观察者，用最后一轮
-        verdict = judge(report, read_last_round(log), find_codex_pid(str(report)))
+# cmd_status 里：外部观察者。还在跑就根本不读日志——判据在那一支用不到它，
+# 而 status 是轮询用的热路径（实测单份日志 0.83MB 读+strip_ansi 约 10ms、
+# 8.3MB 约 100ms，列全部任务还要乘任务数）。
+        pid = find_codex_pid(report)
+        verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
+                   else judge(report, read_last_round(log)))
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**124 个全绿**。加减账：116 − 3（`TestCurrentRound` 整类删掉）− 15（`TestJudge` 整类重写）＋ 4（`TestReadLastRound`）＋ 13（新 `TestJudge`）＋ 6（`TestRoundBoundary`）＋ 3（`TestRoundBoundaryWiring`）＝ 124。
+Expected: PASS，**123 个全绿**。加减账：116 − 3（`TestCurrentRound` 整类删掉）− 15（`TestJudge` 整类重写）＋ 4（`TestReadLastRound`）＋ 12（新 `TestJudge`）＋ 6（`TestRoundBoundary`）＋ 3（`TestRoundBoundaryWiring`）＝ 123。
 
 - [ ] **Step 5: 突变复验**（三个突变逐个做，做完还原）
 
@@ -505,7 +528,7 @@ read_last_round 拿它唯一看得见的东西。judge 不再自己猜边界。
 **Files:** Modify `codex_agent.py` · Modify `test_codex_agent.py`
 
 **Interfaces:**
-- Consumes: Task 1 的 `judge(report_path, round_text, pid)`
+- Consumes: Task 1 的 `judge(report_path, round_text)`
 - Produces:
   - `_STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), ("failed", 1))`
   - `EXIT["interrupted"] == 5`；`_SEVERITY == ["success", "running", "interrupted", "suspect", "failed"]`
@@ -570,10 +593,28 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         而 codex_core::session 刻意不在良性白名单里（它在非打断场景下仍该被看见）。
         优先级：状态取 interrupted（处置是 resume），错误行照常进 detail。
         """
-        v = ca.judge(self.report, ERR_TRACING_UNKNOWN + "\n" + ca.INTERRUPT_MARK + "\n", None)
+        # 前提：这条错误行不许自带额度／写锁标记，否则命中的是上面那条分支，
+        # 这条测试就悄悄变成 test_额度上限和写锁仍然是failed 的副本。
+        # （ERR_TRACING_UNKNOWN 正是这样：它自带 "already has an active writer"。
+        #   改用 codex 被 INT 打断时真正留下的那一行。）
+        for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
+            self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
+                             "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
+        v = ca.judge(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])
+```
+
+再往 `TestExitCodeContract` 里补一条——**第五态唯一的端到端绝对值**。
+上面那些都在判据层，而退出码是**唯一到得了调用方的通道**，
+「判据说 interrupted」和「进程真的 exit 5」是两件事：
+
+```python
+    def test_run_被打断退出5(self):
+        # 这条是整个改动 A 的验收点：harness 的完成通知只搬退出码，
+        # 于是 5 这个数字是「接着 resume，别重跑」唯一到得了调用方的形式。
+        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 5)
 ```
 
 同时改两条已有的：
@@ -628,7 +669,7 @@ _STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), (
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**131 个全绿**（124 + 新 7）。
+Expected: PASS，**131 个全绿**（123 + `TestInterruptedIsItsOwnState` 7 条 + `test_run_被打断退出5` 1 条）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -682,11 +723,22 @@ class TestInterruptCodex(unittest.TestCase):
         self.log.write_text("")
 
     def test_发出信号的同时一定留痕(self):
+        # 陪练进程必须**先报到再挨打**：Popen 一返回就发 INT 的话，信号会落在
+        # 解释器启动途中，那时 SIGINT 还是 SIG_DFL，进程直接被信号打死
+        # （returncode -2），于是「它是被 INT 正常收走的」这条断言测的其实是
+        # 一场竞态而不是本函数。
+        ready = self.log.parent / "陪练就位.txt"
         proc = subprocess.Popen([sys.executable, "-c",
-                                 "import signal,sys,time\n"
+                                 "import pathlib,signal,sys,time\n"
                                  "signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))\n"
-                                 "time.sleep(30)"])
+                                 "pathlib.Path(sys.argv[1]).write_text('ok')\n"
+                                 "time.sleep(30)", str(ready)])
         try:
+            deadline = time.time() + 10
+            while time.time() < deadline and not ready.exists():
+                time.sleep(0.01)
+            self.assertTrue(ready.exists(),
+                            "前提不成立：陪练进程没装上 INT 处理器，这条测不到「被 INT 正常收走」")
             self.assertTrue(ca.pid_alive(proc.pid), "前提不成立：陪练进程没起来")
             ca.interrupt_codex(proc.pid, self.log)
             self.assertIn(ca.INTERRUPT_MARK, self.log.read_text())
@@ -834,7 +886,7 @@ def interrupt_codex(pid, log_path):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**135 个全绿**（131 + 新 4）。
+Expected: PASS，**136 个全绿**（131 + 新 5：`TestInterruptCodex` 4 条 + `TestEveryInterruptPathLeavesAMark` 1 条。初稿写的 135／新 4 漏了后者，Task 4~7 的预期数跟着一路偏小 1，已全部改正）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -867,7 +919,9 @@ git commit -m "fix: 发 INT 与留痕焊成 interrupt_codex，note_interrupt 并
 **Interfaces:**
 - Consumes: `find_codex_pid`
 - Produces:
-  - `wait_for_exit(report_path: str, timeout: float, poll_interval: float) -> bool`
+  - `wait_for_exit(report_path: pathlib.Path, timeout: float, poll_interval: float) -> bool`
+    —— 顺手把 `find_codex_pid` 里的 `needle` 改成 `str(report_path).encode()`，
+    全模块就只剩「传 Path」一种传法（`wait_for_exit` 本来是唯一收 `str` 的那个）
   - 模块级常量 `INTERRUPT_EXIT_TIMEOUT = 60`、`INTERRUPT_POLL_INTERVAL = 0.2`
 - `codex_agent.py` 文件头加 `import time`
 
@@ -965,7 +1019,7 @@ def wait_for_exit(report_path, timeout, poll_interval):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**140 个全绿**（135 + 新 5）。
+Expected: PASS，**141 个全绿**（136 + 新 5）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -991,7 +1045,7 @@ git commit -m "feat: wait_for_exit 只轮询不加火力，超时也绝不升级
 
 ---
 
-### Task 5: 四道闸 + `_resume_with` + `cmd_interrupt_and_resume`
+### Task 5: 四道闸 + `_resume_round` + `cmd_interrupt_and_resume`
 
 **Files:** Modify `codex_agent.py` · Modify `test_codex_agent.py`
 
@@ -999,9 +1053,9 @@ git commit -m "feat: wait_for_exit 只轮询不加火力，超时也绝不升级
 - Consumes: Task 1~4 的全部产出、`find_meta`、`ensure_isolation`、`run_codex`、`judge`、`read_round`、`read_last_round`
 - Produces（确切签名）：
   - `check_can_resume(task: str, meta: dict, brief_path: str) -> None` —— 只拒绝，无副作用
-  - `_resume_with(kind: str, home: pathlib.Path, meta: dict, task: str, brief_path: str, effort: str) -> int`
+  - `_resume_round(kind: str, home: pathlib.Path, meta: dict, task: str, brief_path: str, effort: str) -> int`
   - `cmd_interrupt_and_resume(args) -> int`
-- `cmd_resume` 收缩成「查任务 + 拦住还在跑的 + 调 `_resume_with`」
+- `cmd_resume` 收缩成「查任务 + 拦住还在跑的 + 调 `_resume_round`」
 
 **执行顺序是硬约束**（不是排版顺序）：
 
@@ -1057,7 +1111,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
                                side_effect=lambda *a: order.append("打断")), \
              mock.patch.object(ca, "wait_for_exit",
                                side_effect=lambda *a: order.append("等退出") or True), \
-             mock.patch.object(ca, "_resume_with",
+             mock.patch.object(ca, "_resume_round",
                                side_effect=lambda *a: order.append("续跑") or 0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         self.assertEqual(order, ["打断", "等退出", "续跑"], "顺序反了就会撞写锁")
@@ -1066,13 +1120,19 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
         with mock.patch.object(ca, "find_codex_pid", return_value=None), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
 
     def test_没有session_id时绝不发信号_那一轮白毁且拿不回来(self):
+        # 三条闸测试都要 mock 掉 wait_for_exit。不 mock 的话，闸序一坏就会掉进
+        # 真的 60 秒等待：实测「把 check_can_resume 挪到发信号之后」这个突变要
+        # **180.3 秒**才红，而且报的是「收到 INT 后 60 秒还没退出」——
+        # 闸序坏了，报的却是等超时，指错了方向。mock 之后同一突变 2.1 秒变红，
+        # 报错是 `Expected 'interrupt_codex' to not have been called`，正中要害。
         ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1085,6 +1145,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
                                                dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1095,6 +1156,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_brief不是文件时绝不发信号(self):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -1116,7 +1178,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex"), \
              mock.patch.object(ca, "wait_for_exit", return_value=False), \
-             mock.patch.object(ca, "_resume_with") as rw:
+             mock.patch.object(ca, "_resume_round") as rw:
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_interrupt_and_resume(self._args())
         rw.assert_not_called()
@@ -1134,11 +1196,20 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             f.write(ca.INTERRUPT_MARK + "\n")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
+             mock.patch.object(ca.os, "kill") as k, \
              mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
-        w.assert_called_once()   # 不发信号，但照样要等
+        # 「零调用」要钉 os.kill 本身，不能只钉 interrupt_codex：在那一支里加一行
+        # 裸 os.kill 也会红，但红的原因是 ProcessLookupError（4242 不存在）这个
+        # **巧合**——pid 若恰好存在就是绿的。同一个类里四条闸测试都钉了 os.kill。
+        k.assert_not_called()
+        # **等的是谁**也要钉死：把报告路径传成日志路径，find_codex_pid 永远找不到，
+        # wait_for_exit 秒返 True、等待整个被跳过、直接续跑撞写锁——而这正是
+        # 这条命令唯一独有的收益。实跑确认：不钉参数的话这个突变 156 条全绿。
+        w.assert_called_once_with(ca._report_path(self.d, "t"),
+                                  ca.INTERRUPT_EXIT_TIMEOUT, ca.INTERRUPT_POLL_INTERVAL)
 
     def test_上一轮的打断痕迹不算数_本轮还是要发INT(self):
         # 反面钉一道：判据必须只看**本轮**。看全文的话，一个被打断过的任务
@@ -1150,9 +1221,12 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca, "wait_for_exit", return_value=True), \
-             mock.patch.object(ca, "_resume_with", return_value=0):
+             mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
-        ic.assert_called_once()
+        # **打给谁**也要钉：传成报告路径的话，痕迹写进**报告** → judge 看到非空
+        # 报告、无错误行 → 判 success、退出码 0。不是崩，是静默说谎。
+        # 实跑确认：只钉 assert_called_once() 的话这个突变 156 条全绿。
+        ic.assert_called_once_with(4242, ca._log_path(self.d, "t"))
 
     def test_日志分隔符写的是interrupt_and_resume_而不是resume(self):
         # 日志要看得出这一轮是被插话打断后续上的
@@ -1169,7 +1243,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
 Run: `python3 -m unittest test_codex_agent.TestInterruptAndResumeOrder -v`
 
-Expected: FAIL，`AttributeError: <module 'codex_agent'> does not have the attribute '_resume_with'`
+Expected: FAIL，`AttributeError: <module 'codex_agent'> does not have the attribute '_resume_round'`
 （`mock.patch.object` 在属性不存在时当场抛；`interrupt_codex` / `wait_for_exit` 已经在 Task 3/4 就位了）
 
 - [ ] **Step 3: 最小实现**
@@ -1186,7 +1260,7 @@ def check_can_resume(task, meta, brief_path):
     codex 第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起
     那几秒正是最可能被打断的时候（刚发现 brief 写错）。
 
-    `_resume_with` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
+    `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
     """
     if not meta["session_id"]:
@@ -1202,8 +1276,11 @@ def check_can_resume(task, meta, brief_path):
 再把 `cmd_resume` 的后半段抽成两条路共用的续跑动作：
 
 ```python
-def _resume_with(kind, home, meta, task, brief_path, effort):
+def _resume_round(kind, home, meta, task, brief_path, effort):
     """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
+
+    名字是 `_resume_round` 不是 `_resume_with`：`with` 没说清 with 什么，
+    而它做的事就是「跑完一轮续跑」（仓库规范第 2 条：不清晰的词换成清晰的词组）。
 
     它只管「已经确定停了之后怎么续」，**不判断该不该停**——`cmd_resume` 在调它
     之前拒绝还在跑的任务，`cmd_interrupt_and_resume` 在调它之前把它打断并确认
@@ -1237,10 +1314,15 @@ def cmd_resume(args):
     # 一模一样（thread-store conflict），而处置完全相反——一个该等，一个该弃。
     # 本命令刻意**不替调用方打断**：要打断请用 interrupt-and-resume，
     # 那个名字把代价写在脸上。
+    #
+    # 这里 PID 检查排在 check_can_resume **之前**，和 interrupt-and-resume 的闸序
+    # 相反，是**刻意的**：「拒绝必须在动手之前」约束的是**副作用**，而这条路一个
+    # 副作用都没有，闸序只决定人先看到哪句话——「还在跑」是这里最可操作的那句。
+    # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
     if find_codex_pid(str(_report_path(home, args.task))) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `codex-agent interrupt-and-resume {args.task}`。")
-    return _resume_with("resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("resume", home, meta, args.task, args.brief, args.effort)
 
 
 def cmd_interrupt_and_resume(args):
@@ -1265,8 +1347,11 @@ def cmd_interrupt_and_resume(args):
     check_can_resume(args.task, meta, args.brief)          # 2/3/4. session id / 目录 / brief
     # ────── 以上全过，才允许动手 ──────
 
+    # meta 在这里读一次就一直用到 _resume_round。wait_for_exit 之后它已经旧于
+    # 磁盘上那份（被打断的那一轮会在收尾时写元数据），但无损：差异字段只有
+    # session_id（为空早被上面的闸拒了）和 effort／started_at（本来就要刷新）。
     report, log = _report_path(home, args.task), _log_path(home, args.task)
-    pid = find_codex_pid(str(report))
+    pid = find_codex_pid(report)
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
@@ -1284,12 +1369,12 @@ def cmd_interrupt_and_resume(args):
         else:
             interrupt_codex(pid, log)
             print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
-        if not wait_for_exit(str(report), INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
+        if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
             reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
                    f"还在收尾。稍后重跑这条命令即可——它不会再发第二发 INT。"
                    f"绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。")
         print("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
-    return _resume_with("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
+    return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief, args.effort)
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -1299,7 +1384,7 @@ def cmd_interrupt_and_resume(args):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**150 个全绿**（140 + 新 10）。此刻 `codex-agent interrupt-and-resume`
+Expected: PASS，**151 个全绿**（141 + 新 10）。此刻 `codex-agent interrupt-and-resume`
 在命令行上**还是不存在的**，这是对的：Task 6 才把它接上去。
 
 - [ ] **Step 5: 突变复验**（三个，全部是承重约束）
@@ -1310,6 +1395,17 @@ Expected: PASS，**150 个全绿**（140 + 新 10）。此刻 `codex-agent inter
    → `test_本轮已有打断痕迹时只等不发第二发INT` 必须红
 3. 把 `read_last_round(log)` 换成 `log.read_text()`（看全文而不是本轮）
    → `test_上一轮的打断痕迹不算数_本轮还是要发INT` 必须红
+4. `interrupt_codex(pid, log)` 改成 `interrupt_codex(pid, report)`（留痕写错文件）
+   → `test_上一轮的打断痕迹不算数_本轮还是要发INT` 必须红。
+   **这条曾经三条全绿**：痕迹写进报告 → judge 看到非空报告、无错误行 → 判
+   `success`、退出码 **0**。不是崩，是静默说谎。
+5. `wait_for_exit(report, …)` 改成 `wait_for_exit(log, …)`（等错了文件）
+   → `test_本轮已有打断痕迹时只等不发第二发INT` 必须红。
+   **这条也曾经全绿**：`find_codex_pid` 永远找不到 → 秒返 True →
+   等待整个被跳过 → 直接续跑撞写锁，而等待正是这条命令唯一独有的收益。
+6. 在「只等不发」那一支里加一行裸 `os.kill(pid, signal.SIGINT)`
+   → `test_本轮已有打断痕迹时只等不发第二发INT` 必须红，**且红在 `k.assert_not_called()`**，
+   不是红在 ProcessLookupError（那是 4242 不存在的巧合，pid 恰好存在就绿了）
 
 还原。
 
@@ -1392,6 +1488,34 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "low"))
 ```
 
+再往 `TestExitCodeContract` 补新命令的**四态绝对值**。`run` 和 `resume` 在那里都有
+0/1/3，新命令一条都没有——Task 5 的测试全把 `_resume_round` 或 `judge` mock 掉了，
+接线错了它们一个都测不出来。这四条走**真实** `_resume_round`：
+
+```python
+    def _interrupt_and_resume(self, report_text, log_extra=""):
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low"])
+        # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
+        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+            popen.side_effect = self._spawner(d, report_text, log_extra)
+            return ca.cmd_interrupt_and_resume(args)
+
+    def test_interrupt_and_resume_正常收尾退出0(self):
+        self.assertEqual(self._interrupt_and_resume("干完了"), 0)
+
+    def test_interrupt_and_resume_没留下报告退出1(self):
+        self.assertEqual(self._interrupt_and_resume(None), 1)
+
+    def test_interrupt_and_resume_报告在但有未分类错误退出3(self):
+        self.assertEqual(self._interrupt_and_resume("干完了", self.UNCLASSIFIED), 3)
+
+    def test_interrupt_and_resume_续跑那轮又被打断退出5(self):
+        self.assertEqual(self._interrupt_and_resume(None, ca.INTERRUPT_MARK), 5)
+```
+
 同时改一条已有的：`TestParser.test_任务名校验挂在四个子命令上_结构上绕不过` 改名成
 `test_任务名校验挂在五个子命令上_结构上绕不过`，argv 列表里加一条：
 
@@ -1415,8 +1539,11 @@ Expected: FAIL，`argument cmd: invalid choice: 'interrupt-and-resume'`
     # 仓库规范第 2 条说「不清晰的单词全部换为简单清晰的词组」——
     # `interject` 是个不清晰的单词，`interrupt-and-resume` 是个清晰的词组。
     # 参数表与 resume 逐条一致：同一个工具里 prompt 只有一种传法。
-    j = sub.add_parser("interrupt-and-resume",
-                       help="打断当前轮并用新消息续跑（会截断当前轮，上下文保留）")
+    # help= 进父 parser 的子命令列表，description= 进它自己的 --help。
+    # 只传 help= 的话，`interrupt-and-resume --help` 里看不到「会截断当前轮」——
+    # 而那正是这条命令最该被看见的代价。
+    _IAR_HELP = "打断当前轮并用新消息续跑（会截断当前轮，上下文保留）"
+    j = sub.add_parser("interrupt-and-resume", help=_IAR_HELP, description=_IAR_HELP)
     j.add_argument("task", type=task_name)
     j.add_argument("--brief", required=True)
     j.add_argument("--effort", required=True, choices=EFFORTS)
@@ -1427,7 +1554,7 @@ Expected: FAIL，`argument cmd: invalid choice: 'interrupt-and-resume'`
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**155 个全绿**（150 + 新 5）。
+Expected: PASS，**160 个全绿**（151 + `TestInterruptAndResumeParser` 5 条 + `TestExitCodeContract` 里新命令的四态绝对值 4 条）。
 
 - [ ] **Step 5: 自检 CLI**
 
@@ -1436,7 +1563,10 @@ python3 codex_agent.py --help
 python3 codex_agent.py interrupt-and-resume --help
 ```
 
-Expected: 五条子命令都在；新命令的 help 里看得到「会截断当前轮」；它只有 `task` / `--brief` / `--effort` 三个参数。
+Expected: 五条子命令都在；`codex-agent --help` 的子命令列表里看得到「会截断当前轮」；
+新命令自己的 `--help` 里也看得到——**这要 `description=`**，`help=` 只出现在父 parser 的
+列表里（实测 `interrupt-and-resume --help | grep -c 截断` = 0）。两个都传。
+它只有 `task` / `--brief` / `--effort` 三个参数。
 
 - [ ] **Step 6: 突变复验**
 
@@ -1545,7 +1675,7 @@ Expected: PASS。新写的文字里不许出现 `OWNED_BY_CODE` 的任何一个�
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**155 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
+Expected: PASS，**160 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
 
 - [ ] **Step 6: 突变复验**
 
@@ -1613,7 +1743,8 @@ CA=/home/xy/.claude/skills/codex-agent/.worktree/interrupt-and-resume/codex_agen
 D=/tmp/iar-smoke-2026-09-19
 # 前提：任务确实在跑，否则这一步测的不是打断。两条都不成立就停下来，别往下走。
 python3 $CA status iar-smoke-2026-09-19          # 必须是 running
-test -f $D/s1.txt && echo "前提成立：s1.txt 已经建出来了"
+# `&& echo` 拦不住人：前提不成立只是不打印、脚本照跑，后面测的就不是「打断」了
+test -f $D/s1.txt || { echo "前提不成立：s1.txt 还没建出来，这一步测不到打断"; exit 1; }
 
 cat > $D/msg.md <<'EOF'
 改一下：不用等 sleep 了，直接创建 s3.txt，内容为一行：interrupted ok
