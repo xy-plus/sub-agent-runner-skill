@@ -793,7 +793,7 @@ harness 的完成通知只搬退出码不搬 stdout，reason 写得再准也到�
 
 **Interfaces:**
 - Consumes: `INTERRUPT_MARK`、`_log_path`
-- Produces: `interrupt_codex(pid: int, log_path: pathlib.Path) -> None` —— **刻意不给返回值**
+- Produces: `interrupt_codex(pid: int, log_path: pathlib.Path, cause: str) -> None` —— **刻意不给返回值**；`cause` 必填，追在痕迹行尾（见 spec「痕迹要带来源」）
 - Removes: `note_interrupt(log_path)` —— 整个并进 `interrupt_codex`，它的知识（O_APPEND 原子写、写不进去就算了）一并搬进去
 - 三个调用点全部走它：`forward_as_sigint`、`cmd_stop`、Task 5 的新命令
 
@@ -914,7 +914,7 @@ Expected: FAIL，`AttributeError: module 'codex_agent' has no attribute 'interru
 把 `note_interrupt` 整个删掉，换成：
 
 ```python
-def interrupt_codex(pid, log_path):
+def interrupt_codex(pid, log_path, cause):
     """发 SIGINT 并在日志留痕。这两件事必须一起发生，所以焊在同一个函数里。
 
     拆开放就会漏，而且**已经漏过一次**：`cmd_stop` 用裸 `os.kill` 打给 codex，
@@ -969,7 +969,7 @@ def interrupt_codex(pid, log_path):
 `cmd_stop` 里那一行：
 
 ```python
-    interrupt_codex(pid, _log_path(home, args.task))
+    interrupt_codex(pid, _log_path(home, args.task), "stop")
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
 ```
 
@@ -1460,7 +1460,7 @@ def cmd_interrupt_and_resume(args):
             print(f"[codex-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
-            interrupt_codex(pid, log)
+            interrupt_codex(pid, log, "interrupt-and-resume")
             print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
         if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
             reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
@@ -1488,7 +1488,7 @@ Expected: PASS，**153 个全绿**（143 + 新 10）。此刻 `codex-agent inter
    → `test_本轮已有打断痕迹时只等不发第二发INT` 必须红
 3. 把 `read_last_round(log)` 换成 `log.read_text()`（看全文而不是本轮）
    → `test_上一轮的打断痕迹不算数_本轮还是要发INT` 必须红
-4. `interrupt_codex(pid, log)` 改成 `interrupt_codex(pid, report)`（留痕写错文件）
+4. `interrupt_codex(pid, log, …)` 改成 `interrupt_codex(pid, report, …)`（留痕写错文件）
    → `test_上一轮的打断痕迹不算数_本轮还是要发INT` 必须红。
    **这条曾经三条全绿**：痕迹写进报告 → judge 看到非空报告、无错误行 → 判
    `success`、退出码 **0**。不是崩，是静默说谎。

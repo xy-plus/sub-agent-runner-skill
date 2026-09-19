@@ -103,7 +103,7 @@ stop 打印:  已向 rv-probe1 (pid=602545) 发 SIGINT，上下文保留，可 r
 ```
 
 ```
-interrupt_codex(pid, log_path) -> None
+interrupt_codex(pid, log_path, cause) -> None
 ```
 
 先发信号，成功了再留痕（没送出去就不该留假痕迹）。三条路全部走它：
