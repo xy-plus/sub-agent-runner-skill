@@ -115,6 +115,12 @@ def skill_path(value):
         raise argparse.ArgumentTypeError(
             f"--skill {value} 存在但当前用户读不了（权限 {oct(q.stat().st_mode)[-3:]}）。"
             f"codex 的 cat 会退 1，而那个失败判据看不见。")
+    # **刻意返回原样，不 resolve()**：这个串会逐字进 brief 的白名单行，而
+    # 「codex 到底读没读」就是靠日志里那一行 `cat <这个串>` 看出来的
+    # （见 _add_prompt_round_args 的可观测性论证）。规范化之后，命令行上写的、
+    # brief 里印的、日志里出现的就成了三个不同的串，人和 grep 都对不上。
+    # 代价是审计侧：`/a/../a/SKILL.md` 和 `/a/SKILL.md` 在元数据里记成两个值。
+    # 接受这个代价——元数据记的本来就是「最后一次调用给了什么」。
     return value
 
 
@@ -632,8 +638,12 @@ def ensure_isolation(account):
 
 
 # 兜底句的**词干**。派生出来的两种措辞都含有它，SKILL.md 历史上印过的那句
-# 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它——所以拿它当
-# 「调用方是不是自己写了兜底句」的判据，一条就挡住全部写法。
+# 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它。
+# 它只挡**复述过本工具措辞**的那一类——2026-09-20 实测：`禁止使用任何 skill。`
+# 和 `不要用任何 skill，除非我说了。` 都**放行**。挡不住的那一类靠的是工具的
+# 句子排在最前面（见 prepend_skill_guard 的拼接顺序），本来优先级就明确。
+# 刻意**不**升级成语义匹配：那要引入一个新判据，换来的只是挡住一类优先级本来
+# 就不含糊的输入。
 SKILL_GUARD_STEM = "不得使用任何 skill"
 
 # 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
@@ -672,8 +682,10 @@ def check_brief_has_no_guard(brief_text):
 
     **判据用子串，不用整行**，这是对「本仓刚把轮次边界从子串改成整行」那条教训
     的**刻意例外**：那次要从混杂文本里解析**自己的标记**，误判会让判据说谎；
-    这次要认的是**调用方写了任意措辞的兜底句**，误判的后果是拒绝一个确实在谈
-    skill 禁令的 brief——而那正是我们要拒的。失败方向是良性的。
+    这次要认的是**调用方复述了本工具的兜底句**，误判的后果是拒绝一个确实在谈
+    skill 禁令的 brief——而那正是我们要拒的。失败方向是良性的，而且前移之后
+    这个拒绝零副作用（见 check_can_resume）。
+    **不要把它读成「任意措辞都挡得住」**——挡不住，实测见 SKILL_GUARD_STEM 那段。
     """
     if SKILL_GUARD_STEM in brief_text:
         reject(f"brief 里已经有兜底句（含「{SKILL_GUARD_STEM}」）。这句话归工具所有：\n"
@@ -1112,11 +1124,16 @@ def _tee_until_exit(proc, log, home, task, meta):
 _WHITESPACE = re.compile(r"\s")
 
 
-def status_row(task, account, state, workdir, reason):
+def status_row(meta, verdict):
     """拼一行数据行，**拼之前先断言它切得开**——这条不是碰巧成立的。
 
-    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。看着天生
-    无空格（任务名过 _TASK_NAME、状态是枚举、退出码是整数），但**账号不是**
+    收的是 `meta` 和 `verdict` 两个对象，不是五个位置 `str`：五个同类型参数里
+    **把 workdir 和 reason 传反会静默拼出旧列序**，而那正是这次改动要消灭的东西。
+    调用方（cmd_status）手里正好就是这两个对象，顺序传不反。
+
+    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。状态和退出码
+    由上面那条 _require_enum 保证（五态里没有一个含空白），任务名过 _TASK_NAME，
+    所以这里只剩任务名和账号两列要查，而真正没人保证的是**账号**
     ——它的值读自 `tasks/<task>.json`，而 `_load_meta` 只校验**键**在不在，
     值长什么样一概不管。目录名那一侧另有 account_choices() 在入口拒，
     两道守的是两个不同的入口，不是重复防御。
@@ -1130,14 +1147,19 @@ def status_row(task, account, state, workdir, reason):
     首字符是空白，从而与数据行结构性可分；而它们的内容来自 splitlines()，
     结构上不可能含换行。
     """
-    for label, field in (("任务名", task), ("账号", account), ("状态", state)):
+    # 先过枚举：退出码那一列是 EXIT[state]，裸下标对写错的状态只给一个 KeyError，
+    # 调用方看不出是什么坏了。和 kind／cause 同一条做法。
+    _require_enum(verdict.state, tuple(EXIT), "state")
+    task, account, workdir = meta["task"], meta["account"], meta["dir"]
+    for label, field in (("任务名", task), ("账号", account)):
         if _WHITESPACE.search(field):
             reject(f"{label} {field!r} 含空白字符——status 的前四列就切不开了，"
                    f"调用方再也取不出 state。")
-    for label, field in (("工作目录", workdir), ("reason", reason)):
+    for label, field in (("工作目录", workdir), ("reason", verdict.reason)):
         if _CONTROL_CHARS.search(field):
             reject(f"{label} {field!r} 含控制字符——「一行一任务」就不成立了。")
-    return f"{task:<24} {account:<8} {state:<8} {EXIT[state]:<4} {workdir}  {reason}"
+    return (f"{task:<24} {account:<8} {verdict.state:<8} {EXIT[verdict.state]:<4} "
+            f"{workdir}  {verdict.reason}")
 
 
 def _print_verdict(task, verdict):
@@ -1148,6 +1170,16 @@ def _print_verdict(task, verdict):
 
 def cmd_run(args):
     workdir = pathlib.Path(args.dir).expanduser().resolve()
+    # 入口那道（work_dir）守的是**命令行上那个原始串**，而落进元数据、随后进
+    # status 数据行的是 resolve() 之后的真身——软链一跨就绕过去了。实测：
+    # --dir 指向一个软链，真身叫 `a\tb\nc`，入口放行、resolve 出来含 \t\n、
+    # 落盘，之后 status 整条被 status_row 拒掉，一个任务都列不出来。
+    # 这里用 reject 而不是 ArgumentTypeError：此刻已经离开 argparse 了，
+    # 而 Rejected 和参数错误本来就同一个退出码 2，不必多一个实体。
+    hit = _CONTROL_CHARS.search(str(workdir))
+    if hit:
+        reject(f"--dir {args.dir} 解析出来的真身 {str(workdir)!r} 含控制字符 "
+               f"{hit.group()!r}（软链？）。它要原样进 status 的数据行，会把「一行一任务」切坏。")
     if not workdir.is_dir():
         reject(f"--dir {args.dir} 不是目录")
     brief_file = pathlib.Path(args.brief).expanduser()
@@ -1206,8 +1238,7 @@ def cmd_status(args):
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
                    else judge(Round(report, read_last_round(log))))
-        print(status_row(meta["task"], meta["account"], verdict.state,
-                         meta["dir"], verdict.reason))
+        print(status_row(meta, verdict))
         for line in verdict.detail:
             # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
             print(f"    {line}")
@@ -1412,7 +1443,12 @@ def _add_prompt_round_args(sub):
     g = sub.add_mutually_exclusive_group(required=True)
     g.add_argument("--skill", action="append", dest="skills", type=skill_path,
                    metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
-    g.add_argument("--no-skill", action="store_const", const=[], dest="skills",
+    # const 给的是**不可变**的 ()，不是 []：argparse 的 const 在同一个 parser 上
+    # 是同一个对象，给 [] 的话两次 parse 拿到同一个 list，谁原地改一下就污染了
+    # 另一次。于是 args.skills 的契约是「**路径序列**」而不是「list」：
+    # --no-skill 给 ()，--skill 给 argparse 每次新建的 list（那一支不共享）。
+    # 两种都只被遍历和序列化（json.dumps(()) 就是 []，元数据的形状不受影响）。
+    g.add_argument("--no-skill", action="store_const", const=(), dest="skills",
                    help="本轮一个 skill 都不给")
 
 

@@ -1305,6 +1305,12 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「--skill 收的是 SKILL.md 的绝对路径」这条没了")
         self.assertRegex(skill, r"(--no-skill[^\n]*二选一|二选一[^\n]*--no-skill)",
                          "「--skill/--no-skill 二选一必填」这条契约没了")
+        # status 列表形态的行结构是**接口事实**，不是机制泄漏（怎么切是调用方
+        # 自己的事，文档不写 split）。它没人守的话整段删掉照样全绿——实测过。
+        self.assertRegex(skill, r"一行一个任务", "status 是「一行一个任务」这条接口事实没了")
+        self.assertRegex(skill, r"前四列.*任务名.*账号.*状态.*退出码",
+                         "前四列是哪四列、什么顺序——这条没了，调用方就得自己猜")
+        self.assertRegex(skill, r"缩进的行是明细", "「缩进的行不是任务」这条没了")
 
 
 class TestTaskName(unittest.TestCase):
@@ -1593,7 +1599,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
-                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, [])
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
                 with self.assertRaises(SystemExit):
                     parser.parse_args(self._argv(cmd, "--skill", str(self.skill_a), "--no-skill"))
 
@@ -1601,7 +1607,26 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
-                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, [])
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
+
+    def test_no_skill给的是不可变序列_store_const的常量是跨parse共享的(self):
+        # argparse 的 `const=` 在同一个 parser 上是**同一个对象**：给 [] 的话，
+        # 两次 parse 拿到同一个 list，谁原地改一下就污染了另一次。
+        # 生产路径今天不改它，但「结构上改不了」比「现在没人改」强一个量级。
+        parser = ca.build_parser()
+        a = parser.parse_args(self._argv("run", "--no-skill")).skills
+        b = parser.parse_args(self._argv("resume", "--no-skill")).skills
+        self.assertEqual(a, ())
+        with self.assertRaises(AttributeError):
+            a.append("/x/SKILL.md")
+        self.assertEqual(b, (), "另一次 parse 被污染了")
+        # 反面：--skill 那一支的 list 是 argparse 每次新建的，本来就不共享。
+        # 这条是**正面控制**：没有它，上面那半在「两支都是 ()」的假实现上也绿。
+        c = parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills
+        self.assertEqual(c, [str(self.skill_a)])
+        c.append("/x/SKILL.md")
+        self.assertEqual(parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills,
+                         [str(self.skill_a)], "append 那一支的 list 居然跨 parse 共享")
 
     def test_skill可重复且保持给定顺序(self):
         parser = ca.build_parser()
@@ -1718,6 +1743,25 @@ class TestRunGuards(_HomeSandbox):
         cd = seen["argv"][seen["argv"].index("--cd") + 1]
         self.assertTrue(pathlib.Path(cd).is_absolute(), f"--cd 拿到的是 {cd}")
         self.assertEqual(pathlib.Path(cd), self.workdir.resolve())
+
+    def test_dir是软链且真身含控制字符时拒跑_入口那道守的是原始串(self):
+        # work_dir 挂在 argparse 的 type= 上，它看到的是**命令行上那个串**；
+        # 而落进元数据、随后进 status 数据行的是 `resolve()` 之后的真身。
+        # 软链一跨，入口那道就绕过去了——所以 resolve 之后必须再守一次。
+        ca.ensure_isolation("default")
+        real = self.home / "a\tb\nc"
+        real.mkdir()
+        link = self.home / "link"
+        link.symlink_to(real)
+        self.assertTrue(link.is_dir(), "前提不成立：软链没指到目录上")
+        self.assertEqual(ca.work_dir(str(link)), str(link),
+                         "前提不成立：入口这道本来就该放行它，否则这条测的不是软链那个洞")
+        self.assertIn("\n", str(link.resolve()), "前提不成立：resolve 居然没解出真身")
+        # _no_codex 是**必须**的：这条闸没装上时 cmd_run 会一路走到 spawn，
+        # 不挡住就真的把 codex 叫起来了（实测过，单测绝不能发网络请求）。
+        with _no_codex(), self.assertRaises(ca.Rejected) as cm:
+            ca.cmd_run(self._args(dir=str(link)))
+        self.assertIn("控制字符", cm.exception.message)
 
     def test_run也要校验隔离不变量_resume那一半补过了这一半漏了(self):
         # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
@@ -1877,7 +1921,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         """
         return argparse.Namespace(
             task=task, brief=str(self.brief if brief is None else brief), effort="low",
-            skills=[])
+            skills=())
 
     def test_在跑时顺序是先打断再确认退出再续跑(self):
         order = []
@@ -1934,6 +1978,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_interrupt_and_resume(self._args("t9", brief=bad))
+        self.assertEqual(cm.exception.code, 2, "护栏拒绝走 2，不许和判据结论撞码")
         self.assertIn("--no-skill", cm.exception.message)
         ic.assert_not_called()
         k.assert_not_called()
@@ -2147,13 +2192,15 @@ class TestStatusIsSplittable(_HomeSandbox):
     REASON_WITH_SPACES = "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑"
 
     def test_前四列用split切得开_reason含空格也不影响(self):
-        row = ca.status_row("t1", "default", "failed", "/abs/repo", self.REASON_WITH_SPACES)
+        row = ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                            ca.Verdict("failed", self.REASON_WITH_SPACES, []))
         self.assertGreater(len(self.REASON_WITH_SPACES.split()), 1,
                            "前提不成立：reason 不含空格的话，这条根本测不到东西")
         self.assertEqual(row.split(maxsplit=4)[:4], ["t1", "default", "failed", "1"])
 
     def test_第五段是工作目录加reason_dir含空格也切得开(self):
-        row = ca.status_row("t1", "default", "failed", "/abs/my repo", self.REASON_WITH_SPACES)
+        row = ca.status_row(_full_meta("t1", dir="/abs/my repo"),
+                            ca.Verdict("failed", self.REASON_WITH_SPACES, []))
         tail = row.split(maxsplit=4)[4]
         self.assertTrue(tail.startswith("/abs/my repo"), tail)
         self.assertTrue(tail.endswith(self.REASON_WITH_SPACES), tail)
@@ -2164,7 +2211,8 @@ class TestStatusIsSplittable(_HomeSandbox):
         for state, code in (("success", "0"), ("failed", "1"), ("suspect", "3"),
                             ("running", "4"), ("interrupted", "130")):
             with self.subTest(state=state):
-                row = ca.status_row("t1", "default", state, "/abs/repo", "一句人话")
+                row = ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                                    ca.Verdict(state, "一句人话", []))
                 self.assertEqual(row.split(maxsplit=4)[3], code)
 
     def test_明细行有缩进_数据行没有(self):
@@ -2186,12 +2234,14 @@ class TestStatusIsSplittable(_HomeSandbox):
 
     def test_reason含制表符时当场拒绝(self):
         with self.assertRaises(ca.Rejected) as cm:
-            ca.status_row("t1", "default", "failed", "/abs/repo", "坏\treason")
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("failed", "坏\treason", []))
         self.assertEqual(cm.exception.code, 2)
 
     def test_工作目录含换行时当场拒绝(self):
         with self.assertRaises(ca.Rejected):
-            ca.status_row("t1", "default", "failed", "/abs/a\nb", "一句人话")
+            ca.status_row(_full_meta("t1", dir="/abs/a\nb"),
+                          ca.Verdict("failed", "一句人话", []))
 
     def test_账号含空白时当场拒绝_这一列的值来自元数据文件(self):
         # 前四列「天生无空格」这句话对账号**不成立**。目录名那一侧由
@@ -2203,12 +2253,30 @@ class TestStatusIsSplittable(_HomeSandbox):
         self.assertEqual(ca._load_meta(ca.meta_path(d, "t"))["account"], "bad acct",
                          "前提不成立：元数据这一侧居然校验了 account 的值，那就不是真的洞")
         with self.assertRaises(ca.Rejected):
-            ca.status_row("t1", "bad acct", "failed", "/abs/repo", "一句人话")
+            ca.status_row(_full_meta("t1", account="bad acct", dir="/abs/repo"),
+                          ca.Verdict("failed", "一句人话", []))
 
-    def test_任务名和状态含空白也拒绝(self):
-        for task, state in (("t 1", "failed"), ("t1", "fai led")):
-            with self.subTest(task=task, state=state), self.assertRaises(ca.Rejected):
-                ca.status_row(task, "default", state, "/abs/repo", "一句人话")
+    def test_任务名含空白也拒绝_而reason含空格照样放行(self):
+        # 正面控制在这里是承重的：reason 含空格**必须**放行（它在第五段，
+        # 那正是换列序买到的东西）。少了它，一条「什么都拒」的假实现也全绿。
+        self.assertIn(" ", ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                                         ca.Verdict("success", "有 空 格 的 reason", [])))
+        with self.assertRaises(ca.Rejected):
+            ca.status_row(_full_meta("t 1", dir="/abs/repo"),
+                          ca.Verdict("failed", "一句人话", []))
+        # 状态那一列自己带空白的话，它压根就不是五态之一——归 _require_enum 管，
+        # 那是内部调用方传错枚举，当场 ValueError，不是护栏拒绝
+        with self.assertRaises(ValueError):
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("fai led", "一句人话", []))
+
+    def test_不是五态之一当场炸_不给一个裸KeyError(self):
+        # 退出码那一列是 EXIT[state]，state 写错的话裸下标只给一个 KeyError，
+        # 调用方看不出是什么坏了。和 kind/cause 一样走 _require_enum。
+        with self.assertRaises(ValueError) as cm:
+            ca.status_row(_full_meta("t1", dir="/abs/repo"),
+                          ca.Verdict("done", "一句人话", []))
+        self.assertIn("state", str(cm.exception))
 
     def test_真实status输出每行一个任务_两个任务各切出四列(self):
         # 刻意选 interrupted 这一支：它的 reason **真的含空格**，端到端走一遍才算

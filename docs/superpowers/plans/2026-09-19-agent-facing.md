@@ -1323,9 +1323,20 @@ ensure_isolation 补上「挡的是动机不是能力」：--disable multi_agent
 
 ## 收尾验收（全部任务做完之后）
 
-- [ ] `python3 -m unittest test_codex_agent -v` → **211 个全绿**
+- [ ] `python3 -m unittest test_codex_agent -v` → **217 个全绿**（计划写的 211 是
+  按计划原样做完的数；实际 +6：spec 要求把兜底句检查前移，配一条「绝不发信号」的闸序
+  测试；spec §3 要求 `account_choices()` 拒坏目录名，配两条（拒绝本身 + 拒绝要说人话）；
+  审查实跑补出 `--dir` 软链绕过、`--no-skill` 的 const 共享、`status_row` 的状态枚举各一条）
 - [ ] `python3 -m py_compile codex_agent.py test_codex_agent.py` 零警告（`TestModuleCompilesClean` 已经守着，这里是人工复核）
-- [ ] `grep -n "SKILL_GUARD\b" codex_agent.py test_codex_agent.py SKILL.md` → 只剩 `SKILL_GUARD_STEM`，没有裸的 `SKILL_GUARD`
-- [ ] `grep -c "34.9\|000\|0,25,34,43\|mkdir" codex_agent.py` → 四个实测数字都能在注释里找到
+- [ ] `grep -n "SKILL_GUARD\b" codex_agent.py SKILL.md` → 无输出。**不要把
+  `test_codex_agent.py` 列进来**：那里有一条合法命中（`test_SKILL_GUARD常量已经不存在`）
+- [ ] 四个实测数字**逐条独立 grep**，任一失败即停。**不要写成一条
+  `grep -c "34.9\|000\|0,25,34,43\|mkdir"`**：`mkdir` 本来就命中两次，
+  动手之前那条就已经是 4，而 `0,25,34,43` 一次不命中也照样是 4——恒真，等于没查：
+  ```bash
+  for k in "34.9" "权限 000" "0,25,34,43" "mkdir"; do
+      grep -q "$k" codex_agent.py || { echo "缺：$k"; break; }
+  done
+  ```
 - [ ] spec §5 点名的三条既有测试都已迁移：`:799-801`（幂等 → 删除，语义不存在了）、`:1717`／`:1727`（argv 级 `startswith(SKILL_GUARD)` → 改成断言派生出的两种措辞的字面量）
 - [ ] 四者对齐复核：spec 的每一条 ↔ 计划的每一个 Task ↔ 代码与注释 ↔ `SKILL.md`。确认**做完了**再谈删 spec 与本计划（判据是「事情真的做完了」，不是「我认为内化完了」）
