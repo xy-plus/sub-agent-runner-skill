@@ -13,6 +13,8 @@
     进程反查的三道过滤（uid / comm / argv 元素精确相等）
     开跑前三件事的顺序（落元数据、清旧报告、写轮次分隔符，全在 spawn 之前）
     防陈旧报告（clear_report）、日志追加而非覆盖、**轮次边界由拥有者记下而非推测**
+    **一轮开跑前先确认上一轮安静了**——写日志的（writer，自报身份）和占会话的
+        （codex，现场反查）都停了才走；只看任一边都实测踩过（早放行／孤儿 codex）
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
     退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
@@ -115,6 +117,14 @@ HEADER = ("Reading additional input from stdin...\n"
           "--------\n")
 
 
+# 一副**必定停了**的 writer 身份：`pid_max` 这个值内核从不分配（分配区间是
+# [1, pid_max)），2026-09-20 实测 /proc/sys/kernel/pid_max = 4194304。
+# 前提在 setUpModule 里断言一次——默认元数据要是悄悄变成「还在写」，一大批
+# 「上一轮早停了」的测试会静默测到另一条分支上去。
+GONE_PID = str(2 ** 22)
+GONE_START = "1"
+
+
 # 「单测绝不真的把 codex 叫起来」本来是**软约定**——靠每个作者记得包一层
 # _no_codex。2026-09-20 实测漏过一次：一条 cmd_run 的拒绝测试没包，而那道闸
 # 当时还没装上，cmd_run 一路走到 spawn，真的起了 codex（沙箱 HOME 没登录态，
@@ -129,6 +139,10 @@ _REAL_POPEN_INIT = subprocess.Popen.__init__
 
 def setUpModule():
     """全套测试里没有任何一条允许把真的 codex 叫起来。"""
+    assert not pathlib.Path(f"/proc/{GONE_PID}").exists(), (
+        f"前提不成立：/proc/{GONE_PID} 居然存在。换一个必定不存在的 pid，"
+        f"否则一批「上一轮早停了」的测试会静默测到另一条分支上。")
+
     def no_real_codex(self, args, *a, **kw):
         argv0 = args[0] if isinstance(args, (list, tuple)) else args
         assert argv0 != "codex", (
@@ -160,11 +174,79 @@ def _no_codex():
 
 
 def _full_meta(task, **over):
-    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。"""
+    """元数据的完整形状。_load_meta 会校验必填键，测试不能再写半截字典。
+
+    writer 身份默认给一副**必定停了**的（见 GONE_PID）：绝大多数测试要的前提就是
+    「上一轮的 writer 早就不在了」。要「还在写」的那几条自己传 _live_writer(self)。
+    """
     meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00"}
+            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00",
+            "writer_pid": GONE_PID, "writer_start": GONE_START}
     meta.update(over)
     return meta
+
+
+# ── 陪练进程的四个助手。**必须是模块级的，不许挂在某个 TestCase 上。**
+# 三个测试类都要用它们，而跨类写成 `TestPid._wait_argv(self, …)` 会在 `self`
+# 上找不到兄弟方法当场炸——炸点在陪练的 `kill()` **之前**，于是 `finally` 里的
+# `wait()` 会永久挂住一个 `tail -f`，**整套测试跟着挂死**（原型上挂过两次）。
+def _fake_codex(tmp):
+    """把一个真二进制命名成 codex —— comm 就会报 codex。"""
+    fake = tmp / "codex"
+    fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
+    fake.chmod(0o755)
+    return fake
+
+
+def _argv_of(pid):
+    return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
+
+
+def _wait_argv(test, proc, needle):
+    """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            if needle in _argv_of(proc.pid):
+                return
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+        time.sleep(0.05)
+    test.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
+
+
+def _wait_zombie(test, pid):
+    """等陪练真的变成僵尸，返回它的启动时刻。
+
+    **这条路上不许再建第二个 `subprocess.Popen`**：`Popen.__init__` 会调
+    `subprocess._cleanup()`，顺手把这个僵尸回收掉，测试于是测到另一条分支上去。
+    """
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        fields = ca._read_stat_fields(str(pid))
+        if fields is not None and fields[0] == "Z":
+            return fields[1]
+        time.sleep(0.01)
+    test.fail(f"陪练 {pid} 始终没变成僵尸，本测试验证不了任何东西")
+
+
+def _live_writer(test):
+    """起一个**真的还活着的别的进程**，返回可直接落盘的那一对 writer 身份。
+
+    要「上一轮还在写」的测试一律用它，**不许拿本进程的身份充数**：
+    `_previous_writer_alive` 对本进程恒答「停了」（见那一行注释），
+    拿自己当陪练的测试会测到另一条分支上去。
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    test.addCleanup(proc.wait)
+    test.addCleanup(proc.kill)          # LIFO：先 kill 再 wait，绝不挂死
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        fields = ca._read_stat_fields(str(proc.pid))
+        if fields is not None and fields[0] != "Z":
+            return {"writer_pid": str(proc.pid), "writer_start": fields[1]}
+        time.sleep(0.01)
+    test.fail("陪练没起来，本测试验证不了任何东西")
 
 
 class _HomeSandbox(unittest.TestCase):
@@ -1166,26 +1248,45 @@ class TestMetaShape(_HomeSandbox):
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
     # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
-    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at"}
+    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at",
+              "writer_pid", "writer_start"}
 
     def test_字段清单的绝对值(self):
         self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
         # resume 要回到同一个目录、同一个会话，这两个字段是它的命根子
         self.assertIn("dir", self.FIELDS)
         self.assertIn("session_id", self.FIELDS)
-        # 存活必须每次现查：存下来的 PID 会过期、会被系统复用
+        # **codex** 的存活必须每次现查：存下来的 PID 会过期、会被系统复用，
+        # 而且它有现场特征可查（comm=codex + argv 里的报告路径），见 find_codex_pid。
         self.assertNotIn("pid", self.FIELDS)
+        # **writer 是另一回事**，所以它有自己的名字：写日志的是包装器自己，
+        # 「它还在不在写」没有任何现场特征。身份**成对**存——只存 PID 就退回
+        # 上面那条防的老毛病了。
+        self.assertIn("writer_pid", self.FIELDS)
+        self.assertIn("writer_start", self.FIELDS)
         # 白名单是「最后一次调用给了什么」，要审计就读这个字段——它刻意不进
         # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
         self.assertIn("skills", self.FIELDS)
+
+    def test_构造器自己就把写者记进去(self):
+        """`new_meta` 产出的是「一份此刻开始的任务的完整记录」，**写者是谁是这份
+        记录的一部分**，所以它自己去拿，不收参数。
+
+        收参数的那版实测是**不可观测**的：`run_codex` 在 write_meta 前会盖一次，
+        传垃圾进来落盘的仍是真身份——于是「传反了」（两个都是 str，starttime
+        长得就像个 pid）永远没人发现。不可观测的参数就是给误用留的口子。
+        """
+        meta = ca.new_meta("t", "default", "/abs/x", "low", ())
+        self.assertEqual((meta["writer_pid"], meta["writer_start"]), ca._writer_identity())
 
     def test_构造器的键集就是校验面(self):
         self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
-        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 pid 又会破坏
-        # 「存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        # 相等而不是包含：少一个字段任务就够不着了；多塞一个 **codex 的** pid 又会
+        # 破坏「codex 存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
+        # writer 的那一对是例外，理由见 test_字段清单的绝对值。
         d = ca.ensure_isolation("default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
@@ -1202,6 +1303,30 @@ class TestMetaShape(_HomeSandbox):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 ca.new_meta("t", "default", "/abs/x", "low", bad)
         self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
+
+    def test_run落盘的writer身份就是本进程(self):
+        d = ca.ensure_isolation("default")
+        args = ca.build_parser().parse_args(
+            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", "default", "--no-skill"])
+        with _no_codex():
+            ca.cmd_run(args)
+        落盘 = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
+
+    def test_每一轮都重打writer身份_resume不沿用上一轮的(self):
+        """resume 那一轮的 writer 是**另一个进程**，上一轮那个早就死了。
+
+        `_resume_round` 不经过 `new_meta`，它手里那份 meta 是 `_load_meta` 从磁盘
+        读回来的——沿用的话，下一条命令一问「上一轮那个进程还在吗」，答的是**上上轮**
+        那个进程的事。所以盖章的地方必须是 `run_codex`（三条路的唯一交汇点）。
+        """
+        d = ca.ensure_isolation("default")
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        落盘 = json.loads(ca.meta_path(d, "t").read_text())
+        self.assertNotEqual(落盘["writer_pid"], GONE_PID, "沿用了传进来那份的陈旧身份")
+        self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
 
     def test_run落盘的skills就是命令行给的那几条(self):
         d = ca.ensure_isolation("default")
@@ -1245,6 +1370,181 @@ class TestMetaShape(_HomeSandbox):
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
 
+class TestProcessIdentity(unittest.TestCase):
+    """进程身份 = PID + `/proc/<pid>/stat` 第 22 字段（启动时刻）。
+
+    裸 PID 判不了 PID 复用：同一个 PID 换了个进程，`os.kill(pid, 0)` 一样说「活着」。
+    """
+
+    def test_身份成对返回_两半都是str(self):
+        # 两半必须同时拿到：分开取就会出现「记了 PID 没记启动时刻」的半截身份，
+        # 而半截身份等于退回裸 PID。
+        # 两半都是 str，是因为**写入和比对共用这同一个产生点**——类型不匹配
+        # 从构造上就无从发生，所以 _load_meta 不必给这两个字段加非对称的类型校验。
+        ident = ca._writer_identity()
+        self.assertEqual(len(ident), 2)
+        self.assertEqual(ident[0], str(os.getpid()))
+        self.assertTrue(all(isinstance(v, str) for v in ident),
+                        f"身份必须是 str：{ident!r}——比对是字符串比对，int 会把活着的任务判死")
+
+    def test_启动时刻取的是stat的第22字段(self):
+        """判据是**独立算出来的**，不是拿被测函数自己的切法当参照。
+
+        第 22 字段是「开机以来的滴答数」，所以「进程年龄 = 开机至今 − 启动时刻」
+        必须落在一个很小的正数区间里。左右两个邻居都被这条挡住：
+        第 21 字段 itrealvalue 恒为 0（年龄 = 整个开机时长），
+        第 23 字段 vsize 是字节数（2026-09-20 实测 18,898,944，年龄算出来是几万秒）。
+        """
+        滴答每秒 = os.sysconf("SC_CLK_TCK")
+        开机至今 = int(float(pathlib.Path("/proc/uptime").read_text().split()[0]) * 滴答每秒)
+        启动时刻 = int(ca._writer_identity()[1])
+        self.assertGreater(启动时刻, 0, "第 21 字段(itrealvalue)恒为 0——下标写小了")
+        年龄 = 开机至今 - 启动时刻
+        self.assertGreaterEqual(年龄, 0, "启动时刻比开机至今还晚，切到别的字段上去了")
+        self.assertLess(年龄, 300 * 滴答每秒,
+                        "本测试进程不可能活了 5 分钟以上（整套测试实跑 ~5 秒）——下标写大了")
+
+    def test_comm含空格括号制表符和裸换行时仍然解析正确(self):
+        """`comm` 是进程自己用 `prctl(PR_SET_NAME)` 设的**任意 15 字节**。
+
+        2026-09-20 实测 comm = `we ird)\\nx` 时 `/proc/<pid>/stat` **按行读会得到 2 行**，
+        而第一行里最后一个 `)` 落在 comm **内部**——按行读切出来的字段列表长度是 **0**，
+        下标 19 当场 IndexError；就算侥幸不炸，切出来的「启动时刻」也是 comm 的碎片。
+        这种瞎法很安静：只在别人给进程改过名的时候才发作。
+        参照物是**改名之前**读到的启动时刻，由独立的一次读取得到。
+
+        **刻意只比启动时刻，不比运行状态。** 状态是真会变的（陪练刚写完 `after`
+        正要进 `sleep`，读到 R 还是 S 全看撞上哪一刻）——2026-09-20 实跑撞到过
+        一次，整条测试于是变成随机红。状态那一半改钉「长度是 1」：/proc 的
+        state 字段恒为单个字符，而切错了拿到的是 comm 的碎片（`raw.index` 那个
+        突变切出来的是 `x)`），照样红。
+        """
+        陪练 = subprocess.Popen(
+            [sys.executable, "-c",
+             "import ctypes, sys, time\n"
+             "sys.stdout.write('before\\n'); sys.stdout.flush()\n"
+             "sys.stdin.readline()\n"
+             "ctypes.CDLL('libc.so.6').prctl(15, b'we ird)\\nx', 0, 0, 0)\n"
+             "sys.stdout.write('after\\n'); sys.stdout.flush()\n"
+             "time.sleep(30)\n"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(陪练.stdout.readline(), b"before\n", "前提不成立：陪练没起来")
+            改名前 = ca._read_stat_fields(str(陪练.pid))
+            self.assertIsNotNone(改名前, "前提不成立：陪练的 /proc 读不到")
+            陪练.stdin.write(b"go\n")
+            陪练.stdin.flush()
+            self.assertEqual(陪练.stdout.readline(), b"after\n", "前提不成立：陪练没改成名")
+            raw = pathlib.Path(f"/proc/{陪练.pid}/stat").read_bytes()
+            self.assertIn(b"\n", raw[:raw.rindex(b")")],
+                          "前提不成立：comm 里没有裸换行，这条测不到「不许按行读」")
+            self.assertEqual(len(raw.splitlines()), 2,
+                             "前提不成立：这个文件按行读只有一行，那按行读的突变杀不掉")
+            改名后 = ca._read_stat_fields(str(陪练.pid))
+            self.assertEqual(改名后[1], 改名前[1],
+                             "comm 里的空格/括号/制表符/裸换行把启动时刻切偏了")
+            self.assertEqual(len(改名后[0]), 1,
+                             f"切出来的不是运行状态而是 comm 的碎片：{改名后[0]!r}")
+        finally:
+            陪练.kill()
+            陪练.wait()
+            陪练.stdin.close()
+            陪练.stdout.close()
+
+    def test_进程不在了返回None(self):
+        self.assertIsNone(ca._read_stat_fields(GONE_PID))
+
+
+class TestPreviousWriterAlive(_HomeSandbox):
+    """「上一轮那个进程还在吗」——名字就是它答的那个问题。
+
+    **它不答「还有人写日志吗」**：那是它被用来回答的问题，不是它知道的事实。
+    只有 `_wait_previous_round_ends` 一个调用点，所以设为私有，且收 `(home, task)`
+    ——收 dict 就可以传错任务，而传错了它会一声不吭地答「停了」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def _写盘(self, **over):
+        ca.write_meta(self.d, "t", _full_meta("t", **over))
+
+    def test_没有上一轮就判停了(self):
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_上一轮的writer还活着就判还在(self):
+        # 反面也要有：一个永远返回 False 的实现也能让上面那条全绿。
+        self._写盘(**_live_writer(self))
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"))
+
+    def test_同一个PID但启动时刻对不上就判停了_防PID复用(self):
+        # 自然情况下撞同一副 (PID, 10ms 刻度) 的余量是 445,255 倍，造不出来也不该造。
+        # 但**比对逻辑本身**两行就测完了，而它正是那道防线。
+        陪练 = _live_writer(self)
+        self._写盘(**陪练)
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算活着")
+        self._写盘(writer_pid=陪练["writer_pid"],
+                   writer_start=str(int(陪练["writer_start"]) + 1))
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_进程不在了就判停了(self):
+        self._写盘(writer_pid=GONE_PID, writer_start=GONE_START)
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_元数据记的是本进程时判停了_否则同一进程连跑两轮会等自己(self):
+        """**本进程不算「上一轮的 writer」**，而这一条得是代码不是注释。
+
+        写日志的包装器就是跑 `run_codex` 的那个进程（tee 循环在它自己身上），
+        所以它一落盘，磁盘上那副身份就是**它自己**。同一个进程再进一次
+        `run_codex`，按「进程还在吗」直问就恒答「还在」——它在等自己，等到超时
+        为止。失败模式是**60 秒静默挂起**（等待排在分隔符之前，屏幕和日志都是
+        死的），而「别让调用方遇到静默挂起」正是本工具存在的理由，所以这条
+        必须编进代码里，不能只写在注释里指望下一个人记得。
+        """
+        本进程 = dict(zip(("writer_pid", "writer_start"), ca._writer_identity()))
+        # 前提用 _read_stat_fields 表达，**不碰谓词本身**：谓词正是突变要改的那个。
+        self.assertIsNotNone(ca._read_stat_fields(本进程["writer_pid"]),
+                             "前提不成立：本进程居然读不到自己，那这条测的是另一条分支")
+        self._写盘(**本进程)
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+
+    def test_僵尸writer判停了_它的starttime和存活期完全一样(self):
+        """**这条钉的是承重梁，不是锦上添花。**
+
+        僵尸已经不执行任何代码、fd 全关，日志不可能再长。而它骗得过另外两道：
+        `starttime` 和存活期**完全相同**（本测试当场断言这一点），`os.kill(pid,0)`
+        也照样「成功」。去掉 `state == "Z"` 那一行，等的就变成「等它被父进程回收」
+        ——那归 harness 的 bash/node 管，是第三方，正是 v4 被否掉的那条前提。
+
+        这条测试里**不许再建第二个 `subprocess.Popen`**（见 `_wait_zombie`）。
+        """
+        僵尸 = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.05)"])
+        try:
+            存活期 = None
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                fields = ca._read_stat_fields(str(僵尸.pid))
+                if fields is None:
+                    break
+                if fields[0] == "Z":
+                    僵尸期 = fields[1]
+                    break
+                存活期 = fields[1]
+                time.sleep(0.005)
+            else:
+                self.fail(f"陪练 {僵尸.pid} 始终没变成僵尸，本测试验证不了任何东西")
+            self.assertIsNotNone(存活期, "前提不成立：没在存活期读到过，比不了")
+            self.assertEqual(僵尸期, 存活期,
+                             "前提不成立：僵尸期的 starttime 居然变了——那这一行就不承重了")
+            os.kill(僵尸.pid, 0)   # 前提：裸 PID 对僵尸「成功」；抛异常就是前提变了
+            self._写盘(writer_pid=str(僵尸.pid), writer_start=僵尸期)
+            self.assertFalse(ca._previous_writer_alive(self.d, "t"))
+        finally:
+            僵尸.wait()
+
+
 class TestPid(unittest.TestCase):
     def test_自己的进程判定为存活(self):
         self.assertTrue(ca.pid_alive(os.getpid()))
@@ -1263,44 +1563,20 @@ class TestPid(unittest.TestCase):
         # 没法真拿别人的账号起进程，就反过来做：把「当前用户」换成别人，
         # 我们自己这个 comm=codex、argv 对得上的进程就该落选。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
         proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertEqual(ca.find_codex_pid(mark), proc.pid)   # 前提：本来找得到
             with mock.patch.object(ca.os, "getuid", return_value=os.getuid() + 12345):
                 self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
             proc.wait()
-
-    @staticmethod
-    def _argv_of(pid):
-        return pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().decode().split("\0")
-
-    def _wait_argv(self, proc, needle):
-        """等进程真的 exec 完、argv 里出现 needle。前提不成立就 fail，不让测试空转。"""
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            try:
-                if needle in self._argv_of(proc.pid):
-                    return
-            except (FileNotFoundError, ProcessLookupError):
-                pass
-            time.sleep(0.05)
-        self.fail(f"陪练进程的 argv 里始终没有 {needle}，本测试无法验证任何东西")
-
-    @staticmethod
-    def _fake_codex(tmp):
-        """把一个真二进制命名成 codex —— comm 就会报 codex。"""
-        fake = tmp / "codex"
-        fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
-        fake.chmod(0o755)
-        return fake
 
     def test_只认comm是codex的进程_别的进程不算(self):
         # 2026-09-19 实测：按报告路径反查会命中发命令的 bash 自己（comm=bash），
@@ -1310,7 +1586,7 @@ class TestPid(unittest.TestCase):
         mark = "/tmp/codex-agent-selftest-不存在的报告.md"
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
@@ -1319,14 +1595,14 @@ class TestPid(unittest.TestCase):
     def test_comm真是codex的进程会被找到_反向也要成立(self):
         # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
         proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, mark)
+            _wait_argv(self, proc, mark)
             self.assertEqual(ca.find_codex_pid(mark), proc.pid)
         finally:
             proc.kill()
@@ -1341,7 +1617,7 @@ class TestPid(unittest.TestCase):
         所以比对必须是**元素相等**，不是子串包含。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         mine = str(tmp / "reports" / "mine.md")
         others = str(tmp / "reports" / "others.md")
@@ -1350,9 +1626,40 @@ class TestPid(unittest.TestCase):
         proc = subprocess.Popen([str(fake), "-f", mine, brief], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, brief)
+            _wait_argv(self, proc, brief)
             self.assertEqual(ca.find_codex_pid(mine), proc.pid)   # 前提：自己找得到自己
             self.assertIsNone(ca.find_codex_pid(others))
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_僵尸codex不进候选集_argv过滤是承重的不是保险(self):
+        """僵尸的 `cmdline` 是**空的**（2026-09-20 实测），所以 argv 元素比对
+        自然把它挡在外面——`comm` 那时还是 `codex`，`pid_alive` 也还说「活着」。
+
+        这条行为**没有名字**，却是「僵尸 codex 不该再收信号」的全部依靠，
+        也是 `_wait_previous_round_ends` 里「只看 codex 会早放行」那句话的成因。
+        补这条测试就是给它一个家。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = _fake_codex(tmp)
+        (tmp / "reports").mkdir()
+        mark = str(tmp / "reports" / "t.md")
+        pathlib.Path(mark).write_text("")
+        proc = subprocess.Popen([str(fake), "-f", mark], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_argv(self, proc, mark)
+            self.assertEqual(ca.find_codex_pid(mark), proc.pid, "前提不成立：活着时就找不到它")
+            proc.kill()
+            _wait_zombie(self, proc.pid)
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/comm").read_bytes().strip(), b"codex",
+                             "前提不成立：僵尸的 comm 变了，那挡住它的就不是 argv 过滤")
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"",
+                             "前提不成立：僵尸的 cmdline 不空，这条测的就不是那件事")
+            self.assertTrue(ca.pid_alive(proc.pid),
+                            "前提不成立：裸 PID 对僵尸都说「死了」，那它本来就挡得住")
+            self.assertIsNone(ca.find_codex_pid(mark))
         finally:
             proc.kill()
             proc.wait()
@@ -1369,7 +1676,7 @@ class TestPid(unittest.TestCase):
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = self._fake_codex(tmp)
+        fake = _fake_codex(tmp)
         (tmp / "reports").mkdir()
         victim = str(tmp / "reports" / "aXmd.md")   # 任务 aXmd 的报告路径
         hunter = str(tmp / "reports" / "a.md")      # 任务 a 的报告路径
@@ -1377,7 +1684,7 @@ class TestPid(unittest.TestCase):
         proc = subprocess.Popen([str(fake), "-f", victim], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            self._wait_argv(proc, victim)
+            _wait_argv(self, proc, victim)
             # 前提：它找得到自己，否则下面那条断言是空的
             self.assertEqual(ca.find_codex_pid(victim), proc.pid)
             self.assertIsNone(ca.find_codex_pid(hunter))
@@ -1399,7 +1706,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
     OWNED_BY_CODE = {
         r"--cd": "build_run_argv / build_resume_argv",
         r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
-        r"/proc|pgrep|pkill": "find_codex_pid",
+        r"/proc|pgrep|pkill": "find_codex_pid / _previous_writer_alive",
         r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
         r"mkdir -p": "ensure_isolation",
         r"--color": "build_run_argv（resume 不认它）",
@@ -2114,17 +2421,15 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
             task=task, brief=str(self.brief if brief is None else brief), effort="low",
             skills=())
 
-    def test_在跑时顺序是先打断再确认退出再续跑(self):
+    def test_在跑时顺序是先打断再续跑(self):
         order = []
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex",
                                side_effect=lambda *a: order.append("打断")), \
-             mock.patch.object(ca, "wait_for_exit",
-                               side_effect=lambda *a: order.append("等退出") or True), \
              mock.patch.object(ca, "_resume_round",
                                side_effect=lambda *a: order.append("续跑") or 0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
-        self.assertEqual(order, ["打断", "等退出", "续跑"], "顺序反了就会撞写锁")
+        self.assertEqual(order, ["打断", "续跑"], "顺序反了就会撞写锁")
 
     def test_没在跑时不发信号直接续跑(self):
         # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
@@ -2135,14 +2440,12 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ic.assert_not_called()
 
     def test_没有session_id时绝不发信号_那一轮白毁且拿不回来(self):
-        # 三条闸测试都 mock 掉 wait_for_exit。不 mock 的话闸序一坏就掉进真的
-        # 60 秒等待：实测「把 check_can_resume 挪到发信号之后」这个突变要
-        # **180.3 秒**才红，而且报的是「收到 INT 后 60 秒还没退出」——闸序坏了，
-        # 报的却是等超时，指错方向。mock 之后同一突变 2.1 秒变红，报错是
-        # `Expected 'interrupt_codex' to not have been called`，正中要害。
+        # 闸序一坏会怎样：实测「把 check_can_resume 挪到发信号之后」这个突变，
+        # 在等待还挂在本命令上的那个版本里要 **180.3 秒**才红，而且报的是
+        # 「收到 INT 后 60 秒还没退出」——指错方向。等待搬进 run_codex 之后，
+        # 这几条闸测试一个 mock 都不需要：它们在 _resume_round 之前就拒绝了。
         ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2164,7 +2467,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         bad = self.home / "自带兜底句.md"
         bad.write_text("**不得使用任何 skill。**\n\n顺便把 X 也改了")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2178,7 +2480,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
                                                dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2189,7 +2490,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_brief不是文件时绝不发信号(self):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -2207,17 +2507,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ic.assert_not_called()
         k.assert_not_called()
 
-    def test_等不到退出就拒绝续跑且绝不升级信号(self):
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
-             mock.patch.object(ca, "interrupt_codex"), \
-             mock.patch.object(ca, "wait_for_exit", return_value=False), \
-             mock.patch.object(ca, "_resume_round") as rw:
-            with self.assertRaises(ca.Rejected) as cm:
-                ca.cmd_interrupt_and_resume(self._args())
-        rw.assert_not_called()
-        self.assertEqual(cm.exception.code, 2)      # 绝对值：护栏拒绝就是 2
-        self.assertIn("稍后", cm.exception.message)
-
     def test_本轮已有打断痕迹时只等不发第二发INT(self):
         """超时的处置是「稍后重试」，而重试就是再跑一遍这条命令 → 又一次
         interrupt_codex → 第二发 INT。很多 CLI 把第二发 Ctrl-C 当强退；
@@ -2230,7 +2519,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k, \
-             mock.patch.object(ca, "wait_for_exit", return_value=True) as w, \
              mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
         ic.assert_not_called()
@@ -2238,11 +2526,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # 裸 os.kill 也会红，但红的原因是 ProcessLookupError（4242 不存在）这个
         # **巧合**——pid 若恰好存在就是绿的。同一个类里四条闸测试都钉了 os.kill。
         k.assert_not_called()
-        # **等的是谁**也要钉死：把报告路径传成日志路径，find_codex_pid 永远找不到，
-        # wait_for_exit 秒返 True、等待整个被跳过、直接续跑撞写锁——而这正是
-        # 这条命令唯一独有的收益。实跑确认：不钉参数的话这个突变 156 条全绿。
-        w.assert_called_once_with(ca._report_path(self.d, "t"),
-                                  ca.INTERRUPT_EXIT_TIMEOUT, ca.INTERRUPT_POLL_INTERVAL)
 
     def test_上一轮的打断痕迹不算数_本轮还是要发INT(self):
         # 反面钉一道：判据必须只看**本轮**。看全文的话，一个被打断过的任务
@@ -2253,7 +2536,6 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
                        + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净\n")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
-             mock.patch.object(ca, "wait_for_exit", return_value=True), \
              mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
         # **打给谁**也要钉：传成报告路径的话，痕迹写进**报告** → judge 看到非空
@@ -2959,46 +3241,241 @@ class TestInterruptCodex(unittest.TestCase):
             self.assertIsNone(ca.interrupt_codex(4242, self.log, "stop"))
 
 
-class TestWaitForExit(unittest.TestCase):
-    # 一律传 pathlib.Path：契约就是 Path（find_codex_pid 的注释专门强调过
-    # 「全模块只剩传 Path 一种传法」）。测试示范 str 的话，下一个人会照着传 str，
-    # 而那正是那条注释要消掉的缝。
-    def test_进程退出后返回True(self):
-        with mock.patch.object(ca, "find_codex_pid", side_effect=[4242, 4242, None]):
-            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 5, 0.01))
+class TestWaitPreviousRoundEnds(_HomeSandbox):
+    """「上一轮结束了没有」＝**两个都停了**，缺一不可。
 
-    def test_一直不退则超时返回False(self):
+        还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
+        会话还被占着吗   find_codex_pid           现场反查
+
+    只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
+    argv 比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上**孤儿 codex**：
+    SIGKILL 掉包装器之后 codex 存活并跑完（实测），续跑就撞上它的写锁。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def _写盘(self, **over):
+        ca.write_meta(self.d, "t", _full_meta("t", **over))
+
+    def test_没有上一轮就直接放行(self):
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
+        self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+
+    def test_没有元数据但codex还在跑_不许放行(self):
+        """「文件不在就直接放行」是**多余且开洞**的。
+
+        多余：`_previous_writer_alive` 自己第一件事就是查文件在不在。
+        开洞：那条早返回**连 codex 那一半都跳过了**——元数据被手删（或换账号
+        重跑把它挪走）而上一轮的 codex 还占着会话时，当场放行，新一轮直接撞上
+        它的写锁。两个条件一个都不能少，没有「文件不在」这条例外。
+        """
+        self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
         with mock.patch.object(ca, "find_codex_pid", return_value=4242):
-            self.assertFalse(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01))
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
+    def test_两个都停了才放行(self):
+        self._写盘()
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立：默认身份居然还在写")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+
+    def test_上一轮的writer还在写就等到超时(self):
+        # **突变锁：只等 codex。** 只看 codex 的话这里会立刻放行——那正是病根本身。
+        self._写盘(**_live_writer(self))
+        self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
+        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
+    def test_孤儿codex_writer没了codex还在_不许放行(self):
+        # **突变锁：只等 writer。** SIGKILL 掉包装器之后 codex 会存活并跑完（实测），
+        # 只看包装器就会放行，续跑撞上它的写锁。
+        self._写盘()
+        self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立")
+        with mock.patch.object(ca, "find_codex_pid", return_value=4242):
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+
+    def test_codex早变僵尸而writer还在排干时必须继续等(self):
+        """**本次回归锁**，整条链一起验：真起一个 comm=codex、argv 对得上的陪练，
+        杀掉但不回收 → 它是僵尸、`cmdline` 已空 → `find_codex_pid` 判 None，
+        而上一轮的 writer 还在写 → 必须继续等到超时。
+        """
+        (self.d / "reports").mkdir(exist_ok=True)
+        fake = _fake_codex(self.d)
+        report = ca._report_path(self.d, "t")
+        report.write_text("")
+        # 陪练身份要在起僵尸**之前**拿：_live_writer 会建 Popen，而 Popen.__init__
+        # 顺手调 subprocess._cleanup() 把僵尸回收掉（见 _wait_zombie）。
+        写者 = _live_writer(self)
+        proc = subprocess.Popen([str(fake), "-f", str(report)], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            _wait_argv(self, proc, str(report))
+            self.assertEqual(ca.find_codex_pid(report), proc.pid, "前提不成立：活着时就找不到它")
+            proc.kill()
+            _wait_zombie(self, proc.pid)
+            self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"",
+                             "前提不成立：僵尸的 cmdline 不空，那 argv 过滤就不是免费做对的")
+            self.assertIsNone(ca.find_codex_pid(report), "前提不成立：僵尸居然还被当成在跑")
+            self._写盘(**写者)
+            self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
+            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+        finally:
+            proc.kill()
+            proc.wait()
 
     def test_等待期间绝不发任何信号(self):
         # 超时的正确处置是告诉调用方稍后再来，不是加大火力。
         # 升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+        self._写盘()
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
-            ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01)
+            ca._wait_previous_round_ends(self.d, "t", 0.05, 0.01)
         k.assert_not_called()
 
-    def test_超时是上界不是等待时长(self):
-        # 一确认退出就立刻往下走，不把 timeout 睡满
+    def test_等到了就立刻走_不把超时睡满(self):
+        self._写盘()
         started = time.monotonic()
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 30, 0.01))
+            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 30, 0.01))
         self.assertLess(time.monotonic() - started, 1.0)
 
-    def test_两个常量的绝对值_并且余量对得上实测(self):
+    def test_真要等的时候先说一句_否则run变成静默挂起(self):
+        """等待排在**分隔符之前**，所以这段时间里日志是死的，屏幕也不能死。
+
+        不打印的话 `run` 会多出一个全新的静默挂起：用户看不出它在等谁、等多久。
+        这句**只进屏幕不进日志**——日志里此刻还没有本轮的边界，写进去就落在
+        上一轮里，把上一轮的判据弄脏。它当场就读得到，靠的是 `main()` 那行
+        `sys.stdout.reconfigure(line_buffering=True)`。
+        """
+        self._写盘(**_live_writer(self))
+        buf = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(buf):
+            ca._wait_previous_round_ends(self.d, "t", 0.15, 0.01)
+        self.assertIn("上一轮还在收尾", buf.getvalue())
+
+    def test_不用等的时候一个字都不说(self):
+        # 反面钉一道：无条件打印的话，那句话在 99% 的情况下是假的
+        # （上一轮早就结束了），而假话说多了人就不看了。
+        self._写盘()
+        buf = io.StringIO()
+        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             contextlib.redirect_stdout(buf):
+            ca._wait_previous_round_ends(self.d, "t", 5, 0.01)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_两个常量的绝对值(self):
         """常量必须是**模块级**的，不是函数默认参数：测试要把它压到 0.3 秒，
         而仓库规范本来就不许用默认缺省值。
 
-        60 秒的实测锚点（codex 0.154.0、effort low、sleep 工具调用执行中被打断）：
-        INT → PID 消失分别是 1.854 秒和 0.964 秒。这里把「30~60 倍余量」这个
-        **理由**也钉住——只钉 60 这个数字的话，下一个人把实测值改了没人拦。
+        **刻意只钉绝对值，一条「倍数余量」都不钉。** 排干多久由 codex 起的后代
+        决定，**无上界**（起个后台服务就永不结束），所以 60 秒是「本工具愿意等
+        多久」的**策略值**。原先那两条（`>= 1.854 * 30`、`< 0.964`）都把 codex 的
+        INT 退出实测当成了上界，已删。
         """
-        self.assertEqual(ca.INTERRUPT_EXIT_TIMEOUT, 60)
-        self.assertEqual(ca.INTERRUPT_POLL_INTERVAL, 0.2)
-        self.assertGreaterEqual(ca.INTERRUPT_EXIT_TIMEOUT, 1.854 * 30)
-        self.assertLess(ca.INTERRUPT_POLL_INTERVAL, 0.964,
-                        "轮询间隔比实测最快的退出还长，等于把等待时间凭空拉长一轮")
+        self.assertEqual(ca.ROUND_END_TIMEOUT, 60)
+        self.assertEqual(ca.ROUND_END_POLL_INTERVAL, 0.2)
+
+
+class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
+    """等待折进唯一的 spawn 入口——三条路都经过它，「哪个入口漏了」结构上不存在。"""
+
+    def setUp(self):
+        super().setUp()
+        self.d = ca.ensure_isolation("default")
+
+    def test_等的是磁盘上那份_不是传进来的meta(self):
+        """**本版头号回归锁。**
+
+        按参数读的话，`cmd_run` 传的是刚造好的 `new_meta()`——那一份的 writer 就是
+        本进程，于是这一轮会去等**参数里记的那个进程**，而不是上一轮真正的写者。
+
+        构造：磁盘那份记的是一个早没了的进程（→ 正确实现一路走完），**参数**那份
+        记的是一个**还活着的别的进程**（→ 读错了就会等满 0.3 秒然后 reject）。
+        判据同时钉**走通**和**耗时**，超时只给 0.3 秒，所以这条测试自己绝不挂死。
+
+        **参数那份刻意不用本进程的身份**（计划原稿是那样写的）：
+        `_previous_writer_alive` 对本进程恒答「停了」，拿本进程当参数的话，
+        「改读参数」那个突变会被那条短路救活——实测确实存活。换成真陪练之后才杀得掉。
+        """
+        ca.write_meta(self.d, "t", _full_meta("t"))          # 磁盘：上一轮早停了
+        活的 = _full_meta("t", **_live_writer(self))          # 参数：一个还活着的别的进程
+        # 前提用 _read_stat_fields 表达，**不碰谓词本身**：突变要改的正是谓词的签名，
+        # 用谓词写前提的话，突变会先把前提这一行炸成 TypeError——红是红了，
+        # 但红的是「签名变了」，不是「等错了人」，指错方向（实跑踩过）。
+        self.assertIsNone(ca._read_stat_fields(GONE_PID),
+                          "前提不成立：磁盘那份记的进程居然还在")
+        self.assertIsNotNone(ca._read_stat_fields(活的["writer_pid"]),
+                             "前提不成立：参数那份记的进程不在，突变就不会卡住")
+        started = time.monotonic()
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex():
+            ca.run_codex("run", self.d, "t", 活的, lambda r: ["codex"])
+        self.assertLess(time.monotonic() - started, 0.3,
+                        "等了——说明读的是参数那份，而那一份记的根本不是上一轮的写者")
+
+    def test_同一进程连跑两轮不会等自己(self):
+        """第二轮的磁盘元数据记的正是**本进程**（第一轮刚盖上去的）。
+
+        直问「那个进程还在吗」就恒答「还在」——于是第二轮等自己，等满超时为止。
+        真实失败模式是 **60 秒静默挂起**：等待排在分隔符之前，屏幕和日志都是死的，
+        而「别让调用方遇到静默挂起」正是本工具存在的理由。
+        挡住它的是 `_previous_writer_alive` 里「本进程不算」那一行。
+        """
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex():
+            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+            落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
+            self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity(),
+                             "前提不成立：第一轮没把本进程的身份盖上去，第二轮就不会等自己")
+            started = time.monotonic()
+            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertLess(time.monotonic() - started, 0.3, "第二轮在等自己")
+
+    def test_超时就拒绝_且不留半个状态(self):
+        """**本版最值钱的性质**：等待排在 `write_meta` / `clear_report` / 分隔符
+        **全部之前**，所以超时的时候，上一轮的报告还在、日志没被加分隔符、
+        元数据还是上一轮那份、codex 一个都没起。
+        """
+        ca.write_meta(self.d, "t", _full_meta("t", **_live_writer(self)))
+        报告 = ca._report_path(self.d, "t")
+        报告.write_text("上一轮的报告")
+        日志 = ca._log_path(self.d, "t")
+        日志.write_text("旧日志\n")
+        旧元数据 = ca.meta_path(self.d, "t").read_text()
+        with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             _no_codex() as popen:
+            with self.assertRaises(ca.Rejected) as cm:
+                ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(cm.exception.code, 2, "护栏拒绝走 2，不许和判据结论撞码")
+        popen.assert_not_called()
+        self.assertEqual(报告.read_text(), "上一轮的报告", "clear_report 跑了")
+        self.assertEqual(日志.read_text(), "旧日志\n", "分隔符写进去了")
+        self.assertEqual(ca.meta_path(self.d, "t").read_text(), 旧元数据, "元数据被覆盖了")
+
+    def test_超时文案按kind分(self):
+        """两种停不下来的处置不同，而这行 stderr 是调用方唯一的线索。
+
+        文案产生在 `run_codex` 内部，因为只有它认得 `kind`——而 `kind` 已经被
+        `_require_enum(kind, _KINDS, "kind")` 守着，不会冒出第四种。
+        """
+        陪练 = _live_writer(self)
+        for kind, 期望 in (("run", "换个任务名"), ("resume", "换个任务名"),
+                           ("interrupt-and-resume", "不要再 stop")):
+            with self.subTest(kind=kind):
+                ca.write_meta(self.d, "t", _full_meta("t", **陪练))
+                with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
+                     mock.patch.object(ca, "find_codex_pid", return_value=None), \
+                     _no_codex():
+                    with self.assertRaises(ca.Rejected) as cm:
+                        ca.run_codex(kind, self.d, "t", _full_meta("t"), lambda r: ["codex"])
+                self.assertIn(期望, cm.exception.message)
+                self.assertIn("包装器还在读", cm.exception.message, "没说清谁还没停")
 
 
 class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
@@ -3034,9 +3511,10 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
     于是包装器的话会一直躺在缓冲区里，到退出才随 atexit 一起吐出来——排在
     codex 整轮输出**之后**。
 
-    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 和
-    `已确认退出` 两句都排在 codex 整轮输出的最后面，而它们要说的恰恰是
-    「此刻正在发生什么」。wait_for_exit 卡住的那 60 秒里，屏幕上更是一个字都没有。
+    2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT 并在日志留痕` 排在 codex
+    整轮输出的最后面，而它要说的恰恰是「此刻正在发生什么」。最吃这条的是
+    `_wait_previous_round_ends` 那句「上一轮还在收尾，最多等 N 秒」——它排在本轮
+    分隔符之前，日志里此刻什么都没有，屏幕再不出声，那就是个彻头彻尾的静默挂起。
 
     **钉的是裸 `print`，不是某个助手函数。** 收一个 `_say()` 不解决问题，只是把
     软约定上移一层：每个调用点都得记得用它，新加一行裸 print 照样静默错序——

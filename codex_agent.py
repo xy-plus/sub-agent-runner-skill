@@ -815,8 +815,11 @@ def write_meta(home, task, meta):
     （同一文件系统上是原子的），读者就只可能看到「旧的那份」或「新的那份」。
 
     临时名固定、不带 pid：同一个任务不可能有两个并发写者——`cmd_run` 和
-    `cmd_resume` 都先拒绝「还在跑」的同名任务。固定名的好处是崩在中间留下的
-    那一个残片会被下一次写盖掉，不会越积越多。
+    `cmd_resume` 都先拒绝「还在跑」的同名任务。**那道闸查完到这里写完之间有个
+    窗口**，而且自从等待插在闸之后（见 run_codex），这个窗口从几毫秒拉长到最多
+    一个 `ROUND_END_TIMEOUT`。固定名在这种情况下依然是对的：两个写者会争同一个
+    临时名，但 `os.replace` 是原子的，读者只可能看到完整的旧份或完整的新份；
+    而固定名的好处是崩在中间留下的那一个残片会被下一次写盖掉，不会越积越多。
     后缀是 `.json.tmp` 而不是 `.tmp.json`：`all_metas` 扫的是 `*.json`，
     残片要是被扫进去，它自己就成了一份「缺字段的坏元数据」，
     而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）。
@@ -827,6 +830,76 @@ def write_meta(home, task, meta):
     os.replace(tmp, q)
 
 
+# **这两个必须留在 `REQUIRED_META_KEYS` 那一行之上，别往下挪。** 它是
+# `tuple(new_meta(...).keys())`，在 **import 时**就跑一遍 `new_meta`，而
+# `new_meta` 自取写者身份要调 `_writer_identity`——定义得比它晚，整个模块
+# 当场 `NameError` 起不来（2026-09-20 实测过）。
+# **PID 复用的余量是 445,255 倍，所以这里零行代码去防它。** 启动时刻的分辨率是
+# 10ms（CLK_TCK=100），要让两副身份撞车就得在同一个 10ms 刻度内把同一个 PID 发两次，
+# 而 PID 是顺序分配、绕完 pid_max 才回头：
+#     pid_max 4,194,304 → 10ms 内绕完一圈需 4.19 亿次 fork/秒
+#     本机实测 fork 速率 942 次/秒（绕一圈 1.2 小时）→ 余量 445,255 倍
+# **别用「writer 陪跑整轮所以够长」来论证它——那个论证是错的**：write_meta 在
+# Popen **之前**，Popen 一炸 writer 几毫秒就死。真正兜底的就是上面那个余量。
+def _read_stat_fields(pid):
+    """`/proc/<pid>/stat` 里的 `(运行状态, 启动时刻)`，都是 `str`；进程不在了返回 `None`。
+
+    **整文件读 bytes，从最后一个 `)` 之后切。禁止按行读、禁止 split() 全文。**
+    `comm` 是进程自己用 `prctl(PR_SET_NAME)` 设的**任意 15 字节**：空格、括号、
+    制表符、**裸换行**全都进得去（2026-09-20 实测 comm=`we ird)\\nx`，那时这个文件
+    **按行读得到 2 行**，而第一行里最后一个 `)` 落在 comm 内部，切出来的字段列表
+    长度是 0，下标 19 当场 IndexError）。它瞎得很安静——只在别人给进程改过名时才发作。
+
+    **state 和 starttime 必须同一次读取出来**：分成两个函数会读两次 `/proc`，
+    进程正好在两次之间变僵尸时，starttime 对得上、state 却是存活期那次的，
+    「僵尸算停了」那一行当场失效。
+
+    `tail[0]` 是 stat 的第 3 字段（state），`tail[19]` 是第 22 字段（starttime）：
+    前两个字段 pid 和 comm 已经被切掉了，所以下标是 `22 - 2 - 1`。
+
+    **这一对答的是两个不同的问题，别混成一个。** `starttime` 和 pid 合起来是
+    **身份**（「是不是同一个进程」），它在进程的一生里恒定不变——僵尸期也一样。
+    `state` 是**另一个维度**（「它还在干活吗」），R 和 S 都是「还在」，而且会
+    随时来回变。2026-09-20 实跑踩过：拿整个元组去比对「改名前后解析是否一致」，
+    陪练刚好从 R 翻到 S，测试就随机红一次——比对身份只许比身份那一半。
+
+    `pid` 收 `str`：元数据里存的就是 `str`，全模块只留这一种传法。
+    """
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        # 进程随时可能退出（ENOENT），/proc 也可能读到一半没了——一律当「不在了」
+        return None
+    tail = raw[raw.rindex(b")") + 1:].split()
+    return tail[0].decode(), tail[19].decode()
+
+
+def _writer_identity():
+    """**本进程**的身份 `(pid, 启动时刻)`，由 `run_codex` 盖进元数据。
+
+    **成对返回，拿不到半截**：半截身份等于退回裸 PID，而裸 PID 挡不住复用。
+
+    **类型问题用构造消掉，不用校验。** 落盘的那个值和比对时拿来对照的那个值
+    都出自 `_read_stat_fields`，两边恒为 `str`，类型不匹配从构造上无从发生。
+    （要是让它们各自产生，实测「存 int 比 str」会让 `"20096556" != 20096556`
+    恒成立，一个还在排干的任务被**静默判死**——而 `_load_meta` 今天的设计注释
+    明写「只校验键在不在」，为这两个字段开一道非对称的类型校验会把那条原则破掉。）
+
+    只有 writer 记身份，codex 那侧继续用 `find_codex_pid` 现场反查。分界线是
+    **有没有现场特征**：codex 有（comm=codex、argv 里有报告路径），而「还有没有人
+    往日志里写字」没有任何现场特征。现场事实不依赖「有人记得写下来」，而 writer
+    正是这条链上唯一会死的那个进程——所以只有它必须自报。
+
+    读不到自己就直接炸：`/proc` 读不到自己意味着本工具的全部存活判定
+    （`find_codex_pid` 也在内）都不成立，没有第二条路可走。
+    """
+    pid = str(os.getpid())
+    fields = _read_stat_fields(pid)
+    if fields is None:
+        raise RuntimeError(f"/proc/{pid}/stat 读不到自己——本工具的全部存活判定都架在 /proc 上")
+    return pid, fields[1]
+
+
 def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
@@ -834,16 +907,33 @@ def _now_iso():
 def new_meta(task, account, workdir, effort, skills):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
 
-    刻意没有 pid：存活必须每次重新反查，存下来的 PID 会过期、还会被系统复用，
-    留着它只会诱导别人犯这个设计本来要防的错。
+    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_codex_pid），
+    存下来的 PID 会过期、还会被系统复用，留着它只会诱导别人犯这个设计本来要防的错。
+
+    **writer 的身份是另一回事，所以它有自己的名字。** 写日志的是包装器自己，
+    而「它还在不在写」没有任何现场特征可查。身份是 **PID + 启动时刻**成对存
+    （只存 PID 就退回上面那条防的老毛病）。
+
+    **身份在这里自取，不收参数。** 本函数产出的是「一份**此刻开始**的任务的
+    完整记录」，而「谁在写这一轮的日志」就是这份记录的一部分。
+    收参数的那一版实测是**不可观测**的：`run_codex` 在 write_meta 之前会盖一次，
+    传垃圾进来落盘的仍是真身份——于是「两个参数传反了」（两个都是 str，
+    starttime 长得就像个 pid）永远没人发现。不可观测的参数就是给误用留的口子。
+
+    `run_codex` 仍然会盖一次，**那不是第二个家**：两边调的是同一个
+    `_writer_identity()`，值不可能不一致。它必须盖，是因为 `_resume_round`
+    复用的是 `_load_meta` 从磁盘读回来的**旧记录**，根本不经过本函数——
+    不盖章，resume 那两条路会落盘**上一轮**包装器的身份。
 
     `skills` 记的是**最后一次调用**的白名单，与 effort／started_at 同一条原则
     （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
     skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
     _require_skill_paths(skills)
+    writer_pid, writer_start = _writer_identity()
     return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "skills": skills, "session_id": None, "started_at": _now_iso()}
+            "skills": skills, "session_id": None, "started_at": _now_iso(),
+            "writer_pid": writer_pid, "writer_start": writer_start}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
@@ -861,6 +951,10 @@ def new_meta(task, account, workdir, effort, skills):
 # 字段的老元数据只会建议「删掉它重新 run」，而那等于丢会话。2026-09-19 加
 # `skills` 那次实测三个隔离目录的 tasks/ 全空（各 0 个 json），所以影响为零——
 # **那是当时的事实，不是永久豁免**，下次加字段要重新确认一遍。
+# 2026-09-20 加 writer_pid／writer_start 那次同样执行了这条仪式：三个隔离目录
+# tasks/ 共 0 个 json（~/.codex-subagent 空，-acct2／-acct3 连 tasks/ 都没有），
+# 当前用户的 codex 进程无一属于本工具 → 本次爆炸半径为零。
+# 同上：**那是当时的事实，不是永久豁免**。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
 REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
@@ -946,8 +1040,9 @@ def find_codex_pid(report_path):
     """
     me = os.getuid()
     # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点。
-    # 不做这一下，wait_for_exit 就会变成全模块唯一收 str 的函数——同一个东西两种
-    # 传法，正是「好 API 难被误用」要消掉的那种缝。
+    # 全模块只在这里从 Path 落到 str：别处一律传 Path（_wait_previous_round_ends
+    # 连报告路径都不收，自己从 (home, task) 派生）。同一个东西两种传法，
+    # 正是「好 API 难被误用」要消掉的那种缝。
     needle = str(report_path).encode()
     for entry in pathlib.Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -968,43 +1063,46 @@ def find_codex_pid(report_path):
     return None
 
 
-# 打断之后最多等它收尾这么久。**是上界不是等待时长**——一确认退出就立刻往下走。
-# 实测锚点（2026-09-19，codex 0.154.0，effort low，sleep 工具调用执行中被打断）：
-# INT → PID 消失分别是 **1.854 秒**和 **0.964 秒**。60 秒是 30~60 倍余量——
-# 够大到不会误杀正常收尾，够小到卡住时调用方不会被无限期挂着。
-# 两个数字写在这里，是因为没有它们下一个人会随手改这个 60。
-#
-# 必须是**模块级常量**而不是函数默认参数：测试要把它 patch 成 0.3 秒；
-# 也正合仓库规范「不要默认缺省值」——调用方每次都显式传，不可能漏。
-INTERRUPT_EXIT_TIMEOUT = 60
-INTERRUPT_POLL_INTERVAL = 0.2
+def _previous_writer_alive(home, task):
+    """磁盘上那份元数据记的那个进程，现在还在吗。
 
+    **名字答的就是它知道的事实**：不是「还有人写日志吗」——那是调用方拿它去回答的
+    问题。收 `(home, task)` 不收 dict：两个调用点（`_wait_previous_round_ends` 的
+    轮询、`run_codex` 超时后的那句诊断）都在 `run_codex` 里，都由它自己那一对
+    `(home, task)` 派生，**没有第二个来源**；而收 dict 就可以传错任务，
+    传错了它会一声不吭地答「停了」。
 
-def wait_for_exit(report_path, timeout, poll_interval):
-    """轮询真实 PID 直到它真的退出。返回是否在 timeout 之内退出。
+    四条判停，缺一不可：
 
-    `report_path` 是 `pathlib.Path`，和本模块其它地方一致（见 find_codex_pid）。
+        文件不在        没有上一轮
+        记的就是本进程  那一轮的 writer 就是我自己，见下
+        启动时刻对不上  PID 被复用了（裸 os.kill 在这里会说「活着」）
+        state == "Z"    僵尸
 
-    这是 `interrupt-and-resume` **唯一独有的收益**：护栏只会拒绝，不会替你等。
-    `cmd_resume` 早就拦住了「对还在跑的会话 resume」（实测 stop 之后 0.164 秒
-    resume，拿到的是干净的 exit 2 拒绝，不是 thread-store conflict），但调用方
-    拿到 exit 2 之后得自己写重试循环——间隔多少、上界多少、超时了怎么办，全是
-    软约定，每个调用方现编一遍，编错了没人告诉他。把这个循环收进来就是它存在
-    的全部理由。
-
-    存活判据与 `status` 同一套（扫 /proc + argv 元素精确比对 + comm + 同用户），
-    不另起一份——两份判据必然漂移。
-
-    **只轮询，不发任何信号。** 超时的正确处置是让调用方稍后再来，不是加大火力：
-    升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+    **第四条是承重梁，不是锦上添花。** 实测：僵尸期的 `starttime` 与存活期
+    **完全相同**，`os.kill(pid, 0)` 也照样「成功」——没有这一行，等的就变成
+    「等它被父进程回收」，而回收时机归 harness 的 bash/node 管，是第三方。
+    spec 的版本小史里 v4 就是栽在这条前提上。
     """
-    deadline = time.monotonic() + timeout
-    while True:
-        if find_codex_pid(report_path) is None:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(poll_interval)
+    q = meta_path(home, task)
+    if not q.exists():
+        return False
+    previous = _load_meta(q)
+    # **上一轮要是本进程写的，那它已经写完了。** 写日志的包装器就是跑 run_codex
+    # 的这个进程（tee 循环在它自己身上），所以它一落盘，磁盘上那副身份就是它自己。
+    # run_codex 单线程顺序执行：能走到这里，本进程上一轮的 tee 循环早已返回。
+    # 不加这一行，同一个进程连跑两轮就会**等自己**——白等满一个 ROUND_END_TIMEOUT，
+    # 再拿到一句**说谎的诊断**（「包装器还在读 codex 的输出」，而那个包装器就是
+    # 问话的人自己）。实测超时压到 0.5s 时第二轮就是这么被自己挡住的。
+    # 这一行不是注释能代替的：失败模式是 60 秒静默挂起（等待排在分隔符之前，
+    # 屏幕和日志都是死的），而「别让调用方遇到静默挂起」正是本工具存在的理由。
+    if (previous["writer_pid"], previous["writer_start"]) == _writer_identity():
+        return False
+    fields = _read_stat_fields(previous["writer_pid"])
+    if fields is None:
+        return False
+    state, start = fields
+    return start == previous["writer_start"] and state != "Z"
 
 
 # codex 全集是 minimal/low/medium/high/xhigh/max/ultra，这五档是**刻意裁剪**。
@@ -1072,6 +1170,67 @@ def _log_path(home, task):
     return home / "logs" / f"{task}.log"
 
 
+# 开跑前最多等上一轮安静下来多久。**这是策略值，不是实测上界。**
+# 排干多久由 codex 起的后代决定，**没有上界**——它起个后台服务就永不结束。
+# 所以这个数字回答的是「本工具愿意等多久」：够大到不会误杀正常收尾
+# （2026-09-19 实测 INT → codex 消失是 1.854 秒和 0.964 秒，writer 再多几秒），
+# 够小到卡住时调用方不会被无限期挂着。**不要拿实测值去给它钉倍数余量。**
+#
+# 名字去掉了 `INTERRUPT_` 前缀：等待已经不是 interrupt-and-resume 独有的，
+# run / resume 走的是同一条（见 run_codex）。
+#
+# 必须是**模块级常量**而不是函数默认参数：测试要把它压到 0.3 秒；
+# 也正合仓库规范「不要默认缺省值」——调用方每次都显式传，不可能漏。
+ROUND_END_TIMEOUT = 60
+ROUND_END_POLL_INTERVAL = 0.2
+
+
+def _wait_previous_round_ends(home, task, timeout, poll_interval):
+    """等到**上一轮的 writer 停了**、而且**codex 也停了**。返回是否等到。
+
+    两个条件问的是两件事，缺一不可：
+
+        还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
+        会话还被占着吗   find_codex_pid           现场反查
+
+    只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
+    argv 精确比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上
+    **孤儿 codex**：SIGKILL 掉包装器之后 codex 存活并跑完（实测），续跑撞上它的写锁。
+
+    **不用 pidfd，直接轮询。** codex 那半没有记下来的身份（刻意的：它有现场特征，
+    而现场事实不依赖「有人记得写下来」），只能轮询扫 /proc——**整个函数的唤醒粒度
+    本来就被 poll_interval 钉死了**，pidfd 在 writer 那半最多买到一个轮询间隔，
+    代价却是内核版本前提 + ENOSYS 拒绝路径 + 三条 TOCTOU 契约。一分钱没买到。
+
+    **只等，不发任何信号。** 超时的正确处置是让调用方稍后再来，不是加大火力：
+    升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
+
+    报告路径**自己从 (home, task) 派生**，不收参数：收参数就能传错（把日志路径传
+    进来的话 find_codex_pid 永远找不到，等待整个变成空操作），而这里只有一个调用点。
+
+    **没有「元数据不在就直接放行」这条捷径。** 那条早返回既多余（`_previous_writer_alive`
+    自己第一件事就是查文件在不在），又**开洞**：它连 codex 那一半都跳过了——
+    元数据被手删、而上一轮的 codex 还占着会话时当场放行，新一轮撞上它的写锁。
+    两个条件一个都不能少。
+    """
+    report = _report_path(home, task)
+    deadline = time.monotonic() + timeout
+    said = False
+    while True:
+        if not _previous_writer_alive(home, task) and find_codex_pid(report) is None:
+            return True
+        if not said:
+            # **只在真要等的时候说，而且只进屏幕不进日志。** 等待排在分隔符之前，
+            # 日志里此刻还没有本轮的边界，写进去就落在上一轮里，把上一轮的判据弄脏。
+            # 不说的话 run 会多出一个全新的**静默挂起**。它当场读得到，靠的是
+            # main() 里那行 sys.stdout.reconfigure(line_buffering=True)。
+            print(f"[codex-agent] {task} 上一轮还在收尾，最多等 {timeout} 秒…")
+            said = True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
+
+
 def run_codex(kind, home, task, meta, make_argv):
     """唯一的 spawn 入口。**返回一个 `Round`**：报告路径 + 本轮日志文本
     （codex 退出那一刻的快照）。
@@ -1100,6 +1259,48 @@ def run_codex(kind, home, task, meta, make_argv):
 
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
     # 不会留下一个没人管的孤儿进程。
+    # 开跑前的第一件事：**确认上一轮真的结束了**。
+    # 等谁**从磁盘读**（见 _previous_writer_alive），绝不用传进来的 meta 参数：
+    # cmd_run 传的是刚造好的 new_meta()，那一份记的是本进程，按参数读就等错了人
+    # ——等的成了「参数里写的那个」而不是上一轮真正的写者。
+    # **传进来的 meta 只用于写新的那份。**
+    #
+    # 这一等排在 write_meta / clear_report / 分隔符 **全部之前**，所以超时**不留
+    # 半个状态**：上一轮的报告还在、日志没被加分隔符、元数据还是上一轮那份、
+    # codex 一个都没起。这是本次改动最值钱的性质，别把它挪到后面去。
+    #
+    # 折进 run_codex 而不是逐个命令补闸：它是**唯一的 spawn 入口**，run / resume /
+    # interrupt-and-resume 三条路都经过它，于是「哪个入口漏了」结构上不存在。
+    # 从前只有 interrupt-and-resume 会等，而 cmd_resume 同样只看 codex——
+    # 上一轮被打断、codex 已没、writer 还在排干时它当场放行，老 writer 的输出
+    # 会落在新分隔符之后，judge 把上一轮的尾巴算成这一轮。同一类 bug 换个入口。
+    if not _wait_previous_round_ends(home, task, ROUND_END_TIMEOUT, ROUND_END_POLL_INTERVAL):
+        # 超时之后**再问一次两个谓词**：两种停不下来的现场不同，而这行 stderr
+        # 是调用方唯一的线索。不让等待函数回一个成因枚举——那会多出一个实体，
+        # 而「谁还没停」本来就是这两个谓词各问一次的事。
+        busy = []
+        if _previous_writer_alive(home, task):
+            busy.append("包装器还在读 codex 的输出（codex 起的后台进程继承了同一个 "
+                        "stdout，它不退管道就不 EOF）")
+        if find_codex_pid(report) is not None:
+            busy.append("codex 本身还在跑")
+        if not busy:
+            busy.append("刚刚才安静下来——超时和它停下撞在了一起")
+        下一步 = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
+                  "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
+                  if kind == "interrupt-and-resume" else
+                  f"等上一轮收尾完再来；codex 也还活着的话先 `codex-agent stop {task}`"
+                  f"（run 还可以换个任务名）。")
+        reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
+               + "；".join(busy) + "。\n" + 下一步)
+
+    # writer 身份在这里盖，**而且只在这里**：run_codex 是唯一的 spawn 入口，
+    # run / resume / interrupt-and-resume 三条路都经过它，调用方不需要记住任何事。
+    # 贴在 write_meta 正上方，是因为「落盘那一刻，writer 身份 = 落盘的这个进程」
+    # 这条不变式只有贴在这里才看得见。
+    # resume 路上的 meta 是 `_load_meta` 从磁盘读回来的，里面是**上一轮**包装器的
+    # 身份，那个进程早就死了——不盖章，下一条命令问的就是上上轮那个进程的事。
+    meta["writer_pid"], meta["writer_start"] = _writer_identity()
     write_meta(home, task, meta)
     clear_report(report)
 
@@ -1181,14 +1382,14 @@ def _tee_until_exit(proc, log, home, task, meta):
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
     # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
     # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
-    # **已登记的跟进项（尚未修）**：这个循环等的是 **stdout 管道 EOF**，
-    # 不是「codex 进程没了」。codex 起的孙进程会继承同一个 stdout，孙进程不退
-    # 管道就不 EOF，于是「codex 已经结束了」和「日志安静了」被当成一回事。
-    # 实测：直接子进程 t=0.03s 就退了，而这个 tee 循环挂到 **t=4.16s** 才退。
-    # 后果是 run/resume 的收尾被孙进程拖住——判据本身不受影响（它只看产物和
-    # 本轮日志），但「什么时候算这一轮结束」比真相晚。
-    # 修它要引入「等进程 + 另设管道超时」两件事，而本轮的范围是 --skill 和
-    # status，所以**只登记不修**。这几行是它唯一的书面记录。
+    # 这个循环等的是 **stdout 管道 EOF**，不是「codex 进程没了」：codex 起的
+    # 孙进程继承同一个 stdout，孙进程不退管道就不 EOF。**这是刻意保留的**——
+    # 「日志什么时候安静下来」的答案就等于「本循环什么时候退出」，所以下一轮
+    # 开跑前要等的是**本进程**，不是 codex。本进程的身份就落在元数据的
+    # writer_pid／writer_start 里（见 run_codex 里盖章那一行），
+    # _wait_previous_round_ends 等的也正是它。
+    # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_codex_pid 就判 None
+    # （僵尸的 cmdline 为空，argv 比对拒绝它），日志还要再长好几秒。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
@@ -1431,6 +1632,10 @@ def cmd_resume(args):
     # 一模一样（thread-store conflict），而处置完全相反——一个该等，一个该弃。
     # 本命令刻意**不替调用方打断**：要打断请用 interrupt-and-resume，
     # 那个名字把代价写在脸上。
+    # **这道闸和 run_codex 里那个等待不是一回事，别合并。** 这里拒的是「上一轮
+    # 还在正经跑」——那一轮还要跑多久没有上界，等它等于把调用方挂死，而且该不该
+    # 打断是调用方的判断。run_codex 等的是「上一轮已经停了、只是还在收尾」，
+    # 那是有限的、纯技术性的一小段，谁都不必为它做决定。
     #
     # 这里 PID 检查排在 check_can_resume **之前**，和 interrupt-and-resume 的闸序
     # 相反，是**刻意的**：「拒绝必须在动手之前」约束的是**副作用**，而这条路一个
@@ -1446,11 +1651,13 @@ def cmd_resume(args):
 def cmd_interrupt_and_resume(args):
     """打断当前轮 + 确认它真的退出了 + 用新消息续跑，三件事不可分。
 
-    它唯一独有的收益：**护栏只会拒绝，不会替你等。** `cmd_resume` 早就拦住了
-    「对还在跑的会话 resume」（实测 stop 之后 0.164 秒 resume，拿到的是干净的
-    exit 2 拒绝，不是 thread-store conflict），但调用方拿到 exit 2 之后得自己
-    写重试循环——间隔多少、上界多少、超时了怎么办，全是软约定，每个调用方现编
-    一遍，编错了没人告诉他。收走这个循环就是这条命令存在的全部理由。
+    它独有的收益有两条，**都和「等」无关**（等上一轮收尾已经是 run_codex 的事，
+    三条路一视同仁）：
+
+    ① **五道闸全部排在 INT 之前。** INT 发出去就收不回来，所以「该不该续跑」
+       必须在动手之前问完（见 check_can_resume）。
+    ② **挡第二发 INT。** 超时的处置是稍后重跑这条命令，而重跑会再走一遍这里；
+       用本轮日志里已有的打断痕迹判，不发第二发（见下面那一支）。
 
     **`codex queue` 对 `codex exec` 完全无效**（2026-09-19 实测）：任务跑着时
     不收，resume 之后也不收，而且**静默成功、退出码 0**——比「不能用」更危险，
@@ -1474,9 +1681,10 @@ def cmd_interrupt_and_resume(args):
     check_can_resume(args.task, meta, args.brief)   # 2/3/4/5. session id / 目录 / brief 是文件 / brief 不自带兜底句
     # ────── 以上全过，才允许动手 ──────
 
-    # meta 在这里读一次就一直用到 _resume_round。wait_for_exit 之后它已经旧于
-    # 磁盘上那份（被打断的那一轮会在收尾时写元数据），但无损：差异字段只有
-    # session_id（为空早被上面的闸拒了）和 effort／started_at（本来就要刷新）。
+    # meta 在这里读一次就一直用到 _resume_round，中途可能旧于磁盘上那份（被打断
+    # 的那一轮会在收尾时写元数据），但无损：差异字段只有 session_id（为空早被
+    # 上面的闸拒了）、effort／started_at（本来就要刷新），以及 writer_pid／
+    # writer_start——后两个由 run_codex 临落盘前现盖，这里拿的是哪一份都不影响。
     report, log = _report_path(home, args.task), _log_path(home, args.task)
     pid = find_codex_pid(report)
     if pid is None:
@@ -1496,11 +1704,6 @@ def cmd_interrupt_and_resume(args):
         else:
             interrupt_codex(pid, log, "interrupt-and-resume")
             print(f"[codex-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
-        if not wait_for_exit(report, INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL):
-            reject(f"任务 {args.task} 收到 INT 后 {INTERRUPT_EXIT_TIMEOUT} 秒还没退出，"
-                   f"还在收尾。稍后重跑这条命令即可——它不会再发第二发 INT。"
-                   f"绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。")
-        print("[codex-agent] 已确认退出，本轮被提前结束——已做的部分留在上下文里")
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
@@ -1677,8 +1880,10 @@ def main():
     # stdout 接管道／文件时文本层默认**块缓冲**，而这条 fd 有两个写者：
     # 本模块的 print 走文本层，run_codex 的 tee 走 sys.stdout.buffer（自己 flush）。
     # 不改成行缓冲，包装器「此刻正在发生什么」的话会排到 codex 整轮输出之后
-    # （2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT`、`已确认退出` 两句
-    # 都落在最后面，而 wait_for_exit 卡住的那 60 秒里屏幕上一个字都没有）。
+    # （2026-09-19 端到端实测拿到过这个错序：`已发 SIGINT` 那句落在最后面）。
+    # 最吃这条的是 `_wait_previous_round_ends` 那句「上一轮还在收尾，最多等 N 秒」：
+    # 它排在本轮分隔符**之前**，日志里此刻什么都没有，屏幕再不出声就是个静默挂起
+    # ——**那句话当场看得见，正是这一行行缓冲买到的东西**。
     #
     # **在这里改一次**，而不是每个 print 加 flush=True，也不是收一个 _say()——
     # 那两种都是软约定：15 个调用点都得记得用对的那个，漏一个就静默错序，
