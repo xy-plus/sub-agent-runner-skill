@@ -1,184 +1,186 @@
-# 只给 writer 一个身份，别的都别动
+# 上一轮的写者停了没：查它的进程身份
 
-日期：2026-09-20　状态：第六版，待审查
+日期：2026-09-20　状态：**第八版**，按 v7 审查重写，可进入实现
 
 判据层级：**三条铁律 > 仓库规范 > 既有文档**。
 
-## 版本小史：同一个形状错了五次
+## 版本小史：同一个形状错了七次
 
-每一版的修法都自带一个**没人保证的新前提**：
+每一版的修法都自带**没人保证的新前提**：
 
 | 版本 | 做法 | 自带的新前提 | 谁保证 |
 |---|---|---|---|
-| v1 | 日志写「收尾标记」+ 文本匹配 | 日志文本恰好没有别人写 | 没人 |
-| v2/v3 | 日志文件加排他锁 | 锁的释放 = stdout 管道 EOF | **stdout 刻意给全部后代** |
-| v4 | PID+启动时刻，等 `gone` | harness 的 bash/node 何时回收 | **第三方** |
-| v5 | 再存 codex 身份，分两次写 | **writer 活到第二次写完** | **那条链上唯一会死的进程** |
-| v6 | 只记 writer 身份，pidfd 等待 | pidfd 可用（内核 ≥5.3 / Python ≥3.9） | 环境——**而且它一分钱没买到，见 §4** |
+| v1 | 日志写「收尾标记」+ 文本匹配 | 日志文本恰好没别人写 | 没人 |
+| v2/v3 | 日志文件加排他锁 | 锁释放 = stdout 管道 EOF | stdout 刻意给全部后代 |
+| v4 | PID+启动时刻，等 `gone` | harness 何时回收 | 第三方 |
+| v5 | 再存 codex 身份，分两次写 | writer 活到第二次写完 | 链上唯一会死的进程 |
+| v6 | pidfd 等待 | pidfd 可用（内核/Python 版本） | 环境——而且**一分钱没买到** |
+| v7 | 等待折进 `run_codex` | **「上一轮的 meta」指磁盘还是参数** | **没人写死** |
 
-**第五次的病根说得最清楚**：v5 把「现场可观测的事实」（`/proc` 里有没有那个进程）
-换成了「有人记得写下来的记录」，而那个「有人」就是 writer 自己。
+**v7 那条的代价**：按「参数」读，`cmd_run` 传的是刚造的 `new_meta()`，`writer_pid` 就是本进程
+→ 每次 `run` 都在等自己 → **一个任务都起不来**（审查实测）。
 
-**v6 的做法：只把 writer 的身份记下来，别的全部保持现状。**
-`writer_pid` = `os.getpid()`，**Popen 之前就知道** → 一次 `write_meta` 写完 →
-v5 的 §6、N1、N2 一起消失。
-
-## 1. 病根（订正 v5 的说法）
+## 1. 病根
 
 续跑之前要确认**没有人还会往这份日志里写字**，而真正在写的是**包装器**：
 tee 读 codex 的 stdout **管道**，codex 的后代继承了它，codex 死了管道不 EOF。
 
-**v5 §1 说「现在等的是 codex 从 `/proc` 消失」——不准确。** 实测：僵尸的 `cmdline` 是空的，
-而 `find_codex_pid` 用 argv 精确比对，所以今天的 `wait_for_exit` 在 codex
-**变僵尸那一刻**就返回 True。排干还有好几秒。
+今天的 `wait_for_exit` 等的是 `find_codex_pid` 返回 None，而**僵尸的 `cmdline` 是空的**，
+argv 精确比对天然拒绝它——所以它在 codex **变僵尸那一刻**（实测 0.027s）就返回 True，
+而 writer 还要排干好几秒。
+
+## 2. 改动
+
+### 2.1 元数据加两个字段，一次写完
 
 ```
-t=0.000s  codex=zombie  writer=alive    ← wait_for_exit 此刻已返回 True，而日志还在长
-t=3.007s  writer 才退出
+writer_pid / writer_start      （str）
 ```
 
-## 2. 改动：加一个 writer 身份，等待条件变成「两个都停了」
+**身份由 `run_codex` 盖**——它是唯一的 spawn 入口，`run` / `resume` /
+`interrupt-and-resume` 三条路都经过它。
 
-```
-元数据新增两个字段：writer_pid / writer_start        （str，一次写完）
-writer_still_running(meta) -> bool                   （读 /proc 比对身份）
-wait_until_quiet(meta, timeout)                      （pidfd 阻塞等）
-```
+**但键集仍由唯一构造器派生**：`new_meta` 收两个**显式参数**，由 `run_codex` 唯一传入。
+**不许占位 `None`**（仓库规范 6）。
 
-**codex 那一侧一个字不改**：`find_codex_pid` 的 uid / comm / argv 三道过滤全部保留。
-它是现场事实，writer 死了它照样说真话。
+> 为什么不能让 `new_meta` 自己去拿身份：`_resume_round` **不经过 `new_meta`**
+> （它只刷 `effort`/`skills`/`started_at`）→ resume 那两条路会落盘**上一轮的陈旧身份**。
+> 为什么不能只在 `run_codex` 里事后塞进 dict：`REQUIRED_META_KEYS = tuple(new_meta(...).keys())`
+> 拿不到这两个键 → 校验面漏掉、老元数据 `KeyError`。
 
-### 「僵尸算哪边」这个问题在 v6 里不存在
-
-v5 花了一整节论证「僵尸在两处语义相反，所以要三个命名谓词」。实测发现**两边今天都已经免费做对了**：
-
-| | 僵尸期的行为 | 谁做对的 |
-|---|---|---|
-| codex | `cmdline` 为空 → argv 比对拒绝 → 不发信号 | **今天的 argv 过滤**（无名、无测试的承重行为，要补注释 + 突变） |
-| writer | pidfd 在**终止**那一刻可读，不等回收 | **pidfd 语义自带** |
-
-所以谓词从 3 个降到 1 个，落盘字段从 4 个降到 2 个。
-
-### 等待条件：两个都停了
-
-| | |
-|---|---|
-| 还有人写日志吗 | `writer_still_running` |
-| 会话还被占着吗 | `find_codex_pid`（孤儿 codex：SIGKILL 掉 writer 后 codex 会存活跑完，实测） |
-
-### 等待折进 `run_codex`，不留给调用方
-
-计划编写时发现一个 v6 留下的**真缺口**：`cmd_resume` 也只看 codex。
-上一轮被打断、codex 已没、writer 还在排干时，`resume` 当场放行 → 新一轮的分隔符写进日志 →
-**老 writer 的输出落在它后面** → `judge` 把上一轮的尾巴算成这一轮。
-**同一类 bug，换了个入口。**
-
-所以不要问「哪个命令该等」——**`run_codex` 是唯一的 spawn 入口，三条路都经过它**：
+### 2.2 等待折进 `run_codex`，读**磁盘上**那份 meta
 
 ```
 run_codex:
-    读出**上一轮**元数据里的 writer 身份 → 等它停 + 等 codex 停
-    → 写新元数据（含自己的身份）→ clear_report → 写分隔符 → spawn
+    1. 从**磁盘**读上一轮：_load_meta(meta_path(home, task))
+       文件不存在 ＝ 没有上一轮 ＝ 直接放行
+    2. 打印一句「上一轮还在收尾，最多等 N 秒」        ← 见 §5
+    3. 轮询到「上一轮的 writer 停了」且「codex 也停了」
+    4. write_meta（含**自己**的身份）→ clear_report → 写分隔符 → spawn
 ```
 
-调用方不可能忘，也不存在「哪个入口漏了」。
+**传进来的 `meta` 参数只用于写新的那份，绝不用于判断等谁。** 这条要写进注释并配突变。
 
-`cmd_interrupt_and_resume` 仍然要用 `find_codex_pid` 决定**要不要发 INT**（要的是 pid，
-而且僵尸不该发）——那是另一件事，保留。
+顺序是承重的：**等待排在 `write_meta` / `clear_report` / 分隔符之前，所以超时不留半个状态。**
+这是本版最值钱的性质，写进注释，别让它变成无名承重行为。
+
+### 2.3 为什么 `cmd_*` 一个字都不用改
+
+v7 之前的方案要逐个命令补闸，而 `cmd_resume` 也只看 codex——上一轮被打断、codex 已没、
+writer 还在排干时它当场放行，老 writer 的输出会落在新分隔符之后。**同一类 bug 换个入口。**
+
+折进唯一 spawn 入口之后，「哪个入口漏了」这个问题**结构上不存在**。
+实测：加完字段、加完闸，**36 处 `mock.patch.object(ca, "find_codex_pid", …)` 一处都不用动**。
+
+### 2.4 `interrupt-and-resume` 还剩什么独有价值
+
+三处 docstring 现在写的是「**护栏只会拒绝，不会替你等**」——等待社会化之后**这句话全假**。
+正确答案是：**五道闸排在 INT 之前**（INT 发出去收不回来）＋ **挡第二发 INT**。
+三处都要改。
 
 ## 3. 身份：PID + 启动时刻
 
-`/proc/<pid>/stat` 第 22 字段。实测（PID namespace 强制复用）：裸 `os.kill(pid,0)` 说「活着」，
-比对启动时刻正确判「已退出」。
+`/proc/<pid>/stat` 第 22 字段。实测：裸 `os.kill(pid,0)` 对复用后的 PID 说「活着」，
+比对启动时刻能正确判死。
 
-**解析**：`comm` 可含空格、括号、制表符、**裸换行**（实测都出现过）→ 必须**整文件读 bytes**、
-从**最后一个 `)`** 之后切；**禁止按行读**（要有突变钉住）。
+**解析**：`comm` 可含空格、括号、制表符、**裸换行** → **整文件读 bytes**、从**最后一个 `)`**
+之后切；**禁止按行读**（配突变）。
 
-**类型定 `str`**：json 往返不保类型，实测「存 int 比 str」会把活着的任务**静默判死**。
-`_load_meta` 要校验类型。pid 用到 `os.kill` 时要转 int（实测 `os.kill("123", …)` 直接 `TypeError`）。
+**类型问题用构造消掉，不用校验**：让写入和比对**共用同一个函数**产生那个值
+（`_starttime_of(pid)`），类型不匹配从构造上无从发生 → `_load_meta` 不必为这两个字段加
+非对称的类型校验（它今天的设计注释明写「只校验键在不在」）。
 
 ### 10ms 刻度不是问题：余量 44 万倍
 
-| | 本机实测 |
-|---|---|
-| 要撞同一刻度，得在 10ms 内绕完 `pid_max`(4,194,304) | 需 4.19 亿次 fork/秒 |
-| 实际 fork 速率 | 942 次/秒 |
-| **余量** | **445,255 倍** |
+要撞同一刻度得在 10ms 内绕完 `pid_max`(4,194,304) ＝ 4.19 亿次 fork/秒；本机实测 942 次/秒。
+**余量 445,255 倍，一条注释，零行代码。**
 
-**一条注释，零行代码。** 唯一真实边界：别拿它判活不到 10ms 的短命进程——
-本工具记身份的只有 writer，陪跑整轮。
+> v6 曾写「靠 writer 陪跑整轮」来论证它——**那个论证是错的**（`write_meta` 在 Popen 之前，
+> Popen 一炸 writer 几毫秒就死）。真正兜底的是上面那个余量。**结论对、理由错，改理由。**
 
 ## 4. 不用 pidfd，直接轮询
 
-v6 用 `os.pidfd_open` + `select`。计划编写时算了一笔账，**它一分钱没买到**：
+v6 用 `pidfd_open` + `select`。账算下来**一分钱没买到**：codex 那半没有记身份、只能轮询扫
+`/proc`，**整个函数的唤醒粒度本来就被轮询间隔钉死**，pidfd 最多买到一个间隔，
+代价是 `import select` + ENOSYS 拒绝路径 + 三条 TOCTOU 契约 + 约 40 行测试。
 
-> codex 那半**没有记下来的身份**，只能轮询扫 `/proc`。所以整个等待函数的唤醒粒度
-> **本来就被 `poll_interval` 钉死了**——pidfd 在 writer 那半最多买到一个轮询间隔，
-> 代价是 `import select` + ENOSYS 拒绝路径 + 三条 TOCTOU 契约注释 + 3 条测试（约 40 行）。
+**直接轮询。** 内核版本前提、`hasattr` 挡不住 `ENOSYS`、三条 TOCTOU 契约——全部不需要。
 
-所以：**直接轮询 `writer_still_running` + `find_codex_pid`，两个都停就往下走。**
-一并删掉 v6 的内核版本前提、`hasattr` 挡不住 `ENOSYS` 那段、以及三条 TOCTOU 契约。
+### writer 谓词必须自己看 state
 
-### 但 `writer_still_running` 必须同时看 state
-
-v6 把「僵尸算写完了」交给 pidfd 语义。没有 pidfd 之后，**谓词自己要管**：
-只比对启动时刻会把僵尸 writer 报成「还在写」，而它的 fd 早已全关。
+只比对启动时刻会把**僵尸 writer** 报成「还在写」，而它的 fd 早已全关。
+**实测：僵尸期的 `starttime` 与存活期完全相同，`os.kill(pid,0)` 也说「活着」**
+——这一行不是锦上添花，是承重梁（v4 被否的那条前提会原样回来）。
 
 ```
 文件不在 / 启动时刻对不上 / state == "Z"   → 停了
 否则                                        → 还在写
 ```
 
-多一行，配一条测试 + 突变。
+谓词只有 `run_codex` 一个调用点，**设为私有**，收 `(home, task)` 而不是可以传错任务的 dict。
+名字要诚实：它答的是「上一轮那个进程还在吗」，不是「还有人写日志吗」。
 
-## 5. 超时是策略值，按命令分开说
+## 5. 超时与输出
 
-排干多久由 codex 起的后代决定，**无上界**（起个后台服务就永不结束）。
-所以超时 = 本工具愿意等多久，不是实测上界。现有 `INTERRUPT_EXIT_TIMEOUT >= 1.854 * 30`
-那条测试正把它当上界钉着，**要一起改**。
+排干多久由 codex 起的后代决定，**无上界**。所以超时 = 策略值，不是实测上界。
+常量改名（去掉 `INTERRUPT_` 前缀，等待已不是它独有），注释写明这一点。
 
-诊断按命令分：
+**等待开始前必须打印一句**，否则 `run` 这条路会变成一个全新的静默挂起
+（等待排在分隔符之前，屏幕和日志都是死的）。这句只进屏幕不进日志——
+正是 `main()` 行缓冲那条改动买到的东西。
 
-| 命令 | 超时时说什么 |
+超时文案按 `kind` 分（文案产生在 `run_codex` 内，它认得 `kind`）：
+
+| kind | 说什么 |
 |---|---|
-| `cmd_run` / `cmd_resume` | 上一轮还在收尾；若 codex 也活着 → 换个任务名，或先 stop |
-| `cmd_interrupt_and_resume` | codex 已退出，但包装器还在读输出——很可能它起的后台进程还占着输出管道。**不要再 stop**（已发过 INT，现有闸会挡第二发） |
+| `run` / `resume` | 上一轮还在收尾；若 codex 也活着 → 换个任务名，或先 stop |
+| `interrupt-and-resume` | codex 已退出，但包装器还在读输出——很可能它起的后台进程还占着输出管道。**不要再 stop**（已发过 INT，现有闸会挡第二发） |
 
-## 6. 四者对齐：要改的地方（v5 只列了 5 处，实查 18+）
+## 6. 四者对齐：要改的地方
 
-**本仓没有 README，doc 那一角就是 `SKILL.md`，实查干净**（`OWNED_BY_CODE` 的
-`/proc|pgrep|pkill` 模式在其中无命中）→ 只需改 `OWNED_BY_CODE` 的值。
+**本仓没有 README，doc 那一角是 `SKILL.md`，实查干净**（`/proc|pgrep|pkill|writer|pid` 零命中）
+→ 只需改 `OWNED_BY_CODE` 的值。
 
 | 位置 | 要改什么 |
 |---|---|
-| `test_codex_agent.py` `TestMetaShape.FIELDS` 七字段**绝对值** + `assertNotIn("pid", FIELDS)` | **直接锁死本改动**，加字段必红；其注释「存下来的 PID 会过期、会被复用」是本改动的反命题 |
-| 同文件 `test_run落盘的元数据键集_不多不少` 的注释 | 同一意图的第三个家 |
-| `codex_agent.py` `new_meta` docstring「刻意没有 pid…」 | 反命题本尊——但**只反 codex 那半句**，writer 身份是新加的，要写清区别 |
-| tee 循环里「**已登记的跟进项（尚未修）**：这个循环等的是 stdout 管道 EOF…」整段 | **这次就是在修它** |
-| `INTERRUPT_EXIT_TIMEOUT == 60` **且** `>= 1.854 * 30` 两条断言 | 第二条把策略值当实测上界 |
-| `TestInterruptAndResumeOrder` 里 `assert_called_with(..., INTERRUPT_EXIT_TIMEOUT, INTERRUPT_POLL_INTERVAL)` | 等待入口变了 |
-| 任务名限制的历史注记「反查改成扫 `/proc`…见 `find_codex_pid`」 | `find_codex_pid` **保留**，这条不用改（v5 要改是因为 v5 要删它） |
-| 模块 docstring 的「元数据原子替换——status 永远看不到半截 json」 | 一次写完，**不用加限定**（v5 分两次写才需要） |
-| 约 32 处 `mock.patch.object(ca, "find_codex_pid", ...)` | **一处都不用动**（v6 不删它）——这是 v6 相对 v5 最大的省 |
+| `test_codex_agent.py` `_full_meta`（7 字段硬编码，**59 处调用**） | **字段清单的第四个家**。实测：只加字段不改它 → **226 条炸 43 条**；补上后只剩 1 条 |
+| `TestMetaShape.FIELDS` 绝对值 + `assertNotIn("pid", FIELDS)` | 直接锁死本改动 |
+| `test_run落盘的元数据键集_不多不少` 的注释 | 同一意图第三个家 |
+| `new_meta` docstring「刻意没有 pid…」 | 只反 codex 那半句；writer 身份是新加的，写清区别 |
+| tee 循环「**已登记的跟进项（尚未修）**」整段 | **这次就是在修它** |
+| `INTERRUPT_EXIT_TIMEOUT == 60` 且 `>= 1.854*30` **且** `INTERRUPT_POLL_INTERVAL < 0.964` | **三条**（v7 只列了两条）；后两条把 codex 的 INT 退出实测当上界 |
+| **`wait_for_exit` 整体删除** | 唯一调用点被搬走，**去掉它什么都不丢**。连带：8 处 `mock.patch` + 4 处直调 + 测试里 3 条注释 + 代码里 3 条注释 + 它自己的 docstring（其中「存活判据与 `status` 同一套」在本版后变成假话） |
+| `cmd_resume` / `cmd_interrupt_and_resume` / `wait_for_exit` 三处「护栏只会拒绝，不会替你等」 | 见 §2.4 |
+| `cmd_interrupt_and_resume` 的 `print("已确认退出…")` 与「meta 旧于磁盘」那段 | 等待被搬走，作用域变了 |
+| `write_meta` docstring「同一个任务不可能有两个并发写者」 | 等待插在闸之后，窗口从几毫秒拉长到最多一个超时 |
+| 模块 docstring 承重约束清单 | 「元数据原子替换」不用加限定（一次写完）；但等待语义那条要更新 |
+| 任务名历史注记「见 `find_codex_pid`」 | **不用改**（`find_codex_pid` 保留，核实为真） |
+
+### 加字段的仪式已执行并记录
+
+代码里那条硬前置要求「加字段前先确认没有在跑的任务……那是当时的事实，不是永久豁免」。
+**2026-09-20 执行结果**：三个隔离目录 `tasks/` 共 **0 个 json**（acct2/acct3 连目录都没有），
+当前用户的 codex 进程无一属于本工具 → **本次爆炸半径为零**。写进那段注释，续上日期。
 
 ## 7. 测试
 
 | 测什么 | 关键点 |
 |---|---|
-| 身份挡得住 PID 复用 | PID 相同、启动时刻不同 → 不算 running |
-| `comm` 含空格/括号/制表符/**裸换行** | 仍解析正确；**突变：改成按行读 → 必须红** |
-| starttime 类型 | 存 int 比 str → 被 `_load_meta` 拒，不能静默判死 |
-| **codex 早变僵尸、writer 还在排干时必须继续等** | 本次回归锁。突变：只等 codex → 必须红 |
-| **孤儿 codex** | SIGKILL 掉 writer，codex 仍活 → 等待不许返回。突变：只等 writer → 必须红 |
-| pidfd 复校排在阻塞之前 | 突变：写反 → 必须红（用小超时，别让测试自己挂死） |
-| pidfd 不可用时的退化 | 给人话拒绝，不是 traceback |
-| 僵尸 codex 不发信号 | 今天靠 argv 过滤免费做对，**补一条突变**把这条无名行为钉住 |
-| 超时常量 | 绝对值钉住；**删掉「≥1.854×30」那条**（策略值不是上界） |
+| **等的是磁盘上那份，不是参数** | 本版头号回归锁。突变：改读参数 → 必须红（且**不能**让测试卡满超时） |
+| 身份挡得住 PID 复用 | PID 相同、启动时刻不同 → 判停 |
+| **僵尸 writer 算停了** | 实测僵尸的 starttime 与存活期相同 → 突变：去掉 `state=="Z"` → 必须红 |
+| `comm` 含空格/括号/制表符/**裸换行** | 突变：改按行读 → 必须红 |
+| **孤儿 codex** | SIGKILL 掉 writer、codex 仍活 → 不许放行。突变：只等 writer → 必须红 |
+| **只等 codex** | 突变 → 必须红（这是病根本身） |
+| 超时不留半个状态 | 超时后 `write_meta`/`clear_report`/分隔符**都没发生** |
+| 等待前有输出 | 突变：去掉那句 print → 必须红 |
+| 僵尸 codex 不发信号 | 今天靠 argv 过滤免费做对，**补突变**把这条无名承重行为钉住 |
+| 超时常量 | 绝对值钉住；**删掉两条把实测当上界的断言** |
 
 依赖外部进程的测试**先断言前提成立**（本仓栽过七次）。
 
 ## 8. 非目标
 
-- **`find_codex_pid`、`pid_alive`、`interrupt_codex`、`judge`、`read_*` 一律不动。**
-- 不改日志格式、不引入锁、不引入任何文本标记、**不引入 pidfd**。
+- `find_codex_pid` / `pid_alive` / `interrupt_codex` / `judge` / `read_*` 一律不动。
+- 不改日志格式、不引入锁、不引入文本标记、**不引入 pidfd**。
 - 不为 10ms 刻度做任何机制。
