@@ -475,59 +475,67 @@ def run_codex(argv, env, home, task, kind, meta):
     "Reading additional input from stdin" + 进程 0% CPU）。
     不设 timeout：会误杀正当的长任务。
     """
+    # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
+    # 不会留下一个没人管的孤儿进程。（实测教训：原先要求调用方自己先 write_meta，
+    # 漏了的话会在 codex 已经跑起来之后才炸 FileNotFoundError。）
     write_meta(home, task, meta)
     clear_report(_report_path(home, task))
 
-    # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
-    # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
-    # 就是这么干的）会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、
-    # 再也 resume 不了、上下文全丢。隔到独立会话后 codex 收不到任何组信号，
-    # 只会收到下面 handler 转发的 INT。
-    proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            start_new_session=True)
-
-    def forward_as_sigint(signum, frame):
-        # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
-        # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
-        try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            pass
-
-    # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
-    # 而不还原，等于把本函数的副作用留给了整个进程的余生。
-    previous = {sig: signal.signal(sig, forward_as_sigint)
-                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-    try:
-        _tee_until_exit(proc, home, task, kind, meta)
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-
-
-def _tee_until_exit(proc, home, task, kind, meta):
-    head, session_id = b"", None
-    # 日志追加不覆盖，进来先写一行本轮分隔符——判据只扫它之后的内容。
+    # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
     with open(_log_path(home, task), "ab") as log:
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
         log.flush()
-        # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
-        # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
-        # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
-        # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
-        for chunk in iter(lambda: proc.stdout.read1(1024), b""):
-            sys.stdout.buffer.write(chunk)
-            sys.stdout.buffer.flush()
-            log.write(chunk)
-            log.flush()
-            if session_id is None and len(head) < _HEAD_LIMIT:
-                head += chunk
-                session_id = extract_session_id(head.decode("utf-8", "replace"))
-                if session_id:
-                    meta["session_id"] = session_id
-                    write_meta(home, task, meta)
+
+        # start_new_session=True 不是为了 detach，是为了挡**组信号**。2026-09-19 实测：
+        # codex 与包装器同进程组时，一发 `kill -TERM -<组>`（harness 停掉后台 Bash 任务
+        # 就是这么干的）会直接把 codex TERM 死，而 SIGTERM 之后 thread 永久锁死、
+        # 再也 resume 不了、上下文全丢。隔到独立会话后 codex 收不到任何组信号，
+        # 只会收到下面 handler 转发的 INT。
+        #
+        # stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
+        # "Reading additional input from stdin" + 进程 0% CPU）。
+        # 不设 timeout：会误杀正当的长任务。
+        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+
+        def forward_as_sigint(signum, frame):
+            # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume。
+            # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
+            try:
+                proc.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+
+        # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
+        # 而不还原，等于把本函数的副作用留给了整个进程的余生。
+        previous = {sig: signal.signal(sig, forward_as_sigint)
+                    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        try:
+            _tee_until_exit(proc, log, home, task, meta)
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+
+def _tee_until_exit(proc, log, home, task, meta):
+    head, session_id = b"", None
+    # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
+    # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
+    # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
+    # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
+    for chunk in iter(lambda: proc.stdout.read1(1024), b""):
+        sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        log.write(chunk)
+        log.flush()
+        if session_id is None and len(head) < _HEAD_LIMIT:
+            head += chunk
+            session_id = extract_session_id(head.decode("utf-8", "replace"))
+            if session_id:
+                meta["session_id"] = session_id
+                write_meta(home, task, meta)
     proc.wait()
 
 

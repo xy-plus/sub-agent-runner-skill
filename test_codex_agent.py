@@ -563,18 +563,26 @@ class TestRunGuards(_HomeSandbox):
         self.assertTrue(popen.called)
         self.assertFalse((d / "reports" / "t.md").exists())
 
-    def test_清报告发生在spawn之前_不是之后(self):
-        # 顺序反了等于没清：codex 收尾写下的报告会被紧接着的 unlink 删掉
+    def test_开跑前三件事全在spawn之前做完(self):
+        # 顺序反了每一件都会坏事：
+        #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
+        #   写元数据在 spawn 之后 -> 中途炸了就留下一个没人管的孤儿 codex
+        #   写分隔符在 spawn 之后 -> 同上，而且判据会把上一轮的错误算到这一轮头上
         d = ca.ensure_isolation("default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
+        (d / "logs" / "t.log").write_text("上一轮的日志\n")
         seen = {}
+
+        def snapshot(*a, **k):
+            seen["旧报告还在"] = (d / "reports" / "t.md").exists()
+            seen["元数据已落盘"] = ca.meta_path(d, "t").exists()
+            seen["分隔符已写入"] = ca.ROUND_MARK in (d / "logs" / "t.log").read_text()
+            return mock.DEFAULT
+
         with _no_codex() as popen:
-            popen.side_effect = lambda *a, **k: seen.setdefault(
-                "报告还在", (d / "reports" / "t.md").exists()) or mock.DEFAULT
-            popen.return_value.stdout.read1.return_value = b""
-            popen.return_value.wait.return_value = 0
+            popen.side_effect = snapshot
             ca.cmd_run(self._args(task="t"))
-        self.assertIs(seen["报告还在"], False)
+        self.assertEqual(seen, {"旧报告还在": False, "元数据已落盘": True, "分隔符已写入": True})
 
     def test_日志是追加的_上一轮的内容不会被冲掉(self):
         d = ca.ensure_isolation("default")
