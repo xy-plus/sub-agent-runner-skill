@@ -1063,9 +1063,16 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 三件代码保证不了、只能靠调用方知道的事
         self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
         self.assertIn("brief", skill)               # brief 只收文件路径
-        for code in ("0", "1", "3", "4", "130"):    # 退出码是对外契约
-            with self.subTest(code=code):
-                self.assertIn(f"`{code}`", skill)
+        # 退出码是对外契约，钉的是**数字和状态名的配对**，不是「这个数字出现过」。
+        # 只钉出现过的话，把表改成 `1` interrupted / `130` failed（五个数字一个
+        # 不少、含义全反）照样全绿——实测过。
+        # 配对表从 EXIT 派生，不另写一份清单：两份清单必然漂移。
+        for state, code in ca.EXIT.items():
+            with self.subTest(state=state):
+                self.assertRegex(skill, rf"`{code}`\s*{state}",
+                                 f"SKILL.md 里 {code} 没有紧跟着 {state}")
+        # USAGE_ERROR 不在 EXIT 表里（它不是判据结论），单独钉
+        self.assertRegex(skill, r"`2`.*(参数|护栏)")
         # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
         # 在途工作损失多少，后者在 codex 里根本不可观测
         self.assertIn("值不值", skill)
@@ -1983,27 +1990,30 @@ class TestInterruptCodex(unittest.TestCase):
 
 
 class TestWaitForExit(unittest.TestCase):
+    # 一律传 pathlib.Path：契约就是 Path（find_codex_pid 的注释专门强调过
+    # 「全模块只剩传 Path 一种传法」）。测试示范 str 的话，下一个人会照着传 str，
+    # 而那正是那条注释要消掉的缝。
     def test_进程退出后返回True(self):
         with mock.patch.object(ca, "find_codex_pid", side_effect=[4242, 4242, None]):
-            self.assertTrue(ca.wait_for_exit("/x/reports/t.md", 5, 0.01))
+            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 5, 0.01))
 
     def test_一直不退则超时返回False(self):
         with mock.patch.object(ca, "find_codex_pid", return_value=4242):
-            self.assertFalse(ca.wait_for_exit("/x/reports/t.md", 0.05, 0.01))
+            self.assertFalse(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01))
 
     def test_等待期间绝不发任何信号(self):
         # 超时的正确处置是告诉调用方稍后再来，不是加大火力。
         # 升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
-            ca.wait_for_exit("/x/reports/t.md", 0.05, 0.01)
+            ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 0.05, 0.01)
         k.assert_not_called()
 
     def test_超时是上界不是等待时长(self):
         # 一确认退出就立刻往下走，不把 timeout 睡满
         started = time.monotonic()
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertTrue(ca.wait_for_exit("/x/reports/t.md", 30, 0.01))
+            self.assertTrue(ca.wait_for_exit(pathlib.Path("/x/reports/t.md"), 30, 0.01))
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_两个常量的绝对值_并且余量对得上实测(self):
