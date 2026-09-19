@@ -484,22 +484,28 @@ def _log_path(home, task):
     return home / "logs" / f"{task}.log"
 
 
-def run_codex(argv, env, home, task, kind, meta):
+def run_codex(kind, home, task, meta, make_argv):
     """唯一的 spawn 入口。开跑前必须做的三件事全在这里，调用方不需要记住顺序：
     ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
 
-    原先这三件事散在调用方，实测漏掉「先 write_meta」会在 codex **已经跑起来
-    之后**才炸 FileNotFoundError，子进程当场变孤儿。
+    **报告路径由本函数拥有**，回传给 `make_argv` 去拼命令；`env` 也由 `home`
+    派生。原签名收现成的 `argv` 和 `env`，自己却又重新推导一遍报告路径去删，
+    于是留下三条没人保证的「必须记得对齐」：argv 里 `-o` 指的那个文件、被删掉
+    的那个文件、元数据文件名指的那个任务，得是同一个。三条一起错时它一声不吭
+    ——clear_report 删了别的文件（防陈旧报告这条 P0 静默失效）、日志分隔符说谎、
+    元数据内容和文件名对不上。现在这三条在结构上就违反不了了。
 
-    stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
-    "Reading additional input from stdin" + 进程 0% CPU）。
-    不设 timeout：会误杀正当的长任务。
+    这三件事原先还散在调用方，实测漏掉「先 write_meta」会在 codex **已经跑起来
+    之后**才炸 FileNotFoundError，子进程当场变孤儿。
     """
+    report = _report_path(home, task)
+    argv = make_argv(str(report))
+    env = codex_env(home)
+
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
-    # 不会留下一个没人管的孤儿进程。（实测教训：原先要求调用方自己先 write_meta，
-    # 漏了的话会在 codex 已经跑起来之后才炸 FileNotFoundError。）
+    # 不会留下一个没人管的孤儿进程。
     write_meta(home, task, meta)
-    clear_report(_report_path(home, task))
+    clear_report(report)
 
     # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
@@ -591,10 +597,10 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text())
     print(f"[codex-agent] 已在 brief 前自动加上：{SKILL_GUARD}")
 
-    run_codex(build_run_argv(str(workdir), args.effort, str(report), brief),
-              codex_env(home), home, args.task, "run",
+    run_codex("run", home, args.task,
               {"task": args.task, "account": args.account, "dir": str(workdir),
-               "effort": args.effort, "session_id": None, "started_at": _now_iso()})
+               "effort": args.effort, "session_id": None, "started_at": _now_iso()},
+              lambda r: build_run_argv(str(workdir), args.effort, r, brief))
 
     verdict = judge(report, _log_path(home, args.task), None)
     _print_verdict(args.task, verdict)
@@ -647,8 +653,8 @@ def cmd_resume(args):
     ensure_isolation(meta["account"])
     brief = prepend_skill_guard(brief_file.read_text())
     meta["effort"] = args.effort          # 元数据始终描述最后一次调用
-    run_codex(build_resume_argv(meta["dir"], meta["session_id"], args.effort, str(report), brief),
-              codex_env(home), home, args.task, "resume", meta)
+    run_codex("resume", home, args.task, meta,
+              lambda r: build_resume_argv(meta["dir"], meta["session_id"], args.effort, r, brief))
     verdict = judge(report, _log_path(home, args.task), None)
     _print_verdict(args.task, verdict)
     return EXIT[verdict.state]

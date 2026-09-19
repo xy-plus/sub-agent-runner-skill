@@ -821,6 +821,42 @@ class TestExitCodeContract(_HomeSandbox):
         self.assertEqual(ca._worse("success", "success"), "success")
 
 
+class TestRunCodexOwnsReportPath(unittest.TestCase):
+    """`run_codex` 自己拥有报告路径，不接受调用方算好的 argv。
+
+    原签名是 `run_codex(argv, env, home, task, kind, meta)`：argv 由调用方拼，
+    而 run_codex 又自己重新推导报告路径去删。三条「必须记得对齐」没有任何东西
+    保证——argv 里的 `-o`、被删的那个文件、元数据的文件名。三条一起违反时它
+    一声不吭：clear_report 删了别的文件（防陈旧报告这条 P0 静默失效）、
+    日志分隔符说谎、元数据内容和文件名对不上。
+    改成回传报告路径之后，这三条在结构上就违反不了了。
+    """
+
+    def _dir(self):
+        d = pathlib.Path(tempfile.mkdtemp())
+        for sub in ("tasks", "reports", "logs"):
+            (d / sub).mkdir()
+        return d
+
+    def test_拼命令用的报告路径就是它要删的那一个(self):
+        d = self._dir()
+        seen = {}
+
+        def make_argv(report_path):
+            seen["给调用方的"] = report_path
+            return ["codex"]
+
+        with _no_codex():
+            ca.run_codex("run", d, "t", _full_meta("t"), make_argv)
+        self.assertEqual(seen["给调用方的"], str(ca._report_path(d, "t")))
+
+    def test_环境变量由home派生_调用方传不进一个对不上的(self):
+        d = self._dir()
+        with _no_codex() as popen:
+            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(d))
+
+
 class TestSignalSafety(unittest.TestCase):
     """codex 只能死于 INT——这是整个工具最不能出错的一条保证。"""
 
@@ -830,7 +866,7 @@ class TestSignalSafety(unittest.TestCase):
             (d / sub).mkdir()
         popen.return_value.stdout.read1.return_value = b""
         popen.return_value.wait.return_value = 0
-        ca.run_codex(["codex"], {}, d, "t", "run", _full_meta("t"))
+        ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
 
     def test_codex起在独立会话里_组信号打不到它(self):
         with mock.patch.object(ca.subprocess, "Popen") as popen:
@@ -870,8 +906,8 @@ class TestRunCodexStreaming(unittest.TestCase):
             f"sys.path.insert(0, {str(pathlib.Path.cwd())!r});"
             "import codex_agent as ca;"
             f"d = pathlib.Path({str(d)!r});"
-            f"ca.run_codex([sys.executable, '-c', {fake_codex!r}], dict(os.environ),"
-            f" d, 't', 'run', {_full_meta('t')!r})"
+            f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
+            f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
         )
         proc = subprocess.Popen([sys.executable, "-c", driver],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -950,8 +986,8 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
             "import os,pathlib,sys\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
             "import codex_agent as ca\n"
-            f"ca.run_codex([sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}],"
-            f" dict(os.environ), pathlib.Path({str(d)!r}), 't', 'run', {_full_meta('t')!r})\n"
+            f"ca.run_codex('run', pathlib.Path({str(d)!r}), 't', {_full_meta('t')!r},"
+            f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}])\n"
         )
         # 包装器自己起在独立会话里，这样 killpg 只打到它那一组，不会波及测试进程
         proc = subprocess.Popen([sys.executable, "-c", driver],
