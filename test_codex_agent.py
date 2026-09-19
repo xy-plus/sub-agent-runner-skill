@@ -22,6 +22,8 @@
     兜底句里那句「动手前先逐个读一遍」——**许可不等于指令**，没有指令就没有那行
     `cat`，judge 看不见「它压根没读」，而「不软链」的论证正架在那行 `cat` 上
     `--skill` 收下什么就原样还什么（不 resolve）——命令行、brief、日志三处必须同一个串
+    白名单的形状（恒为 tuple[str]）在 parser 之下也有闸——裸 str 会被逐字符拆开
+    元数据**原子替换**——status 在另一个进程里并发读，永远看不到半截 json
 
 总纲：**空测试比没测试更糟。** 它占着「这条被测过」的位置，却什么都不挡。
 凡是依赖外部进程／文件的测试，先断言前提成立，前提不成立就 fail，别让它静悄悄
@@ -76,6 +78,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import warnings
@@ -131,6 +134,13 @@ def setUpModule():
         assert argv0 != "codex", (
             f"这条测试把真的 codex 叫起来了：{args!r}。少包了一层 _no_codex。")
         return _REAL_POPEN_INIT(self, args, *a, **kw)
+    # **它刻意不还原**（没有 tearDownModule，也没有 addModuleCleanup）：
+    # 泄漏半径是**整个测试进程的余生**，同进程里后来 import 的任何模块调
+    # `Popen(["codex", ...])` 都会被它挡住。现在不可达——本仓只有这一个测试
+    # 模块，只 import 一次。
+    # **安全性唯一的地基是上面那行 `_REAL_POPEN_INIT` 在模块顶层、import 那一刻
+    # 抓的**，所以插桩永远只有一层。实测 50 次 importlib.reload + setUpModule
+    # 会叠成 RecursionError——真要多次 reload 本模块，先把这条前提想清楚。
     subprocess.Popen.__init__ = no_real_codex
 
 
@@ -878,7 +888,7 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
     """
 
     def test_无白名单时的措辞(self):
-        self.assertEqual(ca.build_skill_guard([]), "**不得使用任何 skill。**")
+        self.assertEqual(ca.build_skill_guard(()), "**不得使用任何 skill。**")
 
     def test_有白名单时逐行列出每条绝对路径_并且带上去读的指令(self):
         """**许可不等于指令**——这是立项要杀的那类失效换了个形状。
@@ -890,7 +900,7 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
         （见 _add_prompt_round_args），指令没了那条论证也一起塌。
         """
         self.assertEqual(
-            ca.build_skill_guard(["/abs/one/SKILL.md", "/abs/two/SKILL.md"]),
+            ca.build_skill_guard(("/abs/one/SKILL.md", "/abs/two/SKILL.md")),
             "**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**\n"
             "- /abs/one/SKILL.md\n"
             "- /abs/two/SKILL.md")
@@ -898,11 +908,39 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
     def test_无白名单时不带这条指令_没东西可读(self):
         # 正面控制：指令只在有白名单那一支出现。少了它，一个「两支都加指令」的
         # 实现也全绿，而那句话在无白名单时是句废话（让它去读一个空清单）。
-        self.assertNotIn("读一遍", ca.build_skill_guard([]))
+        self.assertNotIn("读一遍", ca.build_skill_guard(()))
+
+    def test_白名单必须是tuple_裸str会被逐字符拆开(self):
+        """`args.skills` 恒为 tuple 这个不变量**只到 parser 为止**，parser 之下
+        本来一道闸都没有。实测那两种坏法**全是静默的**：
+
+            build_skill_guard("/abs/SKILL.md") → 拼出 14 行：`- /`、`- a`、`- b`…
+            build_skill_guard(None)            → 返回「无白名单」那句，白名单被无声吞掉
+
+        仓内三个调用点都传 args.skills 所以现在不可达——但 kind／cause／state
+        当初上 _require_enum 时也一样不可达。散文不是约束。
+        """
+        for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError) as cm:
+                    ca.build_skill_guard(bad)
+                self.assertIn("skills", str(cm.exception))
+
+    def test_白名单的每一项必须是路径字符串(self):
+        # Path 对象在兜底句里印出来一模一样，却会让 write_meta 的 json.dumps
+        # 在很久以后才炸；整数更坏，json 收得下，静默落盘。
+        for bad in ((pathlib.Path("/abs/SKILL.md"),), (1,)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ca.build_skill_guard(bad)
+
+    def test_空tuple和正常tuple都照收(self):
+        # 正面控制：没有它，一个「什么都拒」的实现也全绿
+        self.assertEqual(ca.build_skill_guard(()), "**不得使用任何 skill。**")
+        self.assertIn("- /a/SKILL.md", ca.build_skill_guard(("/a/SKILL.md",)))
 
     def test_brief自带兜底句就拒跑_并提示改用参数(self):
         with self.assertRaises(ca.Rejected) as cm:
-            ca.prepend_skill_guard("**不得使用任何 skill。**\n\n干活", [])
+            ca.prepend_skill_guard("**不得使用任何 skill。**\n\n干活", ())
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--no-skill", cm.exception.message)
         self.assertIn("--skill", cm.exception.message)
@@ -911,7 +949,7 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
         # 调用方照抄 SKILL.md 开头那句是**可达路径**，不拒就会出现两句互相
         # 矛盾的兜底句。字面量写死那句旧话：它已经不在代码里了，只能这么钉。
         with self.assertRaises(ca.Rejected):
-            ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", [])
+            ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", ())
 
     def test_SKILL_GUARD常量已经不存在_它不再是每轮同一句话(self):
         self.assertFalse(hasattr(ca, "SKILL_GUARD"),
@@ -1045,6 +1083,71 @@ class TestMeta(_HomeSandbox):
         self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
 
 
+class TestWriteMetaIsAtomic(_HomeSandbox):
+    """落元数据必须**原子替换**，不许原地截断重写。
+
+    `Path.write_text` 先把目标截成 0 再往里填，而 `status` 随时可能在另一个
+    进程里读同一份 json——`all_metas`／`find_meta` 都是裸 `json.loads`。
+    2026-09-20 实测（截断重写的版本）：1 秒里写 5289 次、并发读 12284 次，
+    其中 **8277 次读到半截 json**。撞上的调用方拿到的是一个裸
+    `JSONDecodeError` traceback，不是干净的护栏拒绝——正是本工具存在的理由
+    反过来。这个 bug 是被那条真进程信号测试偶发地照出来的：它轮询
+    `tasks/t.json` 等 session_id 落盘，而包装器正好在写。
+    """
+
+    def test_并发读永远读不到半截json(self):
+        d = ca.ensure_isolation("default")
+        meta = _full_meta("t", session_id="01a0b408-f718-7ff3-8123-d5202551acba")
+        ca.write_meta(d, "t", meta)
+        q = ca.meta_path(d, "t")
+        stop, bad, good = [False], [0], [0]
+
+        def reader():
+            while not stop[0]:
+                try:
+                    json.loads(q.read_text())
+                    good[0] += 1
+                except json.JSONDecodeError:
+                    bad[0] += 1
+                except FileNotFoundError:
+                    bad[0] += 1      # 目标短暂消失也算坏：status 会当成「没这个任务」
+
+        th = threading.Thread(target=reader)
+        th.start()
+        try:
+            deadline = time.time() + 0.3
+            while time.time() < deadline:
+                ca.write_meta(d, "t", meta)
+        finally:
+            stop[0] = True
+            th.join()
+        self.assertGreater(good[0], 100,
+                           f"前提不成立：读者根本没跑起来（成功读 {good[0]} 次），这条测不到并发")
+        self.assertEqual(bad[0], 0, f"{bad[0]} 次读到半截或消失的 json——写不是原子的")
+
+    def test_崩在替换之前留下的残片不会被当成任务(self):
+        """残片得由 `write_meta` **自己**造出来，不能手写一个名字去测。
+
+        手写 `t.json.tmp` 再断言 all_metas 忽略它，测的是那个手写的名字；
+        实现把临时名改成 `t.tmp.json`（会被 `*.json` 扫进去）照样全绿——
+        实测这个突变**存活**过。这里改成让 os.replace 崩掉，残片就是实现
+        真正用的那个名字。
+        """
+        d = ca.ensure_isolation("default")
+        ca.write_meta(d, "good", _full_meta("good"))
+        tasks = ca.meta_path(d, "good").parent
+        before = {q.name for q in tasks.iterdir()}
+        with mock.patch.object(ca.os, "replace", side_effect=OSError("崩在替换之前")):
+            with self.assertRaises(OSError):
+                ca.write_meta(d, "t", _full_meta("t"))
+        leftovers = {q.name for q in tasks.iterdir()} - before
+        self.assertTrue(leftovers, "前提不成立：没留下残片，这条测不到任何东西")
+        # 残片要是被 *.json 扫进去，它自己就成了一份「缺字段的坏元数据」，
+        # 而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）
+        self.assertEqual([m["task"] for _, m in ca.all_metas()], ["good"],
+                         f"残片 {leftovers} 被当成任务扫进来了")
+
+
 class TestMetaShape(_HomeSandbox):
     """元数据的形状只许有一个家。
 
@@ -1077,7 +1180,7 @@ class TestMetaShape(_HomeSandbox):
         self.assertIn("skills", self.FIELDS)
 
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", [])),
+        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
@@ -1091,6 +1194,14 @@ class TestMetaShape(_HomeSandbox):
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
                          set(ca.REQUIRED_META_KEYS))
+
+    def test_new_meta也守同一道_它是白名单的第二个家(self):
+        # 两个家各守一道：build_skill_guard 管送进 codex 的那份，new_meta 管落盘
+        # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
+        for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ca.new_meta("t", "default", "/abs/x", "low", bad)
+        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
 
     def test_run落盘的skills就是命令行给的那几条(self):
         d = ca.ensure_isolation("default")
@@ -1568,8 +1679,11 @@ class TestParser(_HomeSandbox):
         | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
         | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
         | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
+        | `--json` | 同一份事实两种呈现，要永远保持一致——正是本仓一路在消灭的东西。列表形态已经机器切得开（见 status_row），单任务查询用退出码就够 |
 
-        前两个是「会造成误用」，后四个是「由工具派生」。
+        前两个是「会造成误用」，中间四个是「由工具派生」，`--json` 是「第二种呈现」。
+        （`--json` 没有对应的 assertRaises：它和别的不一样，不是「给了会出事」，
+        而是「根本不该存在」——真加了它，红的会是 status_row 那一整组契约测试。）
         """
         parser = ca.build_parser()
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
@@ -2991,11 +3105,15 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
     INT 时照样只记到 INT——测试会在 start_new_session 被删掉时照样绿。
     实测过：那样写的版本，去掉 start_new_session 和改成转发 TERM 两个突变都杀不掉。
 
-    **它是全套里唯一一条会偶发的测试**，因为它等的是真进程被真的调度到：
-    2026-09-20 在跑突变套件（机器满载）时 10 次里红过 1 次，而空载下连跑 40 次
-    零失败。红了先重跑一次再查——两次都红才是真的坏了。
-    刻意不把那几个 deadline 往上加：10 秒对空载已经宽出两个量级，加大只是把
-    那个数字换一换，换不来任何保证，却会让真的挂死多等好几秒。
+    **它曾经偶发，而根因不在它自己身上**：它轮询 `tasks/t.json` 等 session_id
+    落盘，而 `write_meta` 当时是 `Path.write_text`——先把目标截成 0 再填。
+    读到半截就是一个裸 `JSONDecodeError`。2026-09-20 量过：1 秒里写 5289 次、
+    并发读 12284 次，**8277 次读到半截**。`write_meta` 改成原子替换之后
+    连跑 20 次零失败（见 TestWriteMetaIsAtomic）。
+    **教训记在这里**：一条真进程测试偶发地红，先别归因到「机器慢」——
+    那次差一点就把它当成调度抖动登记掉，而它照出来的是一个真的并发 bug。
+    那几个 deadline 刻意不往上加：10 秒已经宽出两个量级，加大只会掩盖下一个
+    这样的 bug，还让真的挂死多等好几秒。
     """
 
     FAKE_CODEX = (

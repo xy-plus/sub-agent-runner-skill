@@ -523,6 +523,11 @@ def judge(round):
     # 156 份真实报告只有 4 份是 JSON，`-o` 写的是 agent 的最后一条消息，通常是
     # markdown 散文。要结构化输出那是 --output-schema 的事。
     preview = [l for l in report_text.splitlines() if l.strip()][:REPORT_PREVIEW_LINES]
+    # **这条 success 仍然盖不住「它压根没干活」这一整类。** `--skill` 只堵住其中
+    # 一个实例（路径写错）：codex 读完 skill 之后**拒绝执行**、只在报告里写一句
+    # 「我没做」，这里照样判 success——报告非空、日志无错误行，两个条件都满足。
+    # 结构上看不见：产物存在性由 brief 的 DoD 定义（要 commit 还是要别的），
+    # 那是任务层的事，工具层没有任何东西知道该去找什么。**另案，别在这里补。**
     return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
@@ -670,6 +675,33 @@ _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
            "--skip-git-repo-check", "--disable", "plugins"]
 
 
+def _require_skill_paths(skills):
+    """白名单的形状闸。照 `_require_enum` 的做法：内部调用方传错就**当场炸**。
+
+    `args.skills` 恒为 `tuple[str]` 这个不变量**只到 parser 为止**
+    （见 _AppendSkillPath），parser 之下本来一道闸都没有，而两种坏法全是静默的：
+
+        build_skill_guard("/abs/SKILL.md")  → 逐字符拼出 14 行：`- /`、`- a`、`- b`…
+        build_skill_guard(None)             → 返回「无白名单」那句，白名单被**无声吞掉**
+        new_meta(..., "/abs/SKILL.md")      → 照样落盘
+
+    仓内三个调用点都传 `args.skills`，所以今天不可达——`kind`／`cause`／`state`
+    当初上 `_require_enum` 时也一样不可达。**散文不是约束。**
+
+    只认 tuple，不认 list：不变量就是 tuple，放行 list 等于把刚统一掉的两种类型
+    又放回来。每一项必须是 `str`——`Path` 在兜底句里印出来一模一样，却会让
+    `write_meta` 的 `json.dumps` 在很久以后才炸；整数更坏，json 收得下，静默落盘。
+    """
+    if not isinstance(skills, tuple):
+        raise ValueError(
+            f"skills 必须是 tuple（只有一条就写 (路径,)），收到 "
+            f"{type(skills).__name__}: {skills!r}")
+    for q in skills:
+        if not isinstance(q, str):
+            raise ValueError(
+                f"skills 的每一项必须是路径字符串，收到 {type(q).__name__}: {q!r}")
+
+
 def build_skill_guard(skill_paths):
     """本轮的兜底句。**每轮派生，不是常量**——白名单是每一轮的事。
 
@@ -688,6 +720,7 @@ def build_skill_guard(skill_paths):
     （见 _add_prompt_round_args 的可观测性那段）——指令没了，那条论证也一起塌。
     无白名单那一支**刻意不带**这句：没东西可读，加上去只是句废话。
     """
+    _require_skill_paths(skill_paths)
     if not skill_paths:
         return f"**{SKILL_GUARD_STEM}。**"
     return (f"**{SKILL_GUARD_STEM}，以下几个除外（动手前先逐个读一遍）：**\n"
@@ -772,7 +805,26 @@ def meta_path(home, task):
 
 
 def write_meta(home, task, meta):
-    meta_path(home, task).write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    """落元数据。**原子替换，不原地截断重写。**
+
+    `Path.write_text` 先把目标截成 0 再往里填，而 `status` 随时可能在另一个
+    进程里读同一份 json（`all_metas`／`find_meta` 都是裸 `json.loads`）。
+    2026-09-20 实测截断重写的版本：1 秒里写 5289 次、并发读 12284 次，
+    其中 **8277 次读到半截 json**——撞上的调用方拿到一个裸 `JSONDecodeError`
+    traceback，不是干净的护栏拒绝。写进同目录的临时文件再 `os.replace`
+    （同一文件系统上是原子的），读者就只可能看到「旧的那份」或「新的那份」。
+
+    临时名固定、不带 pid：同一个任务不可能有两个并发写者——`cmd_run` 和
+    `cmd_resume` 都先拒绝「还在跑」的同名任务。固定名的好处是崩在中间留下的
+    那一个残片会被下一次写盖掉，不会越积越多。
+    后缀是 `.json.tmp` 而不是 `.tmp.json`：`all_metas` 扫的是 `*.json`，
+    残片要是被扫进去，它自己就成了一份「缺字段的坏元数据」，
+    而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）。
+    """
+    q = meta_path(home, task)
+    tmp = q.with_name(f"{q.name}.tmp")
+    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2))
+    os.replace(tmp, q)
 
 
 def _now_iso():
@@ -789,6 +841,7 @@ def new_meta(task, account, workdir, effort, skills):
     （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
     skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
+    _require_skill_paths(skills)
     return {"task": task, "account": account, "dir": workdir, "effort": effort,
             "skills": skills, "session_id": None, "started_at": _now_iso()}
 
@@ -796,9 +849,21 @@ def new_meta(task, account, workdir, effort, skills):
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
 # 静默的：少一个字段，run 照常报成败，但那个任务从此 status/resume/stop 全
 # 够不着，工具还会建议「删掉它重新 run」——会话就此丢掉。
+#
+# **爆炸半径是「列表」，不是「那一个任务」**（2026-09-20 逐条实测）：
+#   all_metas()        一个坏 json 就整条拒绝 → 不带任务名的 `status` 一个任务
+#                      都列不出来，连好的那些一起陪葬
+#   find_meta("好的")   **不受牵连**——它只 stat/读那一个任务的 json
+#   find_meta("坏的")   拒绝，而这是对的：你点名要的就是那一份
+# 所以 `status <任务名>`／`resume`／`stop` 只对坏掉的那个任务失灵。
+#
+# **往 REQUIRED_META_KEYS 加字段之前，先确认没有在跑的任务**：_load_meta 对缺
+# 字段的老元数据只会建议「删掉它重新 run」，而那等于丢会话。2026-09-19 加
+# `skills` 那次实测三个隔离目录的 tasks/ 全空（各 0 个 json），所以影响为零——
+# **那是当时的事实，不是永久豁免**，下次加字段要重新确认一遍。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", []).keys())
+REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
 
 
 def _load_meta(path):
@@ -1116,6 +1181,14 @@ def _tee_until_exit(proc, log, home, task, meta):
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
     # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
     # 172 字节）；包装进程此时被杀，这一轮就再也 resume 不回来。
+    # **已登记的跟进项（尚未修）**：这个循环等的是 **stdout 管道 EOF**，
+    # 不是「codex 进程没了」。codex 起的孙进程会继承同一个 stdout，孙进程不退
+    # 管道就不 EOF，于是「codex 已经结束了」和「日志安静了」被当成一回事。
+    # 实测：直接子进程 t=0.03s 就退了，而这个 tee 循环挂到 **t=4.16s** 才退。
+    # 后果是 run/resume 的收尾被孙进程拖住——判据本身不受影响（它只看产物和
+    # 本轮日志），但「什么时候算这一轮结束」比真相晚。
+    # 修它要引入「等进程 + 另设管道超时」两件事，而本轮的范围是 --skill 和
+    # status，所以**只登记不修**。这几行是它唯一的书面记录。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
@@ -1159,12 +1232,14 @@ def status_row(meta, verdict):
     **把 workdir 和 reason 传反会静默拼出旧列序**，而那正是这次改动要消灭的东西。
     调用方（cmd_status）手里正好就是这两个对象，顺序传不反。
 
-    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。状态和退出码
-    由上面那条 _require_enum 保证（五态里没有一个含空白），任务名过 _TASK_NAME，
-    所以这里只剩任务名和账号两列要查，而真正没人保证的是**账号**
-    ——它的值读自 `tasks/<task>.json`，而 `_load_meta` 只校验**键**在不在，
-    值长什么样一概不管。目录名那一侧另有 account_choices() 在入口拒，
-    两道守的是两个不同的入口，不是重复防御。
+    前四列断言「一个空白都没有」：`split(maxsplit=4)` 靠的就是它。
+    状态和退出码由上面那条 `_require_enum` 保证（五态里没有一个含空白），
+    **剩下的任务名和账号两列都没人保证，两条断言都是承重的**：
+    这两列读的都是 `tasks/<task>.json`，而 `_load_meta` 只校验**键**在不在，
+    值长什么样一概不管——2026-09-20 实测手写一份 `"task": "t 1"` 的元数据，
+    `_load_meta` 一声不吭收下，挡住它的只有下面那条断言。
+    `--skill` 的 `_TASK_NAME` 和 `account_choices()` 守的是**另一个入口**
+    （命令行与目录扫描），手写的 json 从它们旁边绕过去，所以这里不是重复防御。
 
     后两列断言「没有控制字符」：dir 和 reason 里空格是合法的（它们同在第五段），
     换行和制表符不是——一个换行就让「一行一任务」不成立，任何切分方案都救不
@@ -1461,6 +1536,9 @@ class _AppendSkillPath(argparse.Action):
     `if not args.skills`）。
     """
 
+    # `option_string=None` 是 **argparse 的 Action 契约签名**，不是本仓禁止的那种
+    # 默认缺省值——argparse 调它时按位置传前三个、`option_string` 用关键字传，
+    # 签名少一个默认值就 TypeError。别当违规删掉。
     def __call__(self, parser, namespace, value, option_string=None):
         setattr(namespace, self.dest, (getattr(namespace, self.dest) or ()) + (value,))
 
@@ -1499,8 +1577,9 @@ def build_parser():
     """命令行契约。
 
     整个工具选 Python3 写，理由就在这个函数里：`argparse` 的 `required=True`
-    + `choices=` 天然实现了「强制显式」——五个参数一个都不能少、难度和账号只能
-    从枚举里挑，而且**错误消息是免费的**，不用自己写一遍校验和提示。
+    + `choices=` + 互斥组天然实现了「强制显式」——五个带值参数一个都不能少、
+    `--skill`/`--no-skill` 二选一、难度和账号只能从枚举里挑，而且**错误消息是
+    免费的**，不用自己写一遍校验和提示。
     另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
     """
     p = argparse.ArgumentParser(
