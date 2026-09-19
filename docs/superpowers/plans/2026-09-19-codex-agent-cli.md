@@ -54,8 +54,11 @@
 - **删掉 `TAIL_LINES`**：日志改成追加 + 每轮写分隔符，判据只扫最后一个分隔符之后。
   「末 50 行」那个窗口在偷偷承担「已恢复的错误不算」的语义，而这件事现在由
   target 分类正经做了，窗口成了劣化替代品。
-- `--color never` 之后日志本就无 ANSI，`strip_ansi` 降级为防御、不再承重；
-  测试仍喂带 ANSI 的输入，因为要防的就是它万一还在。
+- `--color never` 只给**主线**：2026-09-19 端到端冒烟实测 resume 不认它
+  （`error: unexpected argument '--color' found`，整轮当场死掉），codex 也没有
+  对应的 config 键（`--strict-config` 探测回 `unknown configuration field color`）。
+  所以 resume 那一轮的日志照样带 ANSI，**`strip_ansi` 在 resume 这条路上是承重的**，
+  不是可删的防御。测试仍喂带 ANSI 的输入。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -201,7 +204,12 @@ _SESSION_ID = re.compile(r"session id:\s*([0-9a-f-]{36})")
 
 
 def strip_ansi(text):
-    """防御性剥离。有 `--color never` 之后日志本就是纯文本，这里不再承重。"""
+    """剥掉颜色码。
+
+    主线带了 `--color never`，日志本来就是纯文本；但 **resume 不认 --color、
+    codex 也没有对应的 config 键**，resume 那一轮的日志照样带 ANSI。
+    所以这个函数在 resume 这条路上是承重的，删不得。
+    """
     return _ANSI.sub("", text)
 
 
@@ -671,10 +679,15 @@ class TestArgv(unittest.TestCase):
         self.assertNotIn("--sandbox", argv)
         self.assertIn('sandbox_mode="danger-full-access"', " ".join(argv))
 
-    def test_两条命令都从源头关掉颜色(self):
-        for argv in (ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b"),
-                     ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")):
-            self.assertEqual(argv[argv.index("--color") + 1], "never")
+    def test_主线从源头关掉颜色(self):
+        argv = ca.build_run_argv("/abs/repo", "low", "/d/reports/t.md", "b")
+        self.assertEqual(argv[argv.index("--color") + 1], "never")
+
+    def test_resume不许出现color_它也不认(self):
+        # 2026-09-19 端到端冒烟实测：resume 见到 --color 直接
+        # `error: unexpected argument '--color' found`，整轮当场死掉。
+        argv = ca.build_resume_argv("/abs/repo", "s", "low", "/d/reports/t.md", "b")
+        self.assertNotIn("--color", argv)
 
     def test_环境变量把会话索引留在主目录_resume才找得到(self):
         env = ca.codex_env(pathlib.Path("/d"))
@@ -695,11 +708,10 @@ import os
 SKILL_GUARD = "**不得使用任何 skill，除非本 brief 明确指定。**"
 
 # 每次运行都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
-# --color never：实测 --color auto（默认）在输出被重定向时并不关颜色，106 份日志
-# 无一例外含 ANSI，于是提 session id 和跑判据要各自剥一遍。从源头关掉，两个消费方
-# 都不再依赖剥离器（strip_ansi 保留作防御，但不再承重）。
+# 主线和 resume 都收的参数。调用方碰不到它们，也就不可能漏掉。
+# `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
 _COMMON = ["-c", "approval_policy=\"never\"", "-c", "project_doc_max_bytes=0",
-           "--skip-git-repo-check", "--disable", "plugins", "--color", "never"]
+           "--skip-git-repo-check", "--disable", "plugins"]
 
 
 def prepend_skill_guard(brief_text):
@@ -718,9 +730,11 @@ def build_run_argv(dir_abs, effort, report_path, brief):
 
 
 def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
-    # 两处和主线不同，都是实测撞出来的：
+    # 三处和主线不同，都是实测撞出来的：
     #   1. --cd 必须放在 resume 之前，放后面 clap 直接拒收
     #   2. resume 不认 --sandbox（error: unexpected argument，退出码 2），走 -c sandbox_mode
+    #   3. resume 也不认 --color，且 codex 没有对应的 config 键 —— 这条路关不掉颜色
+    # resume 收的参数集比主线小一圈，加参数前先 `codex exec resume --help` 对一遍。
     return (["codex", "exec", "--cd", dir_abs, "resume", session_id, "-m", MODEL,
              "-c", f'model_reasoning_effort="{effort}"',
              "-c", 'sandbox_mode="danger-full-access"'] + _COMMON +
