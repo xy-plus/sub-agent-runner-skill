@@ -532,8 +532,8 @@ read_last_round 拿它唯一看得见的东西。judge 不再自己猜边界。
 **Interfaces:**
 - Consumes: Task 1 的 `judge(report_path, round_text)`
 - Produces:
-  - `_STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), ("failed", 1))`
-  - `EXIT["interrupted"] == 5`；`_SEVERITY == ["success", "running", "interrupted", "suspect", "failed"]`
+  - `_STATES = (("success", 0), ("running", 4), ("interrupted", 130), ("suspect", 3), ("failed", 1))`
+  - `EXIT["interrupted"] == 130`（＝128+SIGINT，跟既成约定，见下）；`_SEVERITY == ["success", "running", "interrupted", "suspect", "failed"]`
   - `judge` 认出 `INTERRUPT_MARK` 时返回 state `"interrupted"`
 
 - [ ] **Step 1: 写失败的测试**
@@ -555,7 +555,14 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
     def test_五个状态的退出码逐个钉死(self):
         # 绝对值。写成 EXIT["x"] == EXIT["x"] 那种自指是空测试，本仓栽过。
         self.assertEqual(ca.EXIT, {"success": 0, "failed": 1, "suspect": 3,
-                                   "running": 4, "interrupted": 5})
+                                   "running": 4, "interrupted": 130})
+
+    def test_interrupted跟的是128加信号号这个既成约定(self):
+        """130 不是随手挑的数：128 + SIGINT(2)，POSIX/Bash 的既成约定
+        （同族 SIGKILL→137、SIGTERM→143）。钉住这个**算式**而不只是 130，
+        下一个人就改不成一个「看起来也挺顺」的数。
+        """
+        self.assertEqual(ca.EXIT["interrupted"], 128 + int(signal.SIGINT))
 
     def test_护栏拒绝的码不与任何判据结论相撞(self):
         self.assertEqual(ca.USAGE_ERROR, 2)
@@ -610,33 +617,33 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
 
 再往 `TestExitCodeContract` 里补一条——**第五态唯一的端到端绝对值**。
 上面那些都在判据层，而退出码是**唯一到得了调用方的通道**，
-「判据说 interrupted」和「进程真的 exit 5」是两件事：
+「判据说 interrupted」和「进程真的 exit 130」是两件事：
 
 ```python
-    def test_run_被打断退出5(self):
+    def test_run_被打断退出130(self):
         # 这条是整个改动 A 的验收点：harness 的完成通知只搬退出码，
-        # 于是 5 这个数字是「接着 resume，别重跑」唯一到得了调用方的形式。
-        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 5)
+        # 于是这个数字是「接着 resume，别重跑」唯一到得了调用方的形式。
+        self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 130)
 ```
 
 同时改两条已有的：
 
 - `TestJudge.test_被INT打断的那轮_reason要告诉人可以resume`：`assertEqual(v.state, "failed")` 改成 `"interrupted"`，注释里那句「状态这一维在 Task 2 才改」删掉，换成推翻旧决定的理由（见下）。
-- `TestExitCodeContract.test_退出码的绝对值是对外契约`：字典加 `"interrupted": 5`。
+- `TestExitCodeContract.test_退出码的绝对值是对外契约`：字典加 `"interrupted": 130`。
 
-**`SKILL.md` 那两条文档断言（退出码 `5`、第五条命令）留到 Task 7 一起改** —— 提前改会让本任务的全量测试红。
+**`SKILL.md` 那两条文档断言（退出码 `130`、第五条命令）留到 Task 7 一起改** —— 提前改会让本任务的全量测试红。
 
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `python3 -m unittest test_codex_agent.TestInterruptedIsItsOwnState -v`
 
-Expected: FAIL，`{'success': 0, 'running': 4, 'suspect': 3, 'failed': 1} != {...'interrupted': 5}`
+Expected: FAIL，`{'success': 0, 'running': 4, 'suspect': 3, 'failed': 1} != {...'interrupted': 130}`
 
 - [ ] **Step 3: 最小实现**
 
 ```python
 # 五个状态回答的是同一个问题：**接下来该干什么**。
-#   success 0 不用干什么 / running 4 等 / interrupted 5 **接着 resume** /
+#   success 0 不用干什么 / running 4 等 / interrupted 130 **接着 resume** /
 #   suspect 3 去看一眼 / failed 1 查原因并重跑
 # interrupted 的处置和其余四个都不同，所以它是一个状态，不是 failed 下的一条理由。
 #
@@ -652,7 +659,15 @@ Expected: FAIL，`{'success': 0, 'running': 4, 'suspect': 3, 'failed': 1} != {..
 # 在跑的任务会自己好，被打断的永远不会自己好——它在等人动手。status 列一批任务
 # 时若被 running 盖住，调用方会去「等」一个永远不会自己好的东西。
 # 码值与顺序无关，2 永久留给护栏拒绝（USAGE_ERROR）。
-_STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), ("failed", 1))
+#
+# interrupted 用 **130** 而不是自编一个数：128+SIGINT(2) 是 POSIX/Bash 的既成
+# 约定（同族 SIGKILL→137、SIGTERM→143），脚本作者和 agent 不读本文档也认得。
+# 反面要知道：>128 在约定里指「**本进程**死于信号」，而这里死的是 codex、
+# 包装器是正常退出的。取它是因为读者的第一反应正确（「被打断了，接着来」），
+# 比语义上的精确更重要——退出码是唯一能到达 harness 完成通知的通道。
+# 3/4 仍是自编：suspect、running 这两个概念约定里根本没有。
+# 原则是：**能跟约定的跟，约定没涵盖的才自己编。**
+_STATES = (("success", 0), ("running", 4), ("interrupted", 130), ("suspect", 3), ("failed", 1))
 ```
 
 `judge` 里那一支：
@@ -671,13 +686,13 @@ _STATES = (("success", 0), ("running", 4), ("interrupted", 5), ("suspect", 3), (
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**132 个全绿**（124 + `TestInterruptedIsItsOwnState` 7 条 + `test_run_被打断退出5` 1 条）。
+Expected: PASS，**133 个全绿**（124 + `TestInterruptedIsItsOwnState` 8 条 + `test_run_被打断退出130` 1 条）。
 
 - [ ] **Step 5: 突变复验**
 
-1. `_STATES` 里把 `("interrupted", 5)` 挪到 `("running", 4)` **之前**
+1. `_STATES` 里把 `("interrupted", 130)` 挪到 `("running", 4)` **之前**
    → `test_严重度顺序的绝对值` 和 `test_worse在running和interrupted之间取interrupted` 必须都红
-2. `EXIT["interrupted"]` 的码值从 5 改成 1
+2. `EXIT["interrupted"]` 的码值从 130 改成 1
    → `test_五个状态的退出码逐个钉死` 和 `test_有打断标记且无报告时状态是interrupted` 必须红
 
 还原。
@@ -686,7 +701,7 @@ Expected: PASS，**132 个全绿**（124 + `TestInterruptedIsItsOwnState` 7 条 
 
 ```bash
 git add codex_agent.py test_codex_agent.py
-git commit -m "fix: 被打断的轮次是第五态 interrupted，退出码 5
+git commit -m "fix: 被打断的轮次是第五态 interrupted，退出码 130
 
 harness 的完成通知只搬退出码不搬 stdout，reason 写得再准也到不了做决定的
 那一方；而在那个唯一的通道上 interrupted 和 failed 此前是同一个数字、处置
@@ -888,7 +903,7 @@ def interrupt_codex(pid, log_path):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**137 个全绿**（132 + 新 5：`TestInterruptCodex` 4 条 + `TestEveryInterruptPathLeavesAMark` 1 条。初稿写的 135／新 4 漏了后者，Task 4~7 的预期数跟着一路偏小 1，已全部改正）。
+Expected: PASS，**138 个全绿**（133 + 新 5：`TestInterruptCodex` 4 条 + `TestEveryInterruptPathLeavesAMark` 1 条。初稿写的 135／新 4 漏了后者，Task 4~7 的预期数跟着一路偏小 1，已全部改正）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -1021,7 +1036,7 @@ def wait_for_exit(report_path, timeout, poll_interval):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**142 个全绿**（137 + 新 5）。
+Expected: PASS，**143 个全绿**（138 + 新 5）。
 
 - [ ] **Step 5: 突变复验**
 
@@ -1386,7 +1401,7 @@ def cmd_interrupt_and_resume(args):
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**152 个全绿**（142 + 新 10）。此刻 `codex-agent interrupt-and-resume`
+Expected: PASS，**153 个全绿**（143 + 新 10）。此刻 `codex-agent interrupt-and-resume`
 在命令行上**还是不存在的**，这是对的：Task 6 才把它接上去。
 
 - [ ] **Step 5: 突变复验**（三个，全部是承重约束）
@@ -1556,7 +1571,7 @@ Expected: FAIL，`argument cmd: invalid choice: 'interrupt-and-resume'`
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**161 个全绿**（152 + `TestInterruptAndResumeParser` 5 条 + `TestExitCodeContract` 里新命令的四态绝对值 4 条）。
+Expected: PASS，**163 个全绿**（153 + `TestInterruptAndResumeParser` 5 条 + `TestExitCodeContract` 里新命令的四态绝对值 4 条 + `TestWrapperSpeaksImmediately` 1 条）。
 
 - [ ] **Step 5: 自检 CLI**
 
@@ -1609,7 +1624,7 @@ git commit -m "feat: interrupt-and-resume 的参数表与 resume 逐条一致
             with self.subTest(cmd=cmd):
                 self.assertIn(f"codex-agent {cmd}", skill)
         ...
-        for code in ("0", "1", "3", "4", "5"):          # 退出码是对外契约
+        for code in ("0", "1", "3", "4", "130"):        # 退出码是对外契约
             with self.subTest(code=code):
                 self.assertIn(f"`{code}`", skill)
         # 「要不要为此打断」是判断力，代码替不了：它要知道这条信息值多少、
@@ -1641,7 +1656,7 @@ codex-agent interrupt-and-resume <任务名> --brief msg.md --effort low
 
 3. 退出码那一行加第五态和「看数字不看词」：
 
-> 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`5` interrupted（被打断，**接着续跑即可，不要重跑**）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字
+> 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字
 
 - [ ] **Step 3: 跑泄漏测试确认没写进机制**
 
@@ -1677,7 +1692,7 @@ Expected: PASS。新写的文字里不许出现 `OWNED_BY_CODE` 的任何一个�
 
 Run: `python3 -m unittest test_codex_agent -v`
 
-Expected: PASS，**161 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
+Expected: PASS，**163 个全绿**（本任务不增减测试数，只把三条断言改严 + 改 docstring）。
 
 - [ ] **Step 6: 突变复验**
 
@@ -1693,7 +1708,7 @@ git commit -m "docs: SKILL.md 加第四条命令与第五态，只写判断力�
 
 要不要为此打断，要知道这条信息值多少、在途工作损失多少，后者在 codex 里
 根本不可观测——这是代码替不了的那部分。
-退出码加 5 interrupted，并写明看数字不看词：完成通知对任何非零码都写
+退出码加 130 interrupted，并写明看数字不看词：完成通知对任何非零码都写
 failed with exit code N，能区分的只有那个数字。
 测试模块 docstring 的承重约束清单一并同步：轮次边界由拥有者记下而非推测、
 退出码五态、以及新的第四条空测试病例。"
@@ -1769,7 +1784,7 @@ grep -c "本轮被 INT 打断" $L                              # 打断标记 �
 awk '/interrupt-and-resume/{exit} {print}' $L | tail -5   # 被打断那一轮的尾巴
 ```
 
-Expected: 打断标记 ≥ 1；**Step 2 那个后台任务的完成通知里的退出码是 5，不是 1**
+Expected: 打断标记 ≥ 1；**Step 2 那个后台任务的完成通知里的退出码是 130，不是 1**
 （这一条是整个改动 A 的验收点：退出码是唯一能到达调用方的通道）。
 
 - [ ] **Step 5: 没在跑时也能用**
