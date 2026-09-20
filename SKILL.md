@@ -1,9 +1,9 @@
 ---
-name: codex-agent
+name: codex-sub-agent
 description: 把有明确规划的执行类任务（照 DoD 写代码、对抗审查、e2e 验证）派给 codex 后台跑，省 claude token。用 Bash run_in_background 启动 run。
 ---
 
-# codex-agent
+# codex-sub-agent
 
 **本 skill 一旦激活，默认就不再开 claude 子代理了**——执行类的活交给 codex，
 claude 只编排。同时开两边等于白烧 claude 的 token，那正是这个 skill 要省的东西。
@@ -11,12 +11,12 @@ claude 只编排。同时开两边等于白烧 claude 的 token，那正是这�
 把**有明确规划的执行类任务**派给 codex 干。Prompt 写进 `brief.md`。
 
 命令怎么拼、隔离目录怎么建、进程怎么判活、成败怎么判、信号怎么发，全部由
-`codex_agent.py` 保证，本文件只讲**人／模型才能决定的事**。
+`codex_sub_agent.py` 保证，本文件只讲**人／模型才能决定的事**。
 
 ## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
 
 ```bash
-codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <档位> --account default --no-skill
+codex-sub-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <档位> --account default --no-skill
 ```
 
 五个带值参数**全必填**，外加 `--skill`/`--no-skill` 二选一，没有默认值。
@@ -42,10 +42,10 @@ codex-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <�
 ## 另外四条命令
 
 ```bash
-codex-agent status [任务名]        # 省略则列出全部
-codex-agent resume <任务名> --brief follow.md --effort <档位> --no-skill
-codex-agent interrupt-and-resume <任务名> --brief msg.md --effort <档位> --no-skill
-codex-agent stop <任务名>          # 上下文保留，之后还能 resume
+codex-sub-agent status [任务名]        # 省略则列出全部
+codex-sub-agent resume <任务名> --brief follow.md --effort <档位> --no-skill
+codex-sub-agent interrupt-and-resume <任务名> --brief msg.md --effort <档位> --no-skill
+codex-sub-agent stop <任务名>          # 上下文保留，之后还能 resume
 ```
 
 `status` 不带任务名时**一行一个任务**：前四列（任务名／账号／状态／退出码）都不含空格，

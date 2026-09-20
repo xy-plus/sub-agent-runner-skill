@@ -1,4 +1,4 @@
-# codex-agent
+# codex-sub-agent
 
 一个 Claude Code skill：把**有明确规划的执行类任务**派给 `codex exec` 在后台跑，claude 只做编排。
 
@@ -13,19 +13,19 @@
 而不是静默跑出一个「零工作量的成功」。
 
 ```bash
-codex-agent run --task <任务名> --dir /abs/repo --brief brief.md \
+codex-sub-agent run --task <任务名> --dir /abs/repo --brief brief.md \
                 --effort high --account default --no-skill
-codex-agent status [任务名]
-codex-agent resume <任务名> --brief follow.md --effort high --no-skill
-codex-agent interrupt-and-resume <任务名> --brief msg.md --effort high --no-skill
-codex-agent stop <任务名>
+codex-sub-agent status [任务名]
+codex-sub-agent resume <任务名> --brief follow.md --effort high --no-skill
+codex-sub-agent interrupt-and-resume <任务名> --brief msg.md --effort high --no-skill
+codex-sub-agent stop <任务名>
 ```
 
 ## 安装
 
 ```bash
-git clone <this repo> ~/.claude/skills/codex-agent
-ln -sfn ~/.claude/skills/codex-agent/codex_agent.py ~/.local/bin/codex-agent
+git clone <this repo> ~/.claude/skills/codex-sub-agent
+ln -sfn ~/.claude/skills/codex-sub-agent/codex_sub_agent.py ~/.local/bin/codex-sub-agent
 ```
 
 需要 Python 3 和 [`codex`](https://github.com/openai/codex) CLI。零第三方依赖。
@@ -41,9 +41,9 @@ ln -sfn ~/.claude/skills/codex-agent/codex_agent.py ~/.local/bin/codex-agent
 ## 开发
 
 ```bash
-python3 -m unittest test_codex_agent -v
+python3 -m unittest test_codex_sub_agent -v
 ```
 
 设计上的取舍和踩过的坑都写在代码注释里，贴在防住它的那行旁边——
-`test_codex_agent.py` 的模块 docstring 是维护者入口，那里记着这个仓库
+`test_codex_sub_agent.py` 的模块 docstring 是维护者入口，那里记着这个仓库
 在「空测试」上栽过的七种形态和它们的解药。

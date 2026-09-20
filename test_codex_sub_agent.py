@@ -1,8 +1,8 @@
-"""codex-agent 的全部单测 —— 也是这个项目的**维护者入口**。
+"""codex-sub-agent 的全部单测 —— 也是这个项目的**维护者入口**。
 
 怎么跑：
 
-    python3 -m unittest test_codex_agent -v
+    python3 -m unittest test_codex_sub_agent -v
 
 （零依赖、零 codex token。纯函数和护栏全在这里，不花钱。）
 
@@ -101,7 +101,7 @@ import unittest
 import warnings
 from unittest import mock
 
-import codex_agent as ca
+import codex_sub_agent as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
@@ -112,7 +112,7 @@ ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
 ERR_TRACING_UNKNOWN = ("\x1b[2m2026-09-17T14:35:32.578919Z\x1b[0m \x1b[31mERROR\x1b[0m "
                        "\x1b[2mcodex_core::session\x1b[0m\x1b[2m:\x1b[0m Failed to create session: "
                        "thread-store conflict: thread already has an active writer")
-ROUND_SEP_SAMPLE = "===== codex-agent run t 2026-09-19T10:00:00 ====="
+ROUND_SEP_SAMPLE = "===== codex-sub-agent run t 2026-09-19T10:00:00 ====="
 ERR_FATAL = "Error: thread/resume: thread 01a0… already has an active writer (code -32600)"
 # 被 INT 打断几乎必然留下这一行。它的 target 是 codex_core::session，而那个
 # target 刻意不在良性白名单里（非打断场景下它仍该被看见），所以它会照常进 detail。
@@ -392,7 +392,7 @@ class TestReadLastRound(unittest.TestCase):
         # status 是外部观察者，它只能看最后一轮。子串搜索会把日志里转述的那行
         # 源码当成新一轮的开始——本轮的打断标记被甩到「上一轮」去，
         # status 于是把一轮被打断的运行报成 failed。
-        源码行 = 'ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀'
+        源码行 = 'ROUND_MARK = "===== codex-sub-agent "   # 每轮开跑前写进日志的分隔符前缀'
         self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
         log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
                         + ca.INTERRUPT_MARK + "\n" + 源码行 + "\n")
@@ -480,13 +480,13 @@ class TestRoundBoundary(unittest.TestCase):
                          "后一轮的致命错误被算到了前一轮头上")
 
     def test_日志里混进ROUND_MARK的源码行_不许被当成轮次分隔符(self):
-        # 这个仓库的日常就是派 codex 改 codex_agent.py 自己，源码行进日志是常态；
+        # 这个仓库的日常就是派 codex 改 codex_sub_agent.py 自己，源码行进日志是常态；
         # 模块 docstring 也写着「日志里还混着 brief 原文和 codex 转述的子进程输出」。
         # 子串搜索会在这里切断本轮：切剩 'ROUND_MARK = "' 14 个字符，
         # 打断标记被甩到本轮之外，judge 从 interrupted 翻成 failed。
         d = self._home()
         log = ca._log_path(d, "t")
-        源码行 = 'ROUND_MARK = "===== codex-agent "   # 每轮开跑前写进日志的分隔符前缀'
+        源码行 = 'ROUND_MARK = "===== codex-sub-agent "   # 每轮开跑前写进日志的分隔符前缀'
         self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(
@@ -906,7 +906,7 @@ class TestIsolation(_HomeSandbox):
         (self.home / ".codex-accounts" / "bad acct").mkdir()
         err = io.StringIO()
         with mock.patch.object(ca.sys, "stdout", mock.MagicMock()), \
-             mock.patch.object(ca.sys, "argv", ["codex-agent", "status"]), \
+             mock.patch.object(ca.sys, "argv", ["codex-sub-agent", "status"]), \
              contextlib.redirect_stderr(err):
             self.assertEqual(ca.main(), 2)
         self.assertIn("bad acct", err.getvalue())
@@ -1619,7 +1619,7 @@ class TestPid(unittest.TestCase):
         # comm 过滤是承重的，不是保险。
         # 陪练进程把报告路径作为 argv 里**独立一项**传进去，和 codex 的 `-o <路径>`
         # 形状一致——否则测到的只是「没匹配上」，不是「comm 把它挡住了」。
-        mark = "/tmp/codex-agent-selftest-不存在的报告.md"
+        mark = "/tmp/codex-sub-agent-selftest-不存在的报告.md"
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
         try:
             _wait_argv(self, proc, mark)
@@ -1707,7 +1707,7 @@ class TestPid(unittest.TestCase):
         `…/reports/a.md` 会命中任务 `aXmd` 的 `…/reports/aXmd.md`
         （`a` + 任意字符 + `md`）——2026-09-19 实测 `pgrep -f …/a.md` 确实
         返回了 aXmd 那个进程的 pid。
-        后果是实打实的：`codex-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
+        后果是实打实的：`codex-sub-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
         而 `run --task a` 会被「还在跑」误拒。
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
         """
@@ -1777,7 +1777,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 五条命令都得在，否则调用方不知道有这些能力
         for cmd in ("run", "status", "resume", "stop", "interrupt-and-resume"):
             with self.subTest(cmd=cmd):
-                self.assertIn(f"codex-agent {cmd}", skill)
+                self.assertIn(f"codex-sub-agent {cmd}", skill)
         # 三件代码保证不了、只能靠调用方知道的事
         self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
         self.assertIn("brief", skill)               # brief 只收文件路径
@@ -3053,7 +3053,7 @@ class TestRunCodexStreaming(unittest.TestCase):
         driver = (
             "import json,os,pathlib,sys;"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r});"
-            "import codex_agent as ca;"
+            "import codex_sub_agent as ca;"
             f"d = pathlib.Path({str(d)!r});"
             f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
             f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
@@ -3567,8 +3567,8 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
         driver = (
             "import sys,time\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
-            "import codex_agent as ca\n"
-            "sys.argv = ['codex-agent', 'status', 'no-such-task-2026']\n"
+            "import codex_sub_agent as ca\n"
+            "sys.argv = ['codex-sub-agent', 'status', 'no-such-task-2026']\n"
             "ca.main()\n"
             "print('裸 print 这句必须当场看得到')\n"
             "time.sleep(30)\n"
@@ -3662,7 +3662,7 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
         driver = (
             "import os,pathlib,sys\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
-            "import codex_agent as ca\n"
+            "import codex_sub_agent as ca\n"
             f"ca.run_codex('run', pathlib.Path({str(d)!r}), 't', {_full_meta('t')!r},"
             f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}])\n"
         )
