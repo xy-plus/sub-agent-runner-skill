@@ -2436,6 +2436,9 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「重跑就换号」这条没了，调用方不知道下一步该干什么")
         self.assertRegex(skill, r"写它的名字[^\n]*\*\*不换号\*\*",
                          "「写死账号名就不换号」这条没了——两种模式的差别没人守")
+        self.assertRegex(skill, r"\*\*`auto` 不是调度器\*\*",
+                         "「auto 不分散负载」这条没了——旁边那句「一个账号可以同时开多个"
+                         "子代理」会让人以为并发的 auto 会挑到不同账号")
 
 
 class TestTaskName(unittest.TestCase):
