@@ -717,7 +717,7 @@ def accounts_by_availability():
     全部意义就是换掉它。搬家现在由 `cmd_run` 在入口处显式做一次。
     """
     def sort_key(account):
-        return (read_usage_limit(isolation_home(account)) or datetime.datetime.min,
+        return (read_usage_limit(isolation_home(CODEX, account)) or datetime.datetime.min,
                 account)
     return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
 
@@ -881,6 +881,15 @@ DEFAULT_ACCOUNT = "default"
 RESERVED_ACCOUNT_NAMES = (DEFAULT_ACCOUNT, AUTO)
 
 
+# 派给谁跑。**runner 不是「模型」**：换 runner 连隔离机制（CODEX_HOME ↔
+# CLAUDE_CONFIG_DIR）、工作目录怎么传（argv 的 --cd ↔ Popen(cwd=)）、报告怎么拿
+# （-o 文件 ↔ result 事件）、有没有账号维度都不一样。所以参数叫 `--runner`
+# 不叫 `--model`——叫 model 会让人以为只是换个权重。
+CODEX = "codex"
+DEEPSEEK = "deepseek"
+RUNNERS = (CODEX, DEEPSEEK)
+
+
 def account_choices():
     """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。
 
@@ -910,14 +919,26 @@ def account_choices():
                    f"两次指向同一个隔离目录，find_meta 会对同一份元数据数出两份并误拒；"
                    f"目录叫 {AUTO} 时这个账号再也没法被明确指定。\n"
                    f"改名要改**两个**：账号目录 {accounts_dir / name}，"
-                   f"以及它的隔离目录 {isolation_home(name)}。\n"
+                   f"以及它的隔离目录 {isolation_home(CODEX, name)}。\n"
                    f"只改前一个的话，住在后一个里的任务之后再也扫不到"
                    f"——status 看不见、stop 停不掉，而且没有任何报错。")
     return [DEFAULT_ACCOUNT] + extra
 
 
-def isolation_home(account):
-    """每个账号一个隔离目录，任务的全部产物都落在这里。
+def isolation_home(runner, account):
+    """这个任务住哪个隔离目录。**由 `(runner, account)` 一对值决定。**
+
+    拆成两个参数各传各的，正是「好 API 难被误用」要消掉的那种缝：
+    `account` 只有 codex 才有意义，deepseek 传任何非 `None` 都是调用方搞混了，
+    所以这里当场 `ValueError` 而不是把它拼进目录名
+    （拼进去就得到 `~/.codex-subagent-deepseek` 这个不存在的账号目录，
+    随后在 `ensure_isolation` 里因缺 auth 拒跑——报的错和真正的原因隔着两层）。
+
+    **目录名一个都不改。** `~/.codex-subagent*` 是 260 份现存元数据里的归属，
+    2026-09-23 迁移时实测三个目录共 260 份。命令名改成 `sub-agent-runner`、
+    目录名不动——**这条不对称是刻意的**：用户敲的是命令名，盘上的东西谁都不该动。
+
+    每个账号一个隔离目录，任务的全部产物都落在这里。
 
     **落点在 `$HOME` 下，不在被改的那个仓库里**，这是判据不是习惯：
     `tasks/`、`reports/`、`logs/` 全在仓库外，过程文件就进不了 git，
@@ -928,10 +949,39 @@ def isolation_home(account):
     软约定拦不住，换成结构上够不着才拦得住。
     """
     base = pathlib.Path.home()
+    if runner == DEEPSEEK:
+        # deepseek 没有账号维度：一个 DeepSeek token，而且它走环境变量不走配置目录。
+        if account is not None:
+            raise ValueError(f"runner={DEEPSEEK} 没有账号概念，account 必须是 None，收到 {account!r}")
+        return base / ".claude-subagent"
+    if runner != CODEX:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
     return base / ".codex-subagent" if account == DEFAULT_ACCOUNT else base / f".codex-subagent-{account}"
 
 
+def isolation_roots():
+    """所有可能住着任务的隔离目录。**`find_meta` 和 `all_metas` 都走这里。**
+
+    原来它们各自写 `for account in account_choices(): isolation_home(account)`，
+    而 deepseek 的家不对应任何账号——**不收进来，deepseek 任务对
+    `status`／`resume`／`stop` 整体不可见**，而那是静默的：任务跑着、报告在盘上，
+    工具却说没有这个任务。抽成一个函数而不是在两处各加一行，是因为
+    「哪些目录住着任务」必须只有一个家：漏掉其中一处的后果是
+    `status` 列得出、`resume` 却说没有这个任务。
+    """
+    return [isolation_home(CODEX, a) for a in account_choices()] + [isolation_home(DEEPSEEK, None)]
+
+
 def auth_source(account):
+    """某个 **codex** 账号的登录态文件。
+
+    **只对 codex 有意义**，所以 `None` 当场炸：deepseek 的 account 恒为 `None`，
+    拿它拼路径会静默得到 `~/.codex-accounts/None/auth.json`——一个谁都不会
+    注意到的假路径，随后报的错是「这个账号没有登录态」，和真正的原因隔着两层。
+    """
+    if account is None:
+        raise ValueError(f"auth_source 只对 codex 账号有意义，收到 None"
+                         f"（runner={DEEPSEEK} 的登录态走环境变量里的 token，不在配置目录里）")
     base = pathlib.Path.home()
     return base / ".codex" / "auth.json" if account == DEFAULT_ACCOUNT else base / ".codex-accounts" / account / "auth.json"
 
@@ -941,8 +991,19 @@ def shared_skill_root():
     return pathlib.Path.home() / ".agents" / "skills"
 
 
-def ensure_isolation(account):
+def ensure_isolation(runner, account):
     """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。
+
+    **不变量按 runner 分叉，因为它们各自的根据不同**：
+    下面那三条（共享扫描根为空、config.toml 不是软链、auth.json 软链到账号）
+    全部是 **codex 的**事实——`~/.agents/skills` 是 codex 的扫描根，claude 根本
+    不看它；`config.toml` 是 codex 的配置文件；而 deepseek 的登录态走环境变量里的
+    token，**配置目录里没有 auth.json**（2026-09-23 实测：`CLAUDE_CONFIG_DIR`
+    指向一个空目录照跑）。把 codex 的不变量套到 deepseek 上，就是把一条外部事实
+    当成了普遍规律，后果是 deepseek 一轮都跑不起来。
+
+    两侧**唯一共有**的是 `tasks`/`reports`/`logs` 三个子目录：少一个就是 tee
+    循环里的 `FileNotFoundError`，包装器中途死掉、子进程变孤儿（见下）。
 
     **它挡的是动机，不是能力**——这条必须写明白，否则下一个人会拿它去推错结论。
     2026-09-19 实测：`collaboration.spawn_agent` 等六个工具**恒在**，
@@ -959,12 +1020,18 @@ def ensure_isolation(account):
     那个口子打不开）。不软链的真理由在 _add_prompt_round_args 里：可观测性 +
     奥卡姆。留着一条错理由比没有理由更危险。
     """
-    d = isolation_home(account)
+    d = isolation_home(runner, account)
     # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
     # 写失败（log 末尾只留一行 Failed to write last message file），而判据是
     # “报告没出现＝没正常收尾”——一次成功的运行会被判成失败。2026-09-13 连踩两次。
-    for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+    # deepseek 侧同样要：`_tee_until_exit` 往 logs/ 里写，`finish_deepseek_round`
+    # 往 reports/ 里写，缺哪个都是同一个 `FileNotFoundError`。
+    # skills/plugins 只有 codex 用（CODEX_HOME 的布局），deepseek 不建。
+    for sub in (("skills", "plugins", "tasks", "reports", "logs") if runner == CODEX
+                else ("tasks", "reports", "logs")):
         (d / sub).mkdir(parents=True, exist_ok=True)
+    if runner == DEEPSEEK:
+        return d
 
     # 拒跑而不是打印警告：隔离的前提一旦被破坏，本工具的核心承诺就是空的，
     # 而警告会被淹没在几千行 codex 输出里没人看见。
@@ -1244,8 +1311,15 @@ def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def new_meta(task, account, workdir, effort, skills):
+def new_meta(task, runner, account, workdir, effort, skills):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
+
+    **`runner` 和 `account` 的合法组合由这里守。** 校验写在构造器里而不是各个
+    调用点，是因为 `REQUIRED_META_KEYS` 就是从本函数派生的——字段和它的合法值
+    共用同一个家，就不可能出现「加了字段忘了加校验」。
+    deepseek 的 `account` **必须是 `None`，不许记一个假名字**：它进 status 第二列，
+    而且 `_resume_round` 会拿它去 `ensure_isolation`——记 `"deepseek"` 会指向
+    `~/.codex-subagent-deepseek` 这个不存在的账号目录并因缺 auth 拒跑。
 
     刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_codex_pid），
     存下来的 PID 会过期、还会被系统复用，留着它只会诱导别人犯这个设计本来要防的错。
@@ -1269,11 +1343,15 @@ def new_meta(task, account, workdir, effort, skills):
     （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
     skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
+    if runner not in RUNNERS:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+    if runner == DEEPSEEK and account is not None:
+        raise ValueError(f"runner={DEEPSEEK} 没有账号概念，account 必须是 None，收到 {account!r}")
     _require_skill_paths(skills)
     writer_pid, writer_start = _writer_identity()
-    return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "skills": skills, "session_id": None, "started_at": _now_iso(),
-            "writer_pid": writer_pid, "writer_start": writer_start}
+    return {"task": task, "runner": runner, "account": account, "dir": workdir,
+            "effort": effort, "skills": skills, "session_id": None,
+            "started_at": _now_iso(), "writer_pid": writer_pid, "writer_start": writer_start}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
@@ -1297,7 +1375,7 @@ def new_meta(task, account, workdir, effort, skills):
 # 同上：**那是当时的事实，不是永久豁免**。
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
+REQUIRED_META_KEYS = tuple(new_meta("", CODEX, "", "", "", ()).keys())
 
 
 def _load_meta(path):
@@ -1321,8 +1399,7 @@ def find_meta(task):
     建起来（旧的那份当场 unlink），这里是第二道。
     """
     found = []
-    for account in account_choices():
-        home = isolation_home(account)
+    for home in isolation_roots():
         p = meta_path(home, task)
         if p.exists():
             found.append((home, _load_meta(p)))
@@ -1335,8 +1412,7 @@ def find_meta(task):
 
 def all_metas():
     out = []
-    for account in account_choices():
-        home = isolation_home(account)
+    for home in isolation_roots():
         tasks_dir = home / "tasks"
         if not tasks_dir.is_dir():
             continue
@@ -1850,7 +1926,7 @@ def cmd_run(args):
         # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
         # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
         # 挑中别的账号时在下面**显式**把旧的那份搬过来。
-        if old_meta is not None and old_home != isolation_home(account):
+        if old_meta is not None and old_home != isolation_home(CODEX, account):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
@@ -1873,13 +1949,13 @@ def cmd_run(args):
     #
     # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
     # writer 和 codex 排干了没有」，每轮都必须做。
-    home = isolation_home(account)
+    home = isolation_home(CODEX, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
         if find_codex_pid(_report_path(candidate_home, args.task)) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `codex-sub-agent stop {args.task}`")
 
-    home = ensure_isolation(account)
+    home = ensure_isolation(CODEX, account)
     if old_meta is not None:
         if old_home == home:
             print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
@@ -1902,7 +1978,8 @@ def cmd_run(args):
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
     this_round = run_codex("run", home, args.task,
-                           new_meta(args.task, account, str(workdir), args.effort, args.skills),
+                           new_meta(args.task, CODEX, account, str(workdir), args.effort,
+                                    args.skills),
                            lambda r: build_run_argv(str(workdir), args.effort, r, brief))
     verdict = judge(this_round)
 
@@ -2053,7 +2130,7 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     `skills` 是本轮的白名单，和 effort 一样每轮重给——白名单是每一轮的事。
     """
     check_can_resume(task, meta, brief_path)
-    ensure_isolation(meta["account"])
+    ensure_isolation(meta["runner"], meta["account"])
     brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
     # 元数据描述的是**最后一次调用**：effort、白名单、开跑时间一起刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。

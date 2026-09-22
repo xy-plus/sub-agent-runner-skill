@@ -221,8 +221,9 @@ def _full_meta(task, **over):
     writer 身份默认给一副**必定停了**的（见 GONE_PID）：绝大多数测试要的前提就是
     「上一轮的 writer 早就不在了」。要「还在写」的那几条自己传 _live_writer(self)。
     """
-    meta = {"task": task, "account": "default", "dir": "/tmp", "effort": "low",
-            "skills": [], "session_id": None, "started_at": "2026-09-19T00:00:00",
+    meta = {"task": task, "runner": ca.CODEX, "account": "default", "dir": "/tmp",
+            "effort": "low", "skills": [], "session_id": None,
+            "started_at": "2026-09-19T00:00:00",
             "writer_pid": GONE_PID, "writer_start": GONE_START}
     meta.update(over)
     return meta
@@ -663,7 +664,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         return spawn
 
     def test_run收尾用的是run_codex回传的本轮文本(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--no-skill"])
@@ -676,7 +677,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
                       "run 接成了 read_last_round：被后来的一轮判瞎了")
 
     def test_resume收尾用的是run_codex回传的本轮文本(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
@@ -692,7 +693,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         # judge 在「还在跑」这一支根本不碰 round_text，而 status 正是轮询用的
         # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
         # 不带任务名时还要乘任务数——读出来再丢掉是白烧。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         ca._log_path(d, "t").write_text("随便什么\n")
         args = ca.build_parser().parse_args(["status", "t"])
@@ -708,7 +709,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         # 这里 spy 的是 judge 而不是 _print_verdict：cmd_status 自己排版、
         # 根本不走 _print_verdict（patch 它只会拿到空列表，是条空测试）。
         # spy 还顺手把**传给判据的那段文本**也钉住了——这正是「谁用哪种边界」的本体。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
         log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
@@ -1374,7 +1375,7 @@ class TestAccountChoicesGuards(_HomeSandbox):
                 # 只能照着这段话做。光改账号目录名不够：住在
                 # .codex-subagent-auto 里的任务之后再也扫不到，status 看不见、
                 # stop 停不掉——正是本函数上方注释反复要避免的静默失效。
-                self.assertIn(str(ca.isolation_home(name)), got.exception.message,
+                self.assertIn(str(ca.isolation_home(ca.CODEX, name)), got.exception.message,
                               "没告诉用户隔离目录也要一起改名，照做之后任务会从 status 消失")
                 d.rmdir()
 
@@ -1385,7 +1386,7 @@ class TestAccountChoicesGuards(_HomeSandbox):
             (self.home / ".codex-accounts" / name).mkdir(parents=True)
         got = ca.account_choices()
         self.assertEqual(len(got), len(set(got)))
-        homes = [ca.isolation_home(a) for a in got]
+        homes = [ca.isolation_home(ca.CODEX, a) for a in got]
         self.assertEqual(len(homes), len(set(homes)))
 
 
@@ -1401,10 +1402,10 @@ class TestAccountOrder(_HomeSandbox):
             d.mkdir(parents=True)
             (d / "auth.json").write_text("{}")     # 有登录态才进候选
         for account in ("default", "acct2", "acct3"):
-            (ca.isolation_home(account) / "tasks").mkdir(parents=True)
+            (ca.isolation_home(ca.CODEX, account) / "tasks").mkdir(parents=True)
 
     def _limit(self, account, when):
-        ca.write_usage_limit(ca.isolation_home(account), when, "测试写的")
+        ca.write_usage_limit(ca.isolation_home(ca.CODEX, account), when, "测试写的")
 
     def test_没记录的排在有记录的前面(self):
         self._limit("default", datetime.datetime(2099, 1, 1))
@@ -1433,8 +1434,8 @@ class TestAccountOrder(_HomeSandbox):
         skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
         传 [] 当场 ValueError。
         """
-        ca.write_meta(ca.isolation_home("acct3"), "t",
-                      ca.new_meta("t", "acct3", "/tmp", "high", ()))
+        ca.write_meta(ca.isolation_home(ca.CODEX, "acct3"), "t",
+                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "high", ()))
         self._limit("acct3", datetime.datetime(2099, 12, 31))
         self.assertEqual(ca.accounts_by_availability()[0], "acct2",
                          "任务住在 acct3 且 acct3 限流到 2099——它不许排第一")
@@ -1480,10 +1481,10 @@ class TestIsolation(_HomeSandbox):
         `ensure_isolation` 里加一条「顶层只许有这几样」，限流记录会当场
         把每一次 run 打死——这条测试要在那之前红。
         """
-        home = ca.ensure_isolation("acct2")
+        home = ca.ensure_isolation(ca.CODEX, "acct2")
         ca.write_usage_limit(home, datetime.datetime(2026, 9, 25, 17, 4), "Sep 25th, 2026 5:04 PM")
         (home / "某个谁也没料到的文件").write_text("x")
-        self.assertEqual(ca.ensure_isolation("acct2"), home)
+        self.assertEqual(ca.ensure_isolation(ca.CODEX, "acct2"), home)
         self.assertEqual(ca.read_usage_limit(home), datetime.datetime(2026, 9, 25, 17, 4),
                          "再跑一次不许把限流记录冲掉")
 
@@ -1517,11 +1518,11 @@ class TestIsolation(_HomeSandbox):
         self.assertIn("bad acct", err.getvalue())
 
     def test_default账号映射到不带后缀的隔离目录(self):
-        self.assertEqual(ca.isolation_home("default"), self.home / ".codex-subagent")
-        self.assertEqual(ca.isolation_home("acct2"), self.home / ".codex-subagent-acct2")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "default"), self.home / ".codex-subagent")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "acct2"), self.home / ".codex-subagent-acct2")
 
     def test_首次使用自动建齐目录与配置(self):
-        d = ca.ensure_isolation("acct2")
+        d = ca.ensure_isolation(ca.CODEX, "acct2")
         for sub in ("skills", "plugins", "tasks", "reports", "logs"):
             with self.subTest(sub=sub):
                 self.assertTrue((d / sub).is_dir())
@@ -1530,7 +1531,7 @@ class TestIsolation(_HomeSandbox):
 
     def test_生成的config不写模型与沙箱_那些由CLI每次显式传(self):
         # 写进 config 就是同一条事实有两个家，还是个会被静默覆盖的缺省值
-        d = ca.ensure_isolation("acct2")
+        d = ca.ensure_isolation(ca.CODEX, "acct2")
         text = (d / "config.toml").read_text()
         for key in ("model", "model_reasoning_effort", "sandbox_mode", "approval_policy"):
             with self.subTest(key=key):
@@ -1540,20 +1541,20 @@ class TestIsolation(_HomeSandbox):
         d = self.home / ".codex-subagent"
         d.mkdir()
         (d / "config.toml").write_text(ca.CONFIG_NOTE + '\n[projects."/x"]\ntrust_level = "trusted"\n')
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         self.assertIn("trust_level", (d / "config.toml").read_text())
 
     def test_共享扫描根非空就拒跑_CODEX_HOME管不到它(self):
         (self.home / ".agents" / "skills" / "某个skill").mkdir(parents=True)
         with self.assertRaises(ca.Rejected) as cm:
-            ca.ensure_isolation("default")
+            ca.ensure_isolation(ca.CODEX, "default")
         self.assertIn("某个skill", cm.exception.message)
 
     def test_auth指错账号时被改回来(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         (d / "auth.json").unlink()
         (d / "auth.json").symlink_to(self.home / ".codex-accounts" / "acct2" / "auth.json")
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         self.assertEqual(os.readlink(d / "auth.json"), str(self.home / ".codex" / "auth.json"))
 
     def test_config是软链就拒跑_隔离会失效(self):
@@ -1561,21 +1562,108 @@ class TestIsolation(_HomeSandbox):
         d.mkdir()
         (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
         with self.assertRaises(ca.Rejected) as cm:
-            ca.ensure_isolation("default")
+            ca.ensure_isolation(ca.CODEX, "default")
         self.assertIn("软链", cm.exception.message)
 
     def test_已有的config不被覆盖(self):
         d = self.home / ".codex-subagent"
         d.mkdir()
         (d / "config.toml").write_text('model = "自定义"\n')
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         self.assertIn("自定义", (d / "config.toml").read_text())
 
     def test_账号没登录态就拒跑(self):
         (self.home / ".codex-accounts" / "acct3").mkdir()
         with self.assertRaises(ca.Rejected) as cm:
-            ca.ensure_isolation("acct3")
+            ca.ensure_isolation(ca.CODEX, "acct3")
         self.assertIn("登录", cm.exception.message)
+
+
+class TestRunnerAxis(_HomeSandbox):
+    """runner 是一条**新的轴**：换 runner 连隔离机制、工作目录怎么传、报告怎么拿、
+    有没有账号都不一样。这条轴的全部结构性后果都钉在这里。
+    """
+
+    def test_元数据记了runner(self):
+        self.assertEqual(ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ())["runner"],
+                         ca.CODEX)
+
+    def test_deepseek的account必须是None(self):
+        # 不许记一个假名字：account 进 status 第二列，而且 _resume_round 会拿它去
+        # ensure_isolation——记 "deepseek" 会指向 ~/.codex-subagent-deepseek 这个
+        # 不存在的账号目录，并因缺 auth 拒跑。
+        self.assertIsNone(ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())["account"])
+        with self.assertRaises(ValueError):
+            ca.new_meta("t", ca.DEEPSEEK, "acct2", "/tmp", "max", ())
+
+    def test_runner不在白名单就炸(self):
+        with self.assertRaises(ValueError):
+            ca.new_meta("t", "gpt4", "default", "/tmp", "low", ())
+
+    def test_校验面仍然从构造器派生(self):
+        self.assertIn("runner", ca.REQUIRED_META_KEYS)
+        self.assertEqual(set(ca.REQUIRED_META_KEYS),
+                         set(ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ())))
+
+    def test_隔离目录由runner和account一对值决定(self):
+        self.assertEqual(ca.isolation_home(ca.CODEX, "default"), self.home / ".codex-subagent")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "acct2"), self.home / ".codex-subagent-acct2")
+        self.assertEqual(ca.isolation_home(ca.DEEPSEEK, None), self.home / ".claude-subagent")
+        with self.assertRaises(ValueError):
+            ca.isolation_home(ca.DEEPSEEK, "acct2")
+
+    def test_隔离目录名一个都没改(self):
+        # 改它会让 260 份现存元数据里的任务从 status/resume/stop 里全部消失。
+        self.assertEqual(ca.isolation_home(ca.CODEX, "default").name, ".codex-subagent")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "acct2").name, ".codex-subagent-acct2")
+
+    def test_扫描根包含deepseek的家(self):
+        # **不加这一条，deepseek 任务对 status/resume/stop 整体不可见。**
+        roots = ca.isolation_roots()
+        self.assertIn(ca.isolation_home(ca.DEEPSEEK, None), roots)
+        for a in ca.account_choices():
+            self.assertIn(ca.isolation_home(ca.CODEX, a), roots)
+
+    def test_deepseek的任务status查得到(self):
+        home = ca.isolation_home(ca.DEEPSEEK, None)
+        (home / "tasks").mkdir(parents=True)
+        ca.write_meta(home, "dst", ca.new_meta("dst", ca.DEEPSEEK, None, "/tmp", "max", ()))
+        got_home, got_meta = ca.find_meta("dst")
+        self.assertEqual(got_home, home)
+        self.assertEqual(got_meta["runner"], ca.DEEPSEEK)
+        self.assertIn("dst", [m["task"] for _, m in ca.all_metas()])
+
+    def test_deepseek的隔离只建三个子目录_少一个就是tee里的FileNotFoundError(self):
+        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.assertEqual(d, self.home / ".claude-subagent")
+        for sub in ("tasks", "reports", "logs"):
+            with self.subTest(sub=sub):
+                self.assertTrue((d / sub).is_dir())
+        # 这三条不变量是 codex 专属：deepseek 的 auth 走环境变量里的 token，
+        # 没有 auth.json；共享扫描根 ~/.agents/skills 是 codex 的扫描根。
+        self.assertFalse((d / "auth.json").exists())
+        self.assertFalse((d / "config.toml").exists())
+
+    def test_deepseek不受codex的共享扫描根约束(self):
+        # ~/.agents/skills 是 **codex** 的扫描根，claude 根本不看它。
+        # 拿它去拒 deepseek 就是把一条外部事实当成了普遍规律。
+        (self.home / ".agents" / "skills" / "某个skill").mkdir(parents=True)
+        self.assertTrue(ca.ensure_isolation(ca.DEEPSEEK, None).is_dir())
+        with self.assertRaises(ca.Rejected):
+            ca.ensure_isolation(ca.CODEX, "default")
+
+    def test_deepseek没有登录态这一关_它的token在环境变量里(self):
+        # codex 那侧缺 auth.json 当场拒跑；deepseek 侧连 auth.json 都不该有。
+        (self.home / ".codex" / "auth.json").unlink()
+        self.assertTrue(ca.ensure_isolation(ca.DEEPSEEK, None).is_dir())
+        with self.assertRaises(ca.Rejected):
+            ca.ensure_isolation(ca.CODEX, "default")
+
+    def test_auth_source只对codex有意义(self):
+        # deepseek 的 account 是 None，拿它拼路径会拿到 ~/.codex-accounts/None/auth.json
+        # 这个谁都不会注意到的假路径——大声炸掉比静默拼一个不存在的路径好。
+        with self.assertRaises(ValueError):
+            ca.auth_source(None)
 
 
 class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
@@ -1750,7 +1838,7 @@ class TestFixedArgs(unittest.TestCase):
 
 class TestMeta(_HomeSandbox):
     def test_元数据写入后能跨隔离目录查回来_home走返回值不是魔法键(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t1", _full_meta("t1", dir="/abs/x"))
         home, meta = ca.find_meta("t1")
         self.assertEqual(meta["dir"], "/abs/x")
@@ -1762,7 +1850,7 @@ class TestMeta(_HomeSandbox):
         self.assertEqual(ca.find_meta("不存在的任务"), (None, None))
 
     def test_元数据缺字段就拒绝_不给默认值圆场(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.meta_path(d, "broken").write_text('{"task": "broken"}')
         with self.assertRaises(ca.Rejected) as cm:
             ca.find_meta("broken")
@@ -1773,13 +1861,13 @@ class TestMeta(_HomeSandbox):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
         for account in ("default", "acct2"):
-            ca.write_meta(ca.ensure_isolation(account), "clash", _full_meta("clash", account=account))
+            ca.write_meta(ca.ensure_isolation(ca.CODEX, account), "clash", _full_meta("clash", account=account))
         with self.assertRaises(ca.Rejected) as cm:
             ca.find_meta("clash")
         self.assertIn("多个隔离目录", cm.exception.message)
 
     def test_列出全部任务(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         for name in ("a", "b"):
             ca.write_meta(d, name, _full_meta(name))
         self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
@@ -1798,7 +1886,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
     """
 
     def test_并发读永远读不到半截json(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         meta = _full_meta("t", session_id="01a0b408-f718-7ff3-8123-d5202551acba")
         ca.write_meta(d, "t", meta)
         q = ca.meta_path(d, "t")
@@ -1835,7 +1923,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
         实测这个突变**存活**过。这里改成让 os.replace 崩掉，残片就是实现
         真正用的那个名字。
         """
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "good", _full_meta("good"))
         tasks = ca.meta_path(d, "good").parent
         before = {q.name for q in tasks.iterdir()}
@@ -1868,8 +1956,8 @@ class TestMetaShape(_HomeSandbox):
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
     # 校验面跟着少，测试照样绿（实测过）。和退出码一样，得按绝对值钉。
-    FIELDS = {"task", "account", "dir", "effort", "skills", "session_id", "started_at",
-              "writer_pid", "writer_start"}
+    FIELDS = {"task", "runner", "account", "dir", "effort", "skills", "session_id",
+              "started_at", "writer_pid", "writer_start"}
 
     def test_字段清单的绝对值(self):
         self.assertEqual(set(ca.REQUIRED_META_KEYS), self.FIELDS)
@@ -1887,6 +1975,10 @@ class TestMetaShape(_HomeSandbox):
         # 白名单是「最后一次调用给了什么」，要审计就读这个字段——它刻意不进
         # status 的列：skill 路径是任意长度的绝对路径，进数据行会把格式撑坏。
         self.assertIn("skills", self.FIELDS)
+        # **runner 必须落盘**，而且没有「读不到就当 codex」的兜底：resume/stop/status
+        # 全靠它决定去问哪个进程名、拼哪套 argv、走哪个隔离目录。写缺省值的那一版
+        # 会让一份坏元数据静默变成「codex 任务」，而它的日志是 JSONL。
+        self.assertIn("runner", self.FIELDS)
 
     def test_构造器自己就把写者记进去(self):
         """`new_meta` 产出的是「一份此刻开始的任务的完整记录」，**写者是谁是这份
@@ -1896,18 +1988,18 @@ class TestMetaShape(_HomeSandbox):
         传垃圾进来落盘的仍是真身份——于是「传反了」（两个都是 str，starttime
         长得就像个 pid）永远没人发现。不可观测的参数就是给误用留的口子。
         """
-        meta = ca.new_meta("t", "default", "/abs/x", "low", ())
+        meta = ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", ())
         self.assertEqual((meta["writer_pid"], meta["writer_start"]), ca._writer_identity())
 
     def test_构造器的键集就是校验面(self):
-        self.assertEqual(set(ca.new_meta("t", "default", "/abs/x", "low", ())),
+        self.assertEqual(set(ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", ())),
                          set(ca.REQUIRED_META_KEYS))
 
     def test_run落盘的元数据键集与校验面相等_不多不少(self):
         # 相等而不是包含：少一个字段任务就够不着了；多塞一个 **codex 的** pid 又会
         # 破坏「codex 存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
         # writer 的那一对是例外，理由见 test_字段清单的绝对值。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--no-skill"])
@@ -1921,11 +2013,11 @@ class TestMetaShape(_HomeSandbox):
         # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
         for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                ca.new_meta("t", "default", "/abs/x", "low", bad)
-        self.assertEqual(ca.new_meta("t", "default", "/abs/x", "low", ())["skills"], ())
+                ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", bad)
+        self.assertEqual(ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", ())["skills"], ())
 
     def test_run落盘的writer身份就是本进程(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--no-skill"])
@@ -1941,7 +2033,7 @@ class TestMetaShape(_HomeSandbox):
         读回来的——沿用的话，下一条命令一问「上一轮那个进程还在吗」，答的是**上上轮**
         那个进程的事。所以盖章的地方必须是 `run_codex`（三条路的唯一交汇点）。
         """
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         with _no_codex():
             ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         落盘 = json.loads(ca.meta_path(d, "t").read_text())
@@ -1949,7 +2041,7 @@ class TestMetaShape(_HomeSandbox):
         self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
 
     def test_run落盘的skills就是命令行给的那几条(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         skill = self.home / "tdd_SKILL.md"
         skill.write_text("---\nname: tdd\n---\n")
         args = ca.build_parser().parse_args(
@@ -1960,7 +2052,7 @@ class TestMetaShape(_HomeSandbox):
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
     def test_resume刷新skills_元数据描述的是最后一次调用(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         first, second = self.home / "a_SKILL.md", self.home / "b_SKILL.md"
         for q in (first, second):
             q.write_text("---\nname: x\n---\n")
@@ -1978,7 +2070,7 @@ class TestMetaShape(_HomeSandbox):
     def test_interrupt_and_resume也把skills接了进去(self):
         # _resume_round 是两条路共用的，但接线是各自的：这条命令传成 [] 或漏传，
         # 上面那条测试一个字都测不出来。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         skill = self.home / "c_SKILL.md"
         skill.write_text("---\nname: x\n---\n")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
@@ -2106,7 +2198,7 @@ class TestPreviousWriterAlive(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation("default")
+        self.d = ca.ensure_isolation(ca.CODEX, "default")
 
     def _写盘(self, **over):
         ca.write_meta(self.d, "t", _full_meta("t", **over))
@@ -2894,7 +2986,7 @@ class TestRunGuards(_HomeSandbox):
         所以这里钉两件事：① 入口闸独有的那句下一步建议；
         ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
         """
-        ca.write_meta(ca.ensure_isolation("default"), "t", _full_meta("t"))
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t", _full_meta("t"))
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
@@ -2907,13 +2999,13 @@ class TestRunGuards(_HomeSandbox):
     def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
-        ca.write_meta(ca.ensure_isolation("acct2"), "t", _full_meta("t", account="acct2"))
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct2"), "t", _full_meta("t", account="acct2"))
         with self.assertRaises(ca.Rejected) as cm:
             ca.cmd_run(self._args(task="t"))
         self.assertIn("acct2", cm.exception.message)
 
     def test_开跑前删掉上一轮的报告_否则旧报告会被判成本轮成功(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
         with _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
@@ -2923,7 +3015,7 @@ class TestRunGuards(_HomeSandbox):
     def test_dir相对路径被转成绝对_相对路径启动即崩(self):
         # --cd 给相对路径，codex 启动即崩（log 无 banner + os error 2）。
         # 转绝对这一步要是没了，工具就把这个坑原样传给了 codex。
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         seen = {}
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
@@ -2944,7 +3036,7 @@ class TestRunGuards(_HomeSandbox):
         # work_dir 挂在 argparse 的 type= 上，它看到的是**命令行上那个串**；
         # 而落进元数据、随后进 status 数据行的是 `resolve()` 之后的真身。
         # 软链一跨，入口那道就绕过去了——所以 resolve 之后必须再守一次。
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         real = self.home / "a\tb\nc"
         real.mkdir()
         link = self.home / "link"
@@ -2963,7 +3055,7 @@ class TestRunGuards(_HomeSandbox):
         # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
         # 这条没人守的话，config.toml 被软链回主配置、auth.json 指错账号，
         # 主路径上全查不出来——而主路径才是绝大多数运行走的那条。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         (d / "config.toml").unlink()
         (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
         with self.assertRaises(ca.Rejected) as cm:
@@ -2974,7 +3066,7 @@ class TestRunGuards(_HomeSandbox):
         # 刻意不一律拒绝：工具没有清理命令，一律拒绝等于任务名一次性，
         # tasks/ 只能手工去删。已结束 + 同账号这一格是安全的——报告会被清掉、
         # 日志是追加的，历史不丢。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
@@ -2985,7 +3077,7 @@ class TestRunGuards(_HomeSandbox):
         #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
         #   写元数据在 spawn 之后 -> 中途炸了就留下一个没人管的孤儿 codex
         #   写分隔符在 spawn 之后 -> 同上，而且判据会把上一轮的错误算到这一轮头上
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
         (d / "logs" / "t.log").write_text("上一轮的日志\n")
         seen = {}
@@ -3002,7 +3094,7 @@ class TestRunGuards(_HomeSandbox):
         self.assertEqual(seen, {"旧报告还在": False, "元数据已落盘": True, "分隔符已写入": True})
 
     def test_日志是追加的_上一轮的内容不会被冲掉(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         (d / "logs" / "t.log").write_text("上一轮的日志\n")
         with _no_codex():
             ca.cmd_run(self._args(task="t"))
@@ -3071,12 +3163,12 @@ class TestAutoAccountPick(_HomeSandbox):
         self.spawned = []        # 真的 spawn 了哪个账号（不止一个就是回归）
         # 反查表，不写 `home.name.replace(...)`：那是 isolation_home 的逆运算，
         # 抄一份就会和它漂移，而漂了之后这里只会 KeyError，不会给出线索。
-        self.account_of = {str(ca.isolation_home(a)): a
+        self.account_of = {str(ca.isolation_home(ca.CODEX, a)): a
                            for a in ("default", "acct2", "acct3")}
 
     def _limit(self, account, when):
-        ca.ensure_isolation(account)
-        ca.write_usage_limit(ca.isolation_home(account), when, "测试写的")
+        ca.ensure_isolation(ca.CODEX, account)
+        ca.write_usage_limit(ca.isolation_home(ca.CODEX, account), when, "测试写的")
 
     def _args(self, account, task="t"):
         return ca.build_parser().parse_args(
@@ -3133,9 +3225,9 @@ class TestAutoAccountPick(_HomeSandbox):
     def test_撞上限要把恢复时间记下来(self):
         code = self._run(ca.AUTO, self.LIMIT_LINE)
         self.assertEqual(self.spawned, ["acct2"])
-        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct2")), self.RESET_AT)
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")), self.RESET_AT)
         self.assertEqual(code, ca.EXIT["failed"])
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct3")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct3")),
                           "没跑过的账号不许被记一笔")
 
     def _撞上限后重排(self, 预先限流=None):
@@ -3202,7 +3294,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(code, ca.EXIT["failed"], "前提不成立：这一轮没有失败")
         self.assertNotIn("额度", self.printed.split("报告 ")[0].split("t: failed")[-1],
                          "failed 的理由不该是额度问题")
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "只是被回显进日志的一句话，不许变成这个账号的限流记录")
         self.assertNotIn("撞上额度上限", self.printed,
                          "闸门在拿整轮裸文本做子串匹配")
@@ -3219,10 +3311,10 @@ class TestAutoAccountPick(_HomeSandbox):
         污染 = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
         code = self._run(ca.AUTO, 污染 + "\n" + self.LIMIT_LINE)
         self.assertEqual(code, ca.EXIT["failed"])
-        记录 = ca.read_usage_limit(ca.isolation_home("acct2"))
+        记录 = ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2"))
         self.assertEqual(记录, self.RESET_AT,
                          "记下的是污染行里那个 2099——恢复时间没有从已分类的错误行里取")
-        落盘 = json.loads(ca.usage_limit_path(ca.isolation_home("acct2")).read_text())
+        落盘 = json.loads(ca.usage_limit_path(ca.isolation_home(ca.CODEX, "acct2")).read_text())
         self.assertEqual(落盘["raw"], "Sep 25th, 2026 5:04 PM",
                          "raw 是审计线索，存了污染行就等于线索也一起坏了")
         # 只看**工具自己写的那一行**。整屏里当然有 2099——tee 会把 codex 的原始
@@ -3237,7 +3329,7 @@ class TestAutoAccountPick(_HomeSandbox):
         # 排序永不过期，一个编出来的未来时间会让这个账号从此排到最后。
         code = self._run(ca.AUTO, self.NO_TIME)
         self.assertEqual(code, ca.EXIT["failed"])
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "解析不出来就不许落盘——写进去的会是编的")
         self.assertIn("没有恢复时间", self.printed)
 
@@ -3264,8 +3356,8 @@ class TestAutoAccountPick(_HomeSandbox):
         **让真的写入失败**（目标位置被一个目录占住），不 mock write_usage_limit
         ——那样测的是 mock 的行为，不是代码的。
         """
-        ca.ensure_isolation("acct2")
-        ca.usage_limit_path(ca.isolation_home("acct2")).mkdir()
+        ca.ensure_isolation(ca.CODEX, "acct2")
+        ca.usage_limit_path(ca.isolation_home(ca.CODEX, "acct2")).mkdir()
         code = self._run(ca.AUTO, self.LIMIT_LINE)
         self.assertEqual(code, ca.EXIT["failed"], "写盘失败不许改写本轮结论")
         self.assertIn("写不进", self.printed, "写不进去要出声，不许静默失效")
@@ -3273,7 +3365,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(len(结论行), 1, "前提不成立：没有结论行")
         self.assertNotIn("已记下", 结论行[0], "没记下就不许说已记下")
         self.assertIn("没能记下", 结论行[0], "要如实说这次没记下")
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "前提不成立：其实写进去了，这条测的就不是写失败")
 
     def test_brief里有额度字样又真被打断_退130且不写限流记录(self):
@@ -3284,17 +3376,17 @@ class TestAutoAccountPick(_HomeSandbox):
         code = self._run(ca.AUTO, self.LIMIT_LINE + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(code, ca.EXIT["interrupted"])
         self.assertEqual(code, 130)
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "被打断的轮次不许被记成撞上限")
-        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists(),
+        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct2"), "t").exists(),
                         "被打断的任务元数据必须留着——下一步是 resume")
 
     def test_不是额度问题_不记限流也不删元数据(self):
         code = self._run(ca.AUTO, self.BROKEN)
         self.assertEqual(code, ca.EXIT["failed"])
-        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "普通失败不许被记成账号限流")
-        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists())
+        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct2"), "t").exists())
         self.assertNotIn("额度", self.printed)
 
     # ── 强制指定账号 ────────────────────────────────────────────────────
@@ -3304,13 +3396,13 @@ class TestAutoAccountPick(_HomeSandbox):
         code = self._run("acct3", self.LIMIT_LINE)
         self.assertEqual(self.spawned, ["acct3"], "强制模式只跑指定的那个")
         self.assertEqual(code, ca.EXIT["failed"])
-        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct3")), self.RESET_AT)
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct3")), self.RESET_AT)
 
     def test_强制模式下同名任务属于别的账号_仍然拒跑(self):
         # 这道护栏在强制模式下**原样保留**：同一个名字出现在两个隔离目录里时，
         # find_meta 数出两份并拒绝，另一份成了再也够不着的孤儿元数据。
-        ca.write_meta(ca.ensure_isolation("acct2"), "t",
-                      ca.new_meta("t", "acct2", "/tmp", "low", ()))
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct2"), "t",
+                      ca.new_meta("t", ca.CODEX, "acct2", "/tmp", "low", ()))
         with self.assertRaises(ca.Rejected) as got:
             ca.cmd_run(self._args("acct3"))
         self.assertIn("acct2", got.exception.message)
@@ -3318,15 +3410,15 @@ class TestAutoAccountPick(_HomeSandbox):
     # ── 迁移 ────────────────────────────────────────────────────────────
 
     def test_任务原本在别的账号_auto显式迁移_元数据只剩一份(self):
-        ca.write_meta(ca.ensure_isolation("acct3"), "t",
-                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
-        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home("acct3"),
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
+                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
+        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home(ca.CODEX, "acct3"),
                          "前提不成立：任务没住进 acct3")
         code = self._run(ca.AUTO, self.FINE)
         self.assertEqual(self.spawned, ["acct2"], "auto 按恢复时间挑，不沿用旧家")
         self.assertEqual(code, ca.EXIT["success"])
         self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
-        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home("acct2"))
+        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home(ca.CODEX, "acct2"))
         self.assertIn("acct3", self.printed, "要点名从哪个账号搬过来的")
 
     def test_迁移提示不许声称旧账号的报告被删掉_因为它没被删(self):
@@ -3338,8 +3430,8 @@ class TestAutoAccountPick(_HomeSandbox):
         v3 的跨账号护栏注释里就写过「那句提示在跨账号时还是假话」，
         v4 把护栏在 auto 模式下拆了，就不能把那句假话留下。
         """
-        旧 = ca.ensure_isolation("acct3")
-        ca.write_meta(旧, "t", ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        旧 = ca.ensure_isolation(ca.CODEX, "acct3")
+        ca.write_meta(旧, "t", ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
         (旧 / "reports" / "t.md").write_text("上一轮的报告\n")
         (旧 / "logs" / "t.log").write_text("上一轮的日志\n")
 
@@ -3371,9 +3463,9 @@ class TestAutoAccountPick(_HomeSandbox):
         `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
         就只剩 `find_codex_pid` 这一条。
         """
-        ca.write_meta(ca.ensure_isolation("acct3"), "t",
-                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
-        选中的报告 = ca._report_path(ca.ensure_isolation("acct2"), "t")
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
+                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
+        选中的报告 = ca._report_path(ca.ensure_isolation(ca.CODEX, "acct2"), "t")
         self.assertEqual(ca.accounts_by_availability()[0], "acct2",
                          "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
 
@@ -3384,7 +3476,7 @@ class TestAutoAccountPick(_HomeSandbox):
             with self.assertRaises(ca.Rejected) as got:
                 ca.cmd_run(self._args(ca.AUTO))
         self.assertIn("还在跑", got.exception.message)
-        self.assertTrue(ca.meta_path(ca.isolation_home("acct3"), "t").exists(),
+        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct3"), "t").exists(),
                         "拒绝发生在删旧元数据之后——任务在半路上消失了")
         self.assertEqual(len(ca.all_metas()), 1, "元数据既不许没有，也不许有两份")
 
@@ -3401,8 +3493,8 @@ class TestAutoAccountPick(_HomeSandbox):
         v4 里「排在最前」这个键已经整个删掉了，但迁移这一步必须留着，
         而且要对**掉了登录态**这种够不着旧账号的情形照样成立。
         """
-        ca.write_meta(ca.ensure_isolation("acct3"), "t",
-                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
+                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
         self.assertNotIn("acct3", ca.accounts_by_availability(),
                          "前提不成立：掉了登录态的账号仍在候选里")
@@ -3432,7 +3524,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertIn("没有这个任务", cm.exception.message)
 
     def test_还在跑就拒绝resume_写锁冲突和SIGTERM锁死长得一样(self):
-        ca.write_meta(ca.ensure_isolation("default"), "t",
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t",
                       _full_meta("t", session_id="s1", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
@@ -3440,7 +3532,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertIn("还在跑", cm.exception.message)
 
     def test_没有session_id就拒绝(self):
-        ca.write_meta(ca.ensure_isolation("default"), "t2",
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t2",
                       _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
@@ -3450,7 +3542,7 @@ class TestResumeGuards(_HomeSandbox):
     def test_工作目录没了就拒绝_run校验了resume也得校验(self):
         # worktree 被删后照样拼命令，codex 会以 os error 2 当场崩——
         # 和 `--cd` 给相对路径同款症状，而 run 那条路是被人话拒绝的
-        ca.write_meta(ca.ensure_isolation("default"), "t4",
+        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t4",
                       _full_meta("t4", session_id="s1", dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_codex_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
@@ -3462,7 +3554,7 @@ class TestResumeGuards(_HomeSandbox):
         # resume 这条路上不查的话，config.toml 被软链回主配置、auth.json 指错
         # 账号，全都查不出来——而这种失效是静默的：跑起来一切正常，
         # 只是 codex 看得见它不该看见的东西。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
         (d / "config.toml").unlink()
         (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
@@ -3473,7 +3565,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def test_resume会刷新started_at_元数据描述的是最后一次调用(self):
         # 完整的轮次历史在日志的分隔符里，元数据只描述最后一次
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t6", _full_meta("t6", session_id="s1", dir=str(self.workdir),
                                           started_at="2020-01-01T00:00:00"))
         with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
@@ -3482,7 +3574,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertNotEqual(meta["started_at"], "2020-01-01T00:00:00")
 
     def test_resume开跑前也要删报告_秒死于写锁时才不会误判成功(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
         (d / "reports" / "t3.md").write_text("上一轮的报告")
         with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
@@ -3505,7 +3597,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "msg.md"
         self.brief.write_text("顺便把 X 也改了")
-        self.d = ca.ensure_isolation("default")
+        self.d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(self.d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         ca._log_path(self.d, "t").write_text(
             ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
@@ -3690,12 +3782,12 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         return seen["argv"][-1]
 
     def _meta_for_resume(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         return d
 
     def test_run这条路_无白名单(self):
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--no-skill"])
@@ -3705,7 +3797,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self.assertIn("干活", brief)
 
     def test_run这条路_有白名单时路径真的进了argv(self):
-        ca.ensure_isolation("default")
+        ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
              "--effort", "low", "--account", "default", "--skill", str(self.skill)])
@@ -3792,7 +3884,7 @@ class TestStatusIsSplittable(_HomeSandbox):
                 self.assertEqual(row.split(maxsplit=4)[3], code)
 
     def test_明细行有缩进_数据行没有(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         ca._log_path(d, "t").write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00")
                                         + "\n" + ERR_FATAL + "\n")
@@ -3824,7 +3916,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         # account_choices() 在入口拒（见 TestIsolation），而 status 第二列读的是
         # tasks/<task>.json 里的 account 字段——_load_meta 只校验**键**在不在，
         # 值长什么样一概不管，所以这一道是独立的第二个入口，不是重复防御。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", account="bad acct"))
         self.assertEqual(ca._load_meta(ca.meta_path(d, "t"))["account"], "bad acct",
                          "前提不成立：元数据这一侧居然校验了 account 的值，那就不是真的洞")
@@ -3858,7 +3950,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         # 刻意选 interrupted 这一支：它的 reason **真的含空格**，端到端走一遍才算
         # 把「reason 排在最后」这件事钉住。选 failed 那一支测不到——它的 reason
         # （「报告缺失或为空＝没正常收尾」）一个空格都没有。
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         for name in ("alpha", "beta"):
             ca.write_meta(d, name, _full_meta(name, dir="/abs/repo"))
             ca._log_path(d, name).write_text(
@@ -3915,13 +4007,13 @@ class TestExitCodeContract(_HomeSandbox):
         return spawn
 
     def _run(self, report_text, log_extra=""):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         with _no_codex() as popen:
             popen.side_effect = self._spawner(d, report_text, log_extra)
             return ca.cmd_run(self._run_args())
 
     def _resume(self, report_text, log_extra=""):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
@@ -3956,7 +4048,7 @@ class TestExitCodeContract(_HomeSandbox):
         self.assertEqual(self._resume("干完了", self.UNCLASSIFIED), 3)
 
     def _interrupt_and_resume(self, report_text, log_extra=""):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
@@ -3988,7 +4080,7 @@ class TestExitCodeContract(_HomeSandbox):
         self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 130)
 
     def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         args = ca.build_parser().parse_args(["status", "t"])
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
@@ -4353,7 +4445,7 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation("default")
+        self.d = ca.ensure_isolation(ca.CODEX, "default")
 
     def _写盘(self, **over):
         ca.write_meta(self.d, "t", _full_meta("t", **over))
@@ -4483,7 +4575,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation("default")
+        self.d = ca.ensure_isolation(ca.CODEX, "default")
 
     def test_等的是磁盘上那份_不是传进来的meta(self):
         """**本版头号回归锁。**
@@ -4585,7 +4677,7 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
     """
 
     def test_stop这条路也留痕(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
         # 非空日志，理由见 TestInterruptCodex.HEAD 上面那段
@@ -4655,7 +4747,7 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
 
 class TestStop(_HomeSandbox):
     def test_只发SIGINT_绝不发SIGTERM(self):
-        d = ca.ensure_isolation("default")
+        d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         args = ca.build_parser().parse_args(["stop", "t"])
         with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
