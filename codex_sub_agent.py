@@ -2239,7 +2239,41 @@ def _print_verdict(task, verdict):
         print(f"  {line}")
 
 
+def _reject_bad_runner_combo(args):
+    """`--runner` 与 `--account`／`--effort` 的三条硬拒绝。**必须排在 `cmd_run`
+    任何状态变更之前**，所以它被抽成一个函数、由 `cmd_run` 第一行调用。
+
+    argparse 表达不了「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范
+    第 5 条要消灭的东西——所以这三条必须是代码。
+
+    **一律退 2 并说清为什么，不静默改正。** `claude-deepseek` 自己就是这么干的
+    （它的注释：「静默跑错模型变成大声退 2」，理由是 DeepSeek 的 API 对不存在的
+    模型名静默返回 200——静默纠正会让调用方以为自己传的那个生效了）。
+
+    「排在任何状态变更之前」这条的检验方式**不是**「排在那段删旧元数据的迁移分支
+    之前」——那半句不可达：迁移分支的门是 `--account auto`，而这三条与 auto 互斥
+    （deepseek 给任何 account 都拒，codex 不给 account 也拒）。真正可检验的
+    判据是**盘上什么都没多出来**：`ensure_isolation` 是第一个落盘的动作。
+    """
+    if args.runner == DEEPSEEK:
+        if args.account is not None:
+            reject(f"--runner {DEEPSEEK} 没有账号概念（一个 DeepSeek token），"
+                   f"不要传 --account（收到 {args.account!r}）。\n"
+                   f"账号只属于 codex：它的登录态是每账号一份 auth.json，"
+                   f"而 DeepSeek 的 token 走环境变量。")
+        if args.effort != DEEPSEEK_EFFORT:
+            reject(f"--runner {DEEPSEEK} 只接受 --effort {DEEPSEEK_EFFORT}"
+                   f"（收到 {args.effort!r}）。\n"
+                   f"不替你改成 {DEEPSEEK_EFFORT}：静默改正会让你以为自己传的那档生效了。")
+    elif args.account is None:
+        reject(f"--runner {CODEX} 必须给 --account（{'／'.join(account_choices())}／{AUTO}）。\n"
+               f"没有隐式选中的账号——选错账号要花钱才发现。")
+
+
 def cmd_run(args):
+    # **第一行就拒。** 排在 find_meta / ensure_isolation / new_meta 全部之前，
+    # 所以被拒的调用在盘上一个字节都不留。
+    _reject_bad_runner_combo(args)
     workdir = pathlib.Path(args.dir).expanduser().resolve()
     # 入口那道（work_dir）守的是**命令行上那个原始串**，而落进元数据、随后进
     # status 数据行的是 resolve() 之后的真身——软链一跨就绕过去了。实测：
@@ -2259,6 +2293,15 @@ def cmd_run(args):
 
     old_home, old_meta = find_meta(args.task)
 
+    # **跨 runner 同名任务当场拒。** 跨账号还有 `--account auto` 那条迁移路，
+    # 跨 runner 一条都没有（auto 只在 codex 的账号之间搬），而放任不管的后果是
+    # 同一个名字出现在两个隔离目录里——`find_meta` 此后一律拒绝，
+    # `status`／`resume`／`stop` 对这个任务全退 2，两份元数据谁也够不着。
+    # 排在这里：`find_meta` 是纯读，还没有任何状态变更。
+    if old_meta is not None and old_meta["runner"] != args.runner:
+        reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
+               f"跨 runner 没有迁移路径（会话、报告、日志都在那边），换个任务名。")
+
     if args.account == AUTO:
         candidates = accounts_by_availability()
         if not candidates:
@@ -2272,7 +2315,8 @@ def cmd_run(args):
         # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
         # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
         # 挑中别的账号时在下面**显式**把旧的那份搬过来。
-        if old_meta is not None and old_home != isolation_home(CODEX, account):
+        # deepseek 走不到这一支的拒绝：它只有一个家，`old_home` 相等，条件不成立。
+        if old_meta is not None and old_home != isolation_home(args.runner, account):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
@@ -2295,13 +2339,18 @@ def cmd_run(args):
     #
     # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
     # writer 和 codex 排干了没有」，每轮都必须做。
-    home = isolation_home(CODEX, account)
+    #
+    # **deepseek 的 needle 只住在元数据里**，所以「选中的家」那一格对它答不出来
+    # （新铸的 uuid 查不到上一轮）。上面那条跨 runner 拒绝保证了：能走到这里的
+    # deepseek 任务，`old_home` 要么是 None、要么就是这个家——而后者带着元数据，
+    # `find_task_agent_pid` 读得到上一轮的 uuid。
+    home = isolation_home(args.runner, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
-        if find_task_agent_pid(CODEX, candidate_home, args.task) is not None:
+        if find_task_agent_pid(args.runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `codex-sub-agent stop {args.task}`")
 
-    home = ensure_isolation(CODEX, account)
+    home = ensure_isolation(args.runner, account)
     if old_meta is not None:
         if old_home == home:
             print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
@@ -2323,10 +2372,14 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    this_round = run_codex("run", home, args.task,
-                           new_meta(args.task, CODEX, account, str(workdir), args.effort,
-                                    args.skills),
-                           lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+    # meta 先落成局部变量：deepseek 的 argv 要用它铸好的 session id，
+    # **argv 里那个和元数据里那个必须是同一个**——两处各算各的话，PID 反查按
+    # 元数据里那个去找，而真跑的是 argv 里那个，于是 status 说不在跑、stop 不发信号。
+    meta = new_meta(args.task, args.runner, account, str(workdir), args.effort, args.skills)
+    make_argv = (
+        (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if args.runner == CODEX
+        else (lambda r: build_deepseek_argv(args.effort, meta["session_id"], brief)))
+    this_round = run_codex("run", home, args.task, meta, make_argv)
     verdict = judge(this_round)
 
     # **撞上限只记一笔，不重跑。** v1~v3 在这里换账号重跑，安全论证是「撞上限的
@@ -2355,7 +2408,10 @@ def cmd_run(args):
     # 一旦看的不是同一批，就是 2026-09-22 那个 bug 的形状——污染行排在真错误前面时，
     # 对整轮文本 search() 取到的是污染那一条，于是一个健康账号被记上 2099 年的
     # 恢复时间，从此永远排最后。
-    if verdict.state == "failed" and hit_usage_limit(verdict.detail):
+    # **只对 codex。** 账号、限流记录、auto 排序全是 codex 的概念；deepseek 走进来
+    # 会往 `~/.claude-subagent` 写一条谁也不读的限流记录（`accounts_by_availability`
+    # 只扫 codex 的家），还会印一句「下次 auto 会先试 X」——而 deepseek 根本没有 auto。
+    if args.runner == CODEX and verdict.state == "failed" and hit_usage_limit(verdict.detail):
         # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
         # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
         reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
@@ -2483,9 +2539,14 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     meta["effort"] = effort
     meta["skills"] = skills
     meta["started_at"] = _now_iso()
-    verdict = judge(run_codex(kind, home, task, meta,
-                              lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                          effort, r, brief)))
+    # **session_id 不刷新**：续跑接的就是那一个会话。deepseek 侧再传一次
+    # `--session-id` 会另起一个会话（实测：同一个 id 第二次用报
+    # `Error: Session ID … is already in use.` 退 1），所以续跑走 `--resume`。
+    make_argv = (
+        (lambda r: build_resume_argv(meta["dir"], meta["session_id"], effort, r, brief))
+        if meta["runner"] == CODEX
+        else (lambda r: build_deepseek_resume_argv(effort, meta["session_id"], brief)))
+    verdict = judge(run_codex(kind, home, task, meta, make_argv))
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 
@@ -2664,9 +2725,17 @@ def build_parser():
     r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
-    # `--account` **仍然必填**：没有任何隐式选中的值。取值只是多了一个 AUTO。
-    r.add_argument("--account", required=True, choices=account_choices() + [AUTO],
-                   help=f"codex 账号；{AUTO} = 按记录的恢复时间自动挑一个")
+    # `--runner` **必填，没有缺省**：这不是「换个模型」，而是换隔离机制、换工作
+    # 目录的传法、换报告怎么拿、换有没有账号——给缺省值就是替调用方选了这一整套。
+    r.add_argument("--runner", required=True, choices=list(RUNNERS),
+                   help=f"派给哪个 agent 跑；{DEEPSEEK} 的 --effort 只能是 {DEEPSEEK_EFFORT}"
+                        f"、且不收 --account")
+    # `--account` 从必填改成可选，**不是放松**：它现在由 `_reject_bad_runner_combo`
+    # 守着——codex 不给就拒、deepseek 给了也拒。argparse 表达不了
+    # 「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范第 5 条要消灭的东西。
+    r.add_argument("--account", choices=account_choices() + [AUTO],
+                   help=f"codex 账号（{CODEX} 必填，{DEEPSEEK} 不收）；"
+                        f"{AUTO} = 按记录的恢复时间自动挑一个")
     # help 只说「这个参数选什么」。**撞上限之后会怎样，一个字都不在这里说**——
     # 轮内重试删掉那一版，SKILL.md 和 README 都改对了，只有这句 help 还写着
     # 「撞上额度上限就换下一个」，而它恰恰是子代理唯一会读的那份说明。

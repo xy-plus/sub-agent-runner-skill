@@ -680,7 +680,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
@@ -2611,7 +2611,7 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
@@ -2629,7 +2629,7 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         落盘 = json.loads(ca.meta_path(d, "t").read_text())
@@ -2655,7 +2655,7 @@ class TestMetaShape(_HomeSandbox):
         skill.write_text("---\nname: tdd\n---\n")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--skill", str(skill)])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--skill", str(skill)])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
@@ -3314,11 +3314,15 @@ class TestWorkDirArg(unittest.TestCase):
 class TestParser(_HomeSandbox):
     def test_run的五个参数一个都不能少(self):
         parser = ca.build_parser()
-        for missing in ["--task", "--dir", "--brief", "--effort", "--account"]:
+        # `--account` **不在这张表里**：它从 argparse 必填改成由
+        # `_reject_bad_runner_combo` 守（codex 不给就拒、deepseek 给了也拒），
+        # 因为 argparse 表达不了「A 必填当且仅当 B 是某值」。
+        # 那条闸自己有测试：TestRunnerCLI.test_codex仍然必须给account。
+        for missing in ["--task", "--dir", "--brief", "--effort", "--runner"]:
             # --no-skill 不加的话这条就静默退化成同义反复：缺 --skill/--no-skill
             # 照样 SystemExit，于是不管 --task/--dir/… 还必不必填，它都绿。
             argv = ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                    "--effort", "low", "--account", "default", "--no-skill"]
+                    "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -3330,7 +3334,7 @@ class TestParser(_HomeSandbox):
             with self.subTest(effort=e):
                 args = parser.parse_args(["run", "--task", "t", "--dir", "/tmp",
                                           "--brief", "b.md", "--effort", e,
-                                          "--account", "default", "--no-skill"])
+                                          "--runner", "codex", "--account", "default", "--no-skill"])
                 self.assertEqual(args.effort, e)
 
     def test_effort只收这五个档位(self):
@@ -3340,12 +3344,12 @@ class TestParser(_HomeSandbox):
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", bad, "--account", "default", "--no-skill"])
+                                   "--effort", bad, "--runner", "codex", "--account", "default", "--no-skill"])
 
     def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
         for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
-                      "--effort", "low", "--account", "default", "--no-skill"],
+                      "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"],
                      ["status", "a|b"],
                      ["resume", "a|b", "--brief", "b.md", "--effort", "low", "--no-skill"],
                      ["stop", "a|b"],
@@ -3381,7 +3385,7 @@ class TestParser(_HomeSandbox):
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", "low", "--account", "default", "--no-skill",
+                                   "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill",
                                    bad, "x"])
 
 
@@ -3460,7 +3464,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
 
     def _argv(self, cmd, *tail):
         base = {"run": ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                        "--effort", "low", "--account", "default"],
+                        "--effort", "low", "--runner", "codex", "--account", "default"],
                 "resume": ["resume", "t", "--brief", "b.md", "--effort", "low"],
                 "interrupt-and-resume": ["interrupt-and-resume", "t", "--brief", "b.md",
                                          "--effort", "low"]}[cmd]
@@ -3565,7 +3569,7 @@ class TestRunGuards(_HomeSandbox):
     def _args(self, **over):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
                 "--brief", over.get("brief", str(self.brief)), "--effort", "low",
-                "--account", "default", "--no-skill"]
+                "--runner", "codex", "--account", "default", "--no-skill"]
         return ca.build_parser().parse_args(argv)
 
     def test_dir不是目录就拒跑(self):
@@ -3629,7 +3633,7 @@ class TestRunGuards(_HomeSandbox):
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
         def grab(*a, **k):
             seen["argv"] = a[0]
             return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
@@ -3729,6 +3733,192 @@ def _capture_stdout():
     got["text"] = q.read_text(encoding="utf-8")
 
 
+class TestRunnerCLI(_HomeSandbox):
+    """`--runner` 必填 + 三条硬拒绝 + uuid 的生命周期。
+
+    三条硬拒绝**一律退 2 并说清为什么，不静默改正**——`claude-deepseek` 自己
+    就是这么干的（它的注释：「静默跑错模型变成大声退 2」）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+        # `--account` 的 choices 是**扫盘**来的：不建这个目录，连 argparse 都过不去，
+        # 后面那几条「cmd_run 怎么拒」根本走不到。
+        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
+        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
+
+    def _args(self, runner, account, effort, task="t"):
+        argv = ["run", "--task", task, "--dir", str(self.workdir),
+                "--brief", str(self.brief), "--effort", effort,
+                "--runner", runner, "--no-skill"]
+        if account is not None:
+            argv += ["--account", account]
+        return ca.build_parser().parse_args(argv)
+
+    def test_runner必填(self):
+        with self.assertRaises(SystemExit):
+            ca.build_parser().parse_args(
+                ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
+                 "--effort", "low", "--account", "default", "--no-skill"])
+
+    def test_runner不在白名单argparse就拦下(self):
+        with self.assertRaises(SystemExit):
+            self._args("gpt4", "default", "low")
+
+    def test_deepseek给account当场拒(self):
+        # 这个 runner 没有账号概念（一个 DeepSeek token）。记一个假名字的后果写在
+        # new_meta 上：account 进 status 第二列，而且 _resume_round 会拿它去
+        # ensure_isolation。
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("deepseek", "acct2", "max"))
+        self.assertIn("账号", got.exception.message)
+        self.assertEqual(got.exception.code, ca.USAGE_ERROR)
+
+    def test_deepseek的effort不是max就拒(self):
+        # 不静默改成 max：静默改正就是「调用方以为自己传的那个生效了」。
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("deepseek", None, "high"))
+        self.assertIn("max", got.exception.message)
+        self.assertEqual(got.exception.code, ca.USAGE_ERROR)
+
+    def test_codex仍然必须给account(self):
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("codex", None, "low"))
+        self.assertIn("--account", got.exception.message)
+
+    def test_被拒的调用不留任何盘上副作用(self):
+        """**v2 那条 `test_三条拒绝排在任何状态变更之前` 是空测试，这是它的替代。**
+
+        审查突变实测：把三条拒绝整个删掉、或挪到 `ensure_isolation` 之后，
+        v2 那条**照样绿**——它构造的场景根本到不了迁移分支（那个分支的门是
+        `--account auto`，而三条拒绝与 auto 互斥），于是先撞上跨账号护栏、
+        照样抛 `Rejected`、元数据照样在。
+
+        换成钉「盘上什么都没多出来」：`ensure_isolation` 是第一个落盘的动作，
+        拒绝排在它后面这条就红。
+        """
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("deepseek", None, "high"))
+        self.assertIn("max", got.exception.message, "钉住是哪一条拒绝在说话")
+        self.assertFalse((self.home / ".claude-subagent").exists(),
+                         "被拒的调用不许建隔离目录——ensure_isolation 是第一个落盘的动作")
+        self.assertEqual(ca.all_metas(), [], "也不许落任何元数据")
+
+    def test_resume和stop都不收runner(self):
+        # runner 从元数据查出来，不让调用方再报一遍（报错了就指向另一个隔离目录）。
+        for argv in (["resume", "t", "--brief", str(self.brief), "--effort", "low",
+                      "--no-skill", "--runner", "codex"],
+                     ["stop", "t", "--runner", "codex"]):
+            with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
+                ca.build_parser().parse_args(argv)
+
+    def test_每次run都铸新uuid_落元数据_argv用的就是它(self):
+        """实测复用同一个 session-id：`Error: Session ID … is already in use.` 退 1。
+
+        所以 `run` 的每一轮必须是新 uuid；而「argv 里那个」和「元数据里那个」
+        **必须是同一个**——两处各算各的话，PID 反查会按元数据里那个去找，
+        而真跑的是 argv 里那个，于是 status 说不在跑、stop 不发信号。
+        """
+        见过的 = []
+        for _ in range(2):
+            with _no_codex() as popen:
+                ca.cmd_run(self._args("deepseek", None, "max"))
+            meta = json.loads(ca.meta_path(ca.isolation_home(ca.DEEPSEEK, None), "t").read_text())
+            argv = popen.call_args.args[0]
+            self.assertEqual(argv[argv.index("--session-id") + 1], meta["session_id"],
+                             "argv 里那个和元数据里那个不是同一个")
+            见过的.append(meta["session_id"])
+        self.assertNotEqual(见过的[0], 见过的[1], "复用任务名沿用了旧 uuid——run 悄悄变成了 resume")
+
+    def test_deepseek走的是claude_deepseek不是codex(self):
+        with _no_codex() as popen:
+            ca.cmd_run(self._args("deepseek", None, "max"))
+        self.assertEqual(popen.call_args.args[0][0], ca.DEEPSEEK_BIN)
+
+    def test_同名任务不许跨runner复用(self):
+        # find_meta 撞见两份会拒，而跨 runner 没有迁移路径（--account auto 只在
+        # codex 的账号之间搬）。当场拒，别让这个状态建起来。
+        codex_home = ca.ensure_isolation(ca.CODEX, "default")
+        ca.write_meta(codex_home, "t", ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ()))
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("deepseek", None, "max"))
+        self.assertIn("runner", got.exception.message)
+        self.assertTrue(ca.meta_path(codex_home, "t").exists(), "被拒的调用不许动旧元数据")
+
+    def test_撞额度上限那一支只对codex(self):
+        """deepseek 没有账号维度，`accounts_by_availability()` / `write_usage_limit`
+        对它没有意义——走进去会往 `~/.claude-subagent` 写一条谁也用不上的限流记录，
+        而 `status` 的 auto 排序根本不看那个目录。
+        """
+        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        # 让这一轮判 failed，且错误行里带额度字样
+        假事件 = ('{"type":"result","subtype":"error_during_execution","is_error":true,'
+                  '"result":"' + ERR_USER_LAYER_REAL.replace('"', "'") + '"}')
+        with _fake_agent_proc((假事件 + "\n").encode()), \
+             mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
+            code = ca.cmd_run(self._args("deepseek", None, "max"))
+        self.assertEqual(code, ca.EXIT["failed"], "前提不成立：这一轮该判 failed")
+        self.assertIsNone(ca.read_usage_limit(d), "给 deepseek 记了一条没有意义的限流记录")
+
+
+class TestDeepseekResume(_HomeSandbox):
+    """`resume` / `interrupt-and-resume` 也要按元数据里的 runner 选 builder。"""
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("接着干")
+        self.d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
+        ca.write_meta(self.d, "t", self.meta)
+
+    def test_resume用的是resume_argv并带上元数据里的uuid(self):
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            ca.cmd_resume(args)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[0], ca.DEEPSEEK_BIN)
+        self.assertEqual(argv[argv.index("--resume") + 1], self.meta["session_id"])
+        self.assertNotIn("--session-id", argv, "续跑再指定 session-id 会另起一个会话")
+
+    def test_resume不许把uuid换掉_那就成了新会话(self):
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+        with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            ca.cmd_resume(args)
+        落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
+        self.assertEqual(落盘["session_id"], self.meta["session_id"])
+
+    def test_resume走的是deepseek的隔离目录_不是codex的账号目录(self):
+        # meta["account"] 是 None；_resume_round 拿 (runner, account) 去
+        # ensure_isolation，记成 "deepseek" 的话会指向 ~/.codex-subagent-deepseek
+        # 并因缺 auth 拒跑。
+        args = ca.build_parser().parse_args(
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            ca.cmd_resume(args)
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.d))
+
+    def test_interrupt_and_resume也走同一条(self):
+        args = ca.build_parser().parse_args(
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
+             "--no-skill"])
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            ca.cmd_interrupt_and_resume(args)
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[argv.index("--resume") + 1], self.meta["session_id"])
+
+
 class TestAutoAccountPick(_HomeSandbox):
     """`--account auto`：挑一个没在限流的账号，**只跑一轮**。
 
@@ -3782,7 +3972,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def _args(self, account, task="t"):
         return ca.build_parser().parse_args(
             ["run", "--task", task, "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", account, "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", account, "--no-skill"])
 
     def _spawn_says(self, popen, text):
         """让这一轮吐 `text`，然后 EOF。
@@ -4399,7 +4589,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -4409,7 +4599,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--skill", str(self.skill)])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--skill", str(self.skill)])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -4600,7 +4790,7 @@ class TestExitCodeContract(_HomeSandbox):
     def _run_args(self):
         return ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--account", "default", "--no-skill"])
+             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
 
     def _resume_args(self):
         return ca.build_parser().parse_args(
