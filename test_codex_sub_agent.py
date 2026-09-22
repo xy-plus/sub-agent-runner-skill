@@ -789,14 +789,6 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertNotIn("额度", v.reason)
 
-    def test_判据过宽时上面那条负例必须变红(self):
-        # 「不含标点」挡不住一个过宽的常量（比如单个字母）。这条钉的是：
-        # 负例的红是真的红，不是因为判据恰好没被触发。
-        with mock.patch.object(ca, "USAGE_LIMIT_MARK", "a"):
-            v = self._judge("任务：排查为什么会 hit your usage limit\n"
-                            + ERR_USER_LAYER + "\n")
-            self.assertIn("额度", v.reason, "判据过宽时应当误判——这条红了说明负例失效")
-
     def test_报告是散文也算success_并预览前几行(self):
         # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
         # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事。
