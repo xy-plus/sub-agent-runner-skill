@@ -1,8 +1,8 @@
-"""codex-sub-agent 的全部单测 —— 也是这个项目的**维护者入口**。
+"""sub-agent-runner 的全部单测 —— 也是这个项目的**维护者入口**。
 
 怎么跑：
 
-    python3 -m unittest test_codex_sub_agent -v
+    python3 -m unittest test_sub_agent_runner -v
 
 （零依赖、零 codex token。纯函数和护栏全在这里，不花钱。）
 
@@ -109,7 +109,7 @@ import unittest
 import warnings
 from unittest import mock
 
-import codex_sub_agent as ca
+import sub_agent_runner as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
@@ -521,7 +521,7 @@ class TestRoundBoundary(unittest.TestCase):
                          "后一轮的致命错误被算到了前一轮头上")
 
     def test_日志里混进ROUND_MARK的源码行_不许被当成轮次分隔符(self):
-        # 这个仓库的日常就是派 codex 改 codex_sub_agent.py 自己，源码行进日志是常态；
+        # 这个仓库的日常就是派 codex 改 sub_agent_runner.py 自己，源码行进日志是常态；
         # 模块 docstring 也写着「日志里还混着 brief 原文和 codex 转述的子进程输出」。
         # 子串搜索会在这里切断本轮：切剩 'ROUND_MARK = "' 14 个字符，
         # 打断标记被甩到本轮之外，judge 从 interrupted 翻成 failed。
@@ -1525,7 +1525,7 @@ class TestIsolation(_HomeSandbox):
         (self.home / ".codex-accounts" / "bad acct").mkdir()
         err = io.StringIO()
         with mock.patch.object(ca.sys, "stdout", mock.MagicMock()), \
-             mock.patch.object(ca.sys, "argv", ["codex-sub-agent", "status"]), \
+             mock.patch.object(ca.sys, "argv", ["sub-agent-runner", "status"]), \
              contextlib.redirect_stderr(err):
             self.assertEqual(ca.main(), 2)
         self.assertIn("bad acct", err.getvalue())
@@ -2978,7 +2978,7 @@ class TestPid(unittest.TestCase):
         # comm 过滤是承重的，不是保险。
         # 陪练进程把报告路径作为 argv 里**独立一项**传进去，和 codex 的 `-o <路径>`
         # 形状一致——否则测到的只是「没匹配上」，不是「comm 把它挡住了」。
-        mark = "/tmp/codex-sub-agent-selftest-不存在的报告.md"
+        mark = "/tmp/sub-agent-runner-selftest-不存在的报告.md"
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
         try:
             _wait_argv(self, proc, mark)
@@ -3066,7 +3066,7 @@ class TestPid(unittest.TestCase):
         `…/reports/a.md` 会命中任务 `aXmd` 的 `…/reports/aXmd.md`
         （`a` + 任意字符 + `md`）——2026-09-19 实测 `pgrep -f …/a.md` 确实
         返回了 aXmd 那个进程的 pid。
-        后果是实打实的：`codex-sub-agent stop a` 把 SIGINT 发给 `aXmd` 的 codex，
+        后果是实打实的：`sub-agent-runner stop a` 把 SIGINT 发给 `aXmd` 的 codex，
         而 `run --task a` 会被「还在跑」误拒。
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
         """
@@ -3165,7 +3165,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 五条命令都得在，否则调用方不知道有这些能力
         for cmd in ("run", "status", "resume", "stop", "interrupt-and-resume"):
             with self.subTest(cmd=cmd):
-                self.assertIn(f"codex-sub-agent {cmd}", skill)
+                self.assertIn(f"sub-agent-runner {cmd}", skill)
         # 三件代码保证不了、只能靠调用方知道的事
         self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
         self.assertIn("brief", skill)               # brief 只收文件路径
@@ -3195,9 +3195,22 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # status 列表形态的行结构是**接口事实**，不是机制泄漏（怎么切是调用方
         # 自己的事，文档不写 split）。它没人守的话整段删掉照样全绿——实测过。
         self.assertRegex(skill, r"一行一个任务", "status 是「一行一个任务」这条接口事实没了")
-        self.assertRegex(skill, r"前四列.*任务名.*账号.*状态.*退出码",
+        # 第二列从「账号」换成了「派给谁跑」：deepseek 没有账号维度，
+        # 而 `codex:acct2` / `deepseek` 这个写法让两侧共用同一列。
+        self.assertRegex(skill, r"前四列.*任务名.*派给谁跑.*状态.*退出码",
                          "前四列是哪四列、什么顺序——这条没了，调用方就得自己猜")
+        self.assertRegex(skill, r"`codex:acct2`.*`deepseek`",
+                         "第二列两侧各长什么样没写——调用方按旧格式解析会取到 `codex:acct2`")
         self.assertRegex(skill, r"缩进的行是明细", "「缩进的行不是任务」这条没了")
+        # `--runner` 的对外契约：哪个 runner 收不收 --account、effort 有没有得选。
+        # 钉**配对**不是「deepseek 出现过」——只钉词的话，把这张表整个删掉，
+        # 启动示例里的 `--runner deepseek` 还在，照样全绿。
+        self.assertRegex(skill, r"`deepseek`[^\n]*不收 `--account`",
+                         "「deepseek 不收 --account」这条契约没了")
+        self.assertRegex(skill, r"`deepseek`[^\n]*只有 `max`",
+                         "「deepseek 的 effort 只有 max」这条契约没了")
+        self.assertRegex(skill, r"同一个任务名不能换 runner",
+                         "「跨 runner 要换任务名」这条没了——撞上了才知道，而那时已经被拒了")
         # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
         # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
         # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
@@ -4200,7 +4213,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def test_限流记录写不进去_不影响本轮结论_而且不许说已记下(self):
         """记录是优化不是前提，但**不许假装记下了**。
 
-        原来这条断言的是 `assertIn("codex-sub-agent", printed)`——而本工具
+        原来这条断言的是 `assertIn("sub-agent-runner", printed)`——而本工具
         **每一行输出都以它开头**，所以那是一条空测试（模块头总纲那条）。
         它放过的正是这个 bug：`write_usage_limit` 印「写不进…」，
         `cmd_run` 紧接着印「恢复时间 09-25 17:04 已记下」，同一屏两句矛盾。
@@ -5062,7 +5075,7 @@ class TestRunCodexStreaming(unittest.TestCase):
         driver = (
             "import json,os,pathlib,sys;"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r});"
-            "import codex_sub_agent as ca;"
+            "import sub_agent_runner as ca;"
             f"d = pathlib.Path({str(d)!r});"
             f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
             f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
@@ -5576,8 +5589,8 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
         driver = (
             "import sys,time\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
-            "import codex_sub_agent as ca\n"
-            "sys.argv = ['codex-sub-agent', 'status', 'no-such-task-2026']\n"
+            "import sub_agent_runner as ca\n"
+            "sys.argv = ['sub-agent-runner', 'status', 'no-such-task-2026']\n"
             "ca.main()\n"
             "print('裸 print 这句必须当场看得到')\n"
             "time.sleep(30)\n"
@@ -5671,7 +5684,7 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
         driver = (
             "import os,pathlib,sys\n"
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
-            "import codex_sub_agent as ca\n"
+            "import sub_agent_runner as ca\n"
             f"ca.run_codex('run', pathlib.Path({str(d)!r}), 't', {_full_meta('t')!r},"
             f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}])\n"
         )

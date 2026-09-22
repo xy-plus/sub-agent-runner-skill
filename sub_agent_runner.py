@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
-"""codex-sub-agent —— 把 `codex exec` 的实测约束编译成硬约束的包装器。
+"""sub-agent-runner —— 把子代理的实测约束编译成硬约束的包装器。
 
-调用方只给任务信息（干什么／在哪干／多难），命令组装、隔离、存活判定、
+两个 runner：`codex exec`（`--runner codex`）和 `claude-deepseek -p`
+（`--runner deepseek`）。**两侧共用同一套任务名、判据、报告和打断／续跑协议**——
+`judge` 只有一个，runner 的职责是把本轮的产物摆成它认识的形状
+（报告文件 + 本轮日志文本）。真正按 runner 分叉的点有七个，都在 `run_codex`
+和它派生的那几个函数里，五个 `cmd_*` 里一个 `if runner ==` 都没有。
+
+调用方只给任务信息（派给谁／干什么／在哪干／多难），命令组装、隔离、存活判定、
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
+
+**工具改名了（`codex-sub-agent` → `sub-agent-runner`），盘上的东西一个没改：**
+隔离目录名 `~/.codex-subagent*`、`ROUND_MARK`、`INTERRUPT_MARK` 的文本。
+它们写在每一份现存日志和 260 份现存元数据里，被整行正则匹配——
+一次全局 sed 会让所有旧日志的轮次边界和打断痕迹当场认不出来。
+不对称是刻意的：**用户敲的是命令名，盘上的东西谁都不该动。**
+有测试钉着（`TestOnDiskContract`）。
 """
 import argparse
 import datetime
@@ -194,7 +207,7 @@ def round_separator(kind, task, when_iso):
 #
 # 子串搜索在这个仓库里是真会说谎的：模块 docstring 自己写着「日志里还混着
 # brief 原文和 codex 转述的子进程输出」，而这里的日常就是派 codex 来改
-# codex_sub_agent.py 自己。源码里那两行常量定义一旦被转述进日志，**两个方向都翻车**：
+# sub_agent_runner.py 自己。源码里那两行常量定义一旦被转述进日志，**两个方向都翻车**：
 #   日志里出现 `ROUND_MARK = "===== codex-sub-agent "` 这行源码
 #     → 本轮文本在那里被切断（实测切剩 'ROUND_MARK = "' 共 14 个字符）
 #     → 打断标记被甩到本轮之外 → judge 从 interrupted 翻成 **failed**
@@ -655,7 +668,7 @@ def write_usage_limit(home, reset_at, raw):
                                   ensure_ascii=False, indent=2))
         os.replace(tmp, usage_limit_path(home))
     except OSError as e:
-        print(f"[codex-sub-agent] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
+        print(f"[sub-agent-runner] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
               f"不影响本轮，只是下次排账号顺序时少一条依据。")
         return False
     return True
@@ -852,11 +865,11 @@ MODEL = "gpt-6-astra"
 # 这份初始内容**刻意只有注释**。model／effort／sandbox_mode／approval_policy
 # 由 CLI 每次显式传，写进 config 就是同一条事实有两个家，还是个会被静默覆盖的
 # 缺省值（现存两个隔离目录的 model/effort/service_tier 本来就互相打架）。
-CONFIG_NOTE = '''# codex-sub-agent 的隔离配置。
+CONFIG_NOTE = '''# sub-agent-runner 的隔离配置。
 # 这个文件必须是本目录自己的普通文件，不许软链 ~/.codex/config.toml——
 # 软链会把主配置的 MCP／plugins／hooks／memories 全带回来，隔离当场失效。
 # 刻意不写 model / model_reasoning_effort / sandbox_mode / approval_policy：
-# 那些由 codex-sub-agent 每次运行显式传参，写在这里只会变成一份会被静默覆盖的缺省值。
+# 那些由 sub-agent-runner 每次运行显式传参，写在这里只会变成一份会被静默覆盖的缺省值。
 # codex 自己会往下面追加 [projects.*] trust_level，那是它的状态，不要手动清。
 '''
 
@@ -1818,7 +1831,7 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # 严重度不能直接拿退出码比：suspect 的码(3)比 failed(1)大，按码取 max 会让一个
 # 真失败被一个 suspect 盖过去；码值与顺序无关。
 # 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
-# 悄悄落成 0，`codex-sub-agent status t && deploy` 就会在任务还在跑的时候部署。
+# 悄悄落成 0，`sub-agent-runner status t && deploy` 就会在任务还在跑的时候部署。
 # 2 永久留给参数错误与护栏拒绝（见 USAGE_ERROR），不进这张表。
 #
 # interrupted 用 **130** 而不是自编一个数：128+SIGINT(2) 是 POSIX/Bash 的既成
@@ -1920,7 +1933,7 @@ def _wait_previous_round_ends(runner, home, task, timeout, poll_interval):
             # 日志里此刻还没有本轮的边界，写进去就落在上一轮里，把上一轮的判据弄脏。
             # 不说的话 run 会多出一个全新的**静默挂起**。它当场读得到，靠的是
             # main() 里那行 sys.stdout.reconfigure(line_buffering=True)。
-            print(f"[codex-sub-agent] {task} 上一轮还在收尾，最多等 {timeout} 秒…")
+            print(f"[sub-agent-runner] {task} 上一轮还在收尾，最多等 {timeout} 秒…")
             said = True
         if time.monotonic() >= deadline:
             return False
@@ -1991,7 +2004,7 @@ def run_codex(kind, home, task, meta, make_argv):
         next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
                      "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
                      if kind == "interrupt-and-resume" else
-                     f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
+                     f"等上一轮收尾完再来；codex 也还活着的话先 `sub-agent-runner stop {task}`"
                      f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
                + "；".join(busy) + "。\n" + next_step)
@@ -2234,7 +2247,7 @@ def status_row(meta, verdict):
 
 
 def _print_verdict(task, verdict):
-    print(f"\n[codex-sub-agent] {task}: {verdict.state} —— {verdict.reason}")
+    print(f"\n[sub-agent-runner] {task}: {verdict.state} —— {verdict.reason}")
     for line in verdict.detail:
         print(f"  {line}")
 
@@ -2348,12 +2361,12 @@ def cmd_run(args):
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
         if find_task_agent_pid(args.runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
-                   f"换个名字或先 `codex-sub-agent stop {args.task}`")
+                   f"换个名字或先 `sub-agent-runner stop {args.task}`")
 
     home = ensure_isolation(args.runner, account)
     if old_meta is not None:
         if old_home == home:
-            print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
+            print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
                   f"上一轮的报告会被删掉、日志会被追加")
         else:
             # 只有 auto 走得到这里（强制模式上面那道护栏已经拒了）。
@@ -2362,7 +2375,7 @@ def cmd_run(args):
             # （新 home 的），旧 home 的 reports/ 和 logs/ 一个字节都没碰。
             # 搬的只有元数据——不搬的话同一个名字出现在两个隔离目录里，
             # find_meta 当场数出两份，status/stop 从此全退 2。
-            print(f"[codex-sub-agent] 任务 {args.task} 原本在账号 {old_meta['account']}，"
+            print(f"[sub-agent-runner] 任务 {args.task} 原本在账号 {old_meta['account']}，"
                   f"本次改用 {account}：元数据搬过来，"
                   f"旧账号的报告和日志留在 {old_home} 原处不动。")
             meta_path(old_home, args.task).unlink(missing_ok=True)
@@ -2435,7 +2448,7 @@ def cmd_run(args):
         whats_next = (f"下次 --account {AUTO} 会先试 {next_account}"
                       if next_account != account else
                       f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它")
-        print(f"[codex-sub-agent] {account} 撞上额度上限，{record_note}。{whats_next}。")
+        print(f"[sub-agent-runner] {account} 撞上额度上限，{record_note}。{whats_next}。")
 
     _print_verdict(args.task, verdict)
     print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
@@ -2570,7 +2583,7 @@ def cmd_resume(args):
     # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
     if find_task_agent_pid(meta["runner"], home, args.task) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
-               f"等它结束，或用 `codex-sub-agent interrupt-and-resume {args.task}`。")
+               f"等它结束，或用 `sub-agent-runner interrupt-and-resume {args.task}`。")
     return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
                          args.skills)
 
@@ -2617,7 +2630,7 @@ def cmd_interrupt_and_resume(args):
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
-        print(f"[codex-sub-agent] {args.task} 本来就没在跑，直接续跑")
+        print(f"[sub-agent-runner] {args.task} 本来就没在跑，直接续跑")
     else:
         # 超时的处置是「稍后重试」，而重试就是再跑一遍这条命令——不加这道判断，
         # 重试就会发出**第二发 INT**。很多 CLI 把第二发 Ctrl-C 当强退，codex
@@ -2626,11 +2639,11 @@ def cmd_interrupt_and_resume(args):
         # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
         # 恰好就是最后一轮的事。
         if has_interrupt_mark(read_last_round(log)):
-            print(f"[codex-sub-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
+            print(f"[sub-agent-runner] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
             interrupt_codex(pid, log, "interrupt-and-resume")
-            print(f"[codex-sub-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
+            print(f"[sub-agent-runner] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
@@ -2713,8 +2726,9 @@ def build_parser():
     另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
     """
     p = argparse.ArgumentParser(
-        prog="codex-sub-agent",
-        description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
+        prog="sub-agent-runner",
+        description="把执行类任务派给 codex 或 DeepSeek 子代理后台跑。"
+                    "用 Bash(run_in_background: true) 启动 run。")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # 五个带值参数全必填，外加 --skill/--no-skill 二选一：不设默认值，因为隐式
