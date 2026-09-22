@@ -1051,65 +1051,6 @@ def codex_env(home):
     return env
 
 
-# 探测用的 prompt。**写死在代码里，且不含任何额度字样。**
-# 这是探测全部可信度的来源：codex 会把 prompt 原样回显进输出（实测在 stderr），
-# prompt 里只要有额度字样，探测就开始自证自己撞了上限。
-# 做成常量而不是参数——参数就能被调用方污染，那就绕回原点了。
-PROBE_PROMPT = "reply with two letters: ok"
-# 实测一个真·限流账号 15 秒返回。给足余量，但必须有上界：
-# 探测卡住不能把整条 run 拖死。
-PROBE_TIMEOUT = 120
-
-
-# 位置在 `codex_env` **之下**：它依赖 codex_env、MODEL 和上面那一整组文本判据。
-# 本文件一律自下而上排（见 `accounts_by_availability` 的同一条理由），所以它
-# 不和 `parse_reset_time` 挨着——那里 codex_env 还没出生。
-def probe_account_quota(home, now):
-    """单独问一次这个账号还有没有额度。返回 `(撞上限了吗, (恢复时间, 原始串) 或 None)`。
-
-    **「换不换账号」由本函数决定，不由任务日志决定。** 任务日志里混着 brief 原文、
-    codex 读文件的回显、子进程输出——2026-09-22 实测：一个**完全正常**的账号，
-    因为任务内容涉及额度处理，日志里就出现了 `ERROR: …hit your usage limit`
-    （codex 带行号 cat 出了含这个字面串的文件）。`runtime_error_lines()` 只认格式
-    不认来源，挡不住它。而在 `cmd_run` 里，误判的后果是**删掉元数据、换账号把整个
-    任务重跑一遍**。
-
-    探测的输出只含我们自己写死的 prompt，**不可能有被回显进来的假证据**。
-
-    实测过没有非文本信号可用（2026-09-22 拿一个真·限流账号实跑）：退出码 1
-    （和普通失败没区别）、15 秒返回、消息在 stderr，而 prompt 回显也在 stderr。
-    所以证据只能是文本，唯一的出路就是换一份没被污染的文本。
-
-    返回**两个值而不是一个**：「撞上了」和「几点恢复」是两件事，现网 39% 的额度消息
-    只有时刻甚至没有时间（见 `parse_reset_time`）。合成一个返回值的话，
-    「时间解析不出」会被当成「没撞上限」，于是一个消息格式变了的账号会被永远
-    当成可用的反复重试。
-
-    **探测本身失败（起不来、超时）一律当成没撞上限**：宁可少试一个账号
-    （调用方重跑即可），也不要凭猜去删元数据、重跑任务。
-
-    代价：账号真的满了，15 秒、零 token（服务端直接拒）；账号其实没满，
-    会真跑一轮极短的 prompt。只在「本轮已失败且日志里有额度字样」时才发生。
-    """
-    # **刻意不复用 `build_run_argv`**：它带 `-o`、带 effort、带 danger-full-access，
-    # 每一条对探测都是错的——探测只是去问一句话，不该有动任何东西的能力，
-    # 也不该去写别人的报告文件。
-    argv = ["codex", "exec", "--cd", str(home), "-m", MODEL,
-            "--sandbox", "read-only", "--color", "never",
-            "--skip-git-repo-check", PROBE_PROMPT]
-    try:
-        done = subprocess.run(argv, env=codex_env(home), stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, errors="replace",
-                              timeout=PROBE_TIMEOUT)
-    except (OSError, subprocess.SubprocessError):
-        return False, None
-    # 两个流都看：实测额度消息在 stderr，但那是当前版本的行为，不是契约。
-    text = strip_ansi(done.stdout + done.stderr)
-    if not hit_usage_limit(runtime_error_lines(text)):
-        return False, None
-    return True, parse_reset_time(text, now=now)
-
-
 def meta_path(home, task):
     return home / "tasks" / f"{task}.json"
 
@@ -1808,13 +1749,11 @@ def cmd_run(args):
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
     old_home, old_meta = find_meta(args.task)
-    if old_meta is not None:
-        # 「还在跑」只查一次，**进循环之前**：它问的是「这个任务名此刻有没有活着的
-        # codex」，和试哪个账号无关。**这不替代 run_codex 内部每次 spawn 前的等待**
-        # ——那一条问的是「上一轮的 writer 和 codex 排干了没有」，每轮都必须做。
-        if find_codex_pid(_report_path(old_home, args.task)) is not None:
-            reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-sub-agent stop {args.task}`")
-        print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
+    if old_meta is not None and find_codex_pid(_report_path(old_home, args.task)) is not None:
+        # 「还在跑」只查一次，**在挑账号之前**：它问的是「这个任务名此刻有没有
+        # 活着的 codex」，和最后跑哪个账号无关。**这不替代 run_codex 内部每次
+        # spawn 前的等待**——那一条问的是「上一轮的 writer 和 codex 排干了没有」。
+        reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-sub-agent stop {args.task}`")
 
     if args.account == AUTO:
         candidates = accounts_by_availability()
@@ -1822,74 +1761,75 @@ def cmd_run(args):
             reject("没有任何账号有登录态，auto 模式无从分配：\n"
                    + "\n".join(f"  {a} 缺 {auth_source(a)}" for a in account_choices())
                    + "\n先跑 `codex-acct login <账号>`。")
-        # **迁移要显式做，不能靠「原账号一定排第一」暗中保证。** 那句话有反例：
-        # 登录态过滤会把该账号整个剔出候选（access_token 只活十天，这条路很好走），
-        # 于是第一轮就写到别的 home，旧的那份还在，find_meta 当场数出两份并拒绝
-        # ——status/stop 从此全退 2，任务既停不掉也查不了。
-        if old_home is not None and old_home not in [isolation_home(a) for a in candidates]:
-            print(f"[codex-sub-agent] 任务原本在账号 {old_meta['account']}，"
-                  f"但它现在没有登录态，迁移到 {candidates[0]}")
-            meta_path(old_home, args.task).unlink(missing_ok=True)
+        account = candidates[0]
     else:
+        account = args.account
         # 跨账号同名的护栏**只在强制模式下需要**：同一个名字出现在两个隔离目录里
-        # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据；
-        # 「上一轮会被覆盖」那句提示在跨账号时也还是假话（报告路径不同）。
-        # auto 模式不走这条：它要么沿用原来那个家（排序把它排最前），
-        # 要么在上面那一支里把旧的显式删掉。
-        if old_meta is not None and old_home != isolation_home(args.account):
+        # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
+        # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
+        # 挑中别的账号时在下面**显式**把旧的那份搬过来。
+        if old_meta is not None and old_home != isolation_home(account):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
-                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
-        candidates = [args.account]
+                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
+                   f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
 
-    # brief 在循环**外面**只派生一次：换的只是账号，prompt 一个字都不许变。
+    home = ensure_isolation(account)
+    if old_meta is not None:
+        if old_home == home:
+            print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
+                  f"上一轮的报告会被删掉、日志会被追加")
+        else:
+            # 只有 auto 走得到这里（强制模式上面那道护栏已经拒了）。
+            # **措辞必须点明旧产物留在原处。** 上面那句「上一轮的报告会被删掉」
+            # 在跨账号时是**假话**：`clear_report` 只动这一轮要写的那个报告
+            # （新 home 的），旧 home 的 reports/ 和 logs/ 一个字节都没碰。
+            # 搬的只有元数据——不搬的话同一个名字出现在两个隔离目录里，
+            # find_meta 当场数出两份，status/stop 从此全退 2。
+            print(f"[codex-sub-agent] 任务 {args.task} 原本在账号 {old_meta['account']}，"
+                  f"本次改用 {account}：元数据搬过来，"
+                  f"旧账号的报告和日志留在 {old_home} 原处不动。")
+            meta_path(old_home, args.task).unlink(missing_ok=True)
+
     # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
     # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
-    exhausted = []          # [(账号, 恢复时间 or None)]，全撞上限时要逐个报出来
-    for attempt, account in enumerate(candidates):
-        home = ensure_isolation(account)
-        # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
-        # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-        round = run_codex("run", home, args.task,
-                          new_meta(args.task, account, str(workdir), args.effort, args.skills),
-                          lambda r: build_run_argv(str(workdir), args.effort, r, brief))
-        verdict = judge(round)
-        limited = False
-        # **日志只决定「要不要花 15 秒探一下」**——一个廉价闸门，误判的代价只是
-        # 白探一次。**换不换账号由探测决定**：日志里混着 brief 原文、codex 读文件
-        # 的回显、子进程输出（见 probe_account_quota）。
-        if verdict.state == "failed" and hit_usage_limit(runtime_error_lines(round.text)):
-            limited, hit = probe_account_quota(home, now=datetime.datetime.now())
-            if limited:
-                # 解析不出时间也要记进 exhausted（值为 None）：这个账号确实满了，
-                # 漏记会让「全撞上限」那条汇总少一行。
-                if hit is not None:
-                    write_usage_limit(home, *hit)   # 写失败它自己吞掉并出声
-                exhausted.append((account, hit[0] if hit else None))
-                if attempt + 1 < len(candidates):
-                    # run_codex 在 spawn 前就把元数据写进了这个 home。不删的话
-                    # 下一个账号会被上面那道跨账号同名护栏挡住，而且这一份会变成
-                    # 够不着的孤儿。**最后一个候选不走这条路**：删了的话全满之后
-                    # 任务凭空消失，status 列表为空、status <任务名> 说「没有这个任务」。
-                    # 强制模式的候选恒为一个，这个条件对它恒假——所以**不再多写一次**
-                    # `args.account == AUTO`：同一个事实两个家，必然漂移。
-                    meta_path(home, args.task).unlink(missing_ok=True)
-                    when = f"，恢复于 {hit[0]:%m-%d %H:%M}" if hit else ""
-                    print(f"[codex-sub-agent] {account} 撞上额度上限{when}，换下一个账号")
-                    continue
-        # **两个条件缺一不可。** v2 写成 `len(exhausted) > 1` 且放在 limited 之外，
-        # 实测把「满、满、成功」报成了「全部 2 个账号都撞上额度上限」并退出 1。
-        if limited and len(exhausted) == len(candidates):
-            # 不新增状态，只把 reason 说清楚——沿用 judge 的规矩。
-            # 写「候选的 N 个」而不是「全部 N 个」：强制模式的候选恒为一个，
-            # 那句话会印成「全部 1 个账号都撞上额度上限」，而用户明明只点了一个。
-            verdict = Verdict("failed", f"候选的 {len(exhausted)} 个账号全部撞上额度上限",
-                              [f"{a:<8} " + (f"恢复于 {t:%m-%d %H:%M}" if t
-                                             else "恢复时间未知（消息里没有时间）")
-                               for a, t in exhausted])
-        _print_verdict(args.task, verdict)
-        print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
-        return EXIT[verdict.state]
+    # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
+    # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
+    this_round = run_codex("run", home, args.task,
+                           new_meta(args.task, account, str(workdir), args.effort, args.skills),
+                           lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+    verdict = judge(this_round)
+
+    # **撞上限只记一笔，不重跑。** v1~v3 在这里换账号重跑，安全论证是「撞上限的
+    # 那一轮 codex 从未拿到响应，零工作量」——269 份现网日志、56 条真·额度错误行
+    # 实测推翻了它：距本轮开头中位 101 行、最小 41 行，**0 条在轮首 12 行以内**。
+    # 额度永远是在任务跑到一半用完的，而重跑用的是同一个 --dir、同一份 brief、
+    # danger-full-access，落在一棵已经被改过的树上；而「这一轮到底改没改过文件」
+    # 没法可靠地知道——唯一的线索是日志文本，而日志正是被污染的那个东西。
+    # 于是「重试」从工具的一个循环，变成了调用方的一次重发，而重发是安全的：
+    # 重发时 auto 已经知道这个账号满了。
+    #
+    # 判据不可靠这件事在这里的爆炸半径只有**记录**：误判最多给一个健康账号写条
+    # 限流记录，于是它排到后面——仍然会被选中、仍然会被试，只是顺序差一格。
+    if verdict.state == "failed" and hit_usage_limit(runtime_error_lines(this_round.text)):
+        # 从**本轮的文本**解析，绝不另读整份历史日志——那会把上一轮、上一个任务
+        # 的旧额度错误和旧恢复时间当成本轮事实。
+        hit = parse_reset_time(this_round.text, now=datetime.datetime.now())
+        if hit is None:
+            记 = "日志里没有恢复时间可记（现网确有这种形态）"
+        else:
+            write_usage_limit(home, *hit)         # 写失败它自己吞掉并出声
+            记 = f"恢复时间 {hit[0]:%m-%d %H:%M} 已记下"
+        # 下一个账号**算出来，不写死**：记完这一笔之后重新排一次序，第一个就是
+        # 下次会跑的那个。说「下次 auto 会先试」而不是「重跑这条命令会换成」，
+        # 因为后者在两种情形下是假话：强制模式重跑的还是指定的那个账号；
+        # 全部账号都有记录时第一个可能仍是它自己。
+        print(f"[codex-sub-agent] {account} 撞上额度上限，{记}。"
+              f"下次 --account {AUTO} 会先试 {accounts_by_availability()[0]}。")
+
+    _print_verdict(args.task, verdict)
+    print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
+    return EXIT[verdict.state]
 
 
 def cmd_status(args):
