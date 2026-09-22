@@ -1810,34 +1810,89 @@ def cmd_run(args):
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
-    home = isolation_home(args.account)
     old_home, old_meta = find_meta(args.task)
     if old_meta is not None:
-        # 换账号重跑同名任务很好走（撞额度上限时就该这么干），但那会让同一个名字
-        # 出现在两个隔离目录里：find_meta 按账号顺序查，另一份就成了再也够不着的
-        # 孤儿元数据，而「上一轮会被覆盖」那句提示在跨账号时还是假话（报告路径不同）。
-        if old_home != home:
-            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
-                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
-        if find_codex_pid(_report_path(home, args.task)) is not None:
+        # 「还在跑」只查一次，**进循环之前**：它问的是「这个任务名此刻有没有活着的
+        # codex」，和试哪个账号无关。**这不替代 run_codex 内部每次 spawn 前的等待**
+        # ——那一条问的是「上一轮的 writer 和 codex 排干了没有」，每轮都必须做。
+        if find_codex_pid(_report_path(old_home, args.task)) is not None:
             reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-sub-agent stop {args.task}`")
         print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
 
-    ensure_isolation(args.account)
-    report = _report_path(home, args.task)
-    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    if args.account == AUTO:
+        candidates = accounts_by_availability(args.task)
+        if not candidates:
+            reject("没有任何账号有登录态，auto 模式无从分配：\n"
+                   + "\n".join(f"  {a} 缺 {auth_source(a)}" for a in account_choices())
+                   + "\n先跑 `codex-acct login <账号>`。")
+        # **迁移要显式做，不能靠「原账号一定排第一」暗中保证。** 那句话有反例：
+        # 登录态过滤会把该账号整个剔出候选（access_token 只活十天，这条路很好走），
+        # 于是第一轮就写到别的 home，旧的那份还在，find_meta 当场数出两份并拒绝
+        # ——status/stop 从此全退 2，任务既停不掉也查不了。
+        if old_home is not None and old_home not in [isolation_home(a) for a in candidates]:
+            print(f"[codex-sub-agent] 任务原本在账号 {old_meta['account']}，"
+                  f"但它现在没有登录态，迁移到 {candidates[0]}")
+            meta_path(old_home, args.task).unlink(missing_ok=True)
+    else:
+        # 跨账号同名的护栏**只在强制模式下需要**：同一个名字出现在两个隔离目录里
+        # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据；
+        # 「上一轮会被覆盖」那句提示在跨账号时也还是假话（报告路径不同）。
+        # auto 模式不走这条：它要么沿用原来那个家（排序把它排最前），
+        # 要么在上面那一支里把旧的显式删掉。
+        if old_meta is not None and old_home != isolation_home(args.account):
+            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
+                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
+        candidates = [args.account]
+
+    # brief 在循环**外面**只派生一次：换的只是账号，prompt 一个字都不许变。
     # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
     # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
-
-    # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
-    # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    verdict = judge(run_codex("run", home, args.task,
-                              new_meta(args.task, args.account, str(workdir),
-                                       args.effort, args.skills),
-                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
-    _print_verdict(args.task, verdict)
-    print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
-    return EXIT[verdict.state]
+    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    exhausted = []          # [(账号, 恢复时间 or None)]，全撞上限时要逐个报出来
+    for attempt, account in enumerate(candidates):
+        home = ensure_isolation(account)
+        # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
+        # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
+        round = run_codex("run", home, args.task,
+                          new_meta(args.task, account, str(workdir), args.effort, args.skills),
+                          lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+        verdict = judge(round)
+        limited = False
+        # **日志只决定「要不要花 15 秒探一下」**——一个廉价闸门，误判的代价只是
+        # 白探一次。**换不换账号由探测决定**：日志里混着 brief 原文、codex 读文件
+        # 的回显、子进程输出（见 probe_account_quota）。
+        if verdict.state == "failed" and hit_usage_limit(runtime_error_lines(round.text)):
+            limited, hit = probe_account_quota(home, now=datetime.datetime.now())
+            if limited:
+                # 解析不出时间也要记进 exhausted（值为 None）：这个账号确实满了，
+                # 漏记会让「全撞上限」那条汇总少一行。
+                if hit is not None:
+                    write_usage_limit(home, *hit)   # 写失败它自己吞掉并出声
+                exhausted.append((account, hit[0] if hit else None))
+                if attempt + 1 < len(candidates):
+                    # run_codex 在 spawn 前就把元数据写进了这个 home。不删的话
+                    # 下一个账号会被上面那道跨账号同名护栏挡住，而且这一份会变成
+                    # 够不着的孤儿。**最后一个候选不走这条路**：删了的话全满之后
+                    # 任务凭空消失，status 列表为空、status <任务名> 说「没有这个任务」。
+                    # 强制模式的候选恒为一个，这个条件对它恒假——所以**不再多写一次**
+                    # `args.account == AUTO`：同一个事实两个家，必然漂移。
+                    meta_path(home, args.task).unlink(missing_ok=True)
+                    when = f"，恢复于 {hit[0]:%m-%d %H:%M}" if hit else ""
+                    print(f"[codex-sub-agent] {account} 撞上额度上限{when}，换下一个账号")
+                    continue
+        # **两个条件缺一不可。** v2 写成 `len(exhausted) > 1` 且放在 limited 之外，
+        # 实测把「满、满、成功」报成了「全部 2 个账号都撞上额度上限」并退出 1。
+        if limited and len(exhausted) == len(candidates):
+            # 不新增状态，只把 reason 说清楚——沿用 judge 的规矩。
+            # 写「候选的 N 个」而不是「全部 N 个」：强制模式的候选恒为一个，
+            # 那句话会印成「全部 1 个账号都撞上额度上限」，而用户明明只点了一个。
+            verdict = Verdict("failed", f"候选的 {len(exhausted)} 个账号全部撞上额度上限",
+                              [f"{a:<8} " + (f"恢复于 {t:%m-%d %H:%M}" if t
+                                             else "恢复时间未知（消息里没有时间）")
+                               for a, t in exhausted])
+        _print_verdict(args.task, verdict)
+        print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
+        return EXIT[verdict.state]
 
 
 def cmd_status(args):
@@ -2118,7 +2173,9 @@ def build_parser():
     r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
-    r.add_argument("--account", required=True, choices=account_choices(), help="codex 账号")
+    # `--account` **仍然必填**：没有任何隐式选中的值。取值只是多了一个 AUTO。
+    r.add_argument("--account", required=True, choices=account_choices() + [AUTO],
+                   help=f"codex 账号；{AUTO} = 自动挑一个没在限流的，撞上额度上限就换下一个")
     _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 

@@ -2877,6 +2877,299 @@ class TestRunGuards(_HomeSandbox):
         self.assertIn(ca.ROUND_MARK, text)
 
 
+@contextlib.contextmanager
+def _capture_stdout():
+    """接住 stdout，**连 `.buffer` 一起**，把文本回填进 yield 出去的那个 dict。
+
+    不能用 `redirect_stdout(io.StringIO())`：`_tee_until_exit` 走
+    `sys.stdout.buffer.write(bytes)`，而 StringIO 没有 `.buffer`，当场
+    AttributeError。用真文件接，文本层和字节层就都在；`buffering=1` 让两层的
+    先后顺序不至于被块缓冲搅乱。
+    """
+    got = {}
+    q = pathlib.Path(tempfile.mkdtemp()) / "stdout"
+    with open(q, "w", encoding="utf-8", buffering=1) as sink, \
+         contextlib.redirect_stdout(sink):
+        yield got
+    got["text"] = q.read_text(encoding="utf-8")
+
+
+class TestRunRetry(_HomeSandbox):
+    """`--account auto`：撞上额度上限就换下一个账号重试。
+
+    **mock 的是 `Popen`，不是 `run_codex`。** 清报告、写分隔符、轮次边界、
+    等上一轮全住在 `run_codex` 里，把它整个换掉，要验的行为就一起没了
+    （同一条理由见 `_no_codex`）。
+
+    参数走**真 parser**，不手搭 Namespace：`--account auto` 能不能被收下本身
+    就是这次改动的一部分，手搭 Namespace 会把 `choices=` 那一行整个绕过去，
+    parser 里漏掉 AUTO 也照样全绿。
+
+    **探测（`probe_account_quota`）是被 mock 的那一层**——它自己的行为由
+    `TestProbeAccountQuota` 钉，这里钉的是「循环怎么用它的答案」。
+    """
+
+    LIMIT_LINE = ("ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
+                  "settings/usage to purchase more credits or try again at "
+                  "Sep 25th, 2026 5:04 PM.\n")
+    BROKEN = "Error: 代码写错了\n"
+    FINE = "一切正常\n"
+    RESET_AT = datetime.datetime(2026, 9, 25, 17, 4)
+    RESET_RAW = "Sep 25th, 2026 5:04 PM"
+
+    def setUp(self):
+        super().setUp()      # 基类已建好 ~/.codex/auth.json（default 的登录态）
+        for name in ("acct2", "acct3"):
+            d = self.home / ".codex-accounts" / name
+            d.mkdir(parents=True)
+            (d / "auth.json").write_text("{}")
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "b.md"
+        self.brief.write_text("干活\n")
+        self.skill = self.home / "SKILL.md"
+        self.skill.write_text("# 一个真的 skill\n")
+        self.spawned = []        # 每一轮真的 spawn 了哪个账号
+        self.sent = []           # 每一轮真的发出去的整条 argv
+        self.probed = []         # 探测问过哪些账号
+        # 反查表，不写 `home.name.replace(...)`：那是 isolation_home 的逆运算，
+        # 抄一份就会和它漂移，而漂了之后这里只会 KeyError，不会给出线索。
+        self.account_of = {str(ca.isolation_home(a)): a
+                           for a in ("default", "acct2", "acct3")}
+
+    def _args(self, account, task="t", skill=None):
+        argv = ["run", "--task", task, "--dir", str(self.workdir),
+                "--brief", str(self.brief), "--effort", "low", "--account", account]
+        argv += ["--skill", str(skill)] if skill else ["--no-skill"]
+        return ca.build_parser().parse_args(argv)
+
+    def _probe_says(self, out_of_quota):
+        """out_of_quota：账号名集合。探测只对集合里的账号说「满了」。"""
+        def fake(home, now):
+            account = self.account_of[str(home)]
+            self.probed.append(account)
+            if account not in out_of_quota:
+                return False, None
+            return True, (self.RESET_AT, self.RESET_RAW)
+        return mock.patch.object(ca, "probe_account_quota", fake)
+
+    def _spawn_says(self, popen, outcomes):
+        """每一轮按账号吐 `outcomes[账号]` 那段日志，然后 EOF。
+
+        报告写到 **argv 里 `-o` 指的那个路径**，和真的 codex 一样——
+        `run_codex` 在 spawn 之前才刚把它删掉，写在这里才验得到清报告那一步。
+        **本轮文本里有错误行就不写报告**：judge 只在 `failed` 那一支上才让
+        `cmd_run` 去探额度，而「有报告 + 有错误行」判的是 suspect，走不到那里。
+        """
+        def one(argv, *a, **kwargs):
+            account = self.account_of[kwargs["env"]["CODEX_HOME"]]
+            self.spawned.append(account)
+            self.sent.append(list(argv))
+            text = outcomes[account]
+            if not ca.runtime_error_lines(text):
+                pathlib.Path(argv[argv.index("-o") + 1]).write_text("干完了\n")
+            proc = mock.MagicMock()
+            proc.stdout.read1.side_effect = [text.encode(), b""]
+            proc.wait.return_value = 1
+            return proc
+        popen.side_effect = one
+
+    def _run(self, account, outcomes, out_of_quota, **kw):
+        with _capture_stdout() as printed, _no_codex() as popen, \
+             self._probe_says(out_of_quota):
+            self._spawn_says(popen, outcomes)
+            code = ca.cmd_run(self._args(account, **kw))
+        self.printed = printed["text"]
+        return code
+
+    def _all(self, text):
+        return {"default": text, "acct2": text, "acct3": text}
+
+    def test_探测说满了才换号(self):
+        code = self._run(ca.AUTO,
+                         {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                         out_of_quota={"acct2"})
+        self.assertEqual(self.spawned, ["acct2", "acct3"])
+        self.assertEqual(self.probed, ["acct2"], "第二个账号成功了，不该再探它")
+        self.assertEqual(code, ca.EXIT["success"])
+
+    def test_换号时每轮发出去的命令只有报告路径不同(self):
+        # 换的只是账号，brief／effort／白名单一个字都不许变。
+        # 白名单用**非空**集合：空集合测不出参数有没有被漏传。
+        self._run(ca.AUTO,
+                  {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                  out_of_quota={"acct2"}, skill=self.skill)
+        self.assertEqual(len(self.sent), 2, "前提不成立：没发生重试，这条什么都没比")
+        first, second = self.sent
+        self.assertIn(str(self.skill), first[-1], "前提不成立：白名单根本没进 prompt")
+        self.assertEqual(len(first), len(second))
+        差 = [(a, b) for a, b in zip(first, second) if a != b]
+        self.assertEqual(
+            差, [(str(ca._report_path(ca.isolation_home("acct2"), "t")),
+                  str(ca._report_path(ca.isolation_home("acct3"), "t")))],
+            "两轮之间只允许报告路径不同")
+
+    def test_满满成功_退出0(self):
+        # v2 写成 `len(exhausted) > 1` 且放在 limited 之外，实测把这一局
+        # 报成「全部 2 个账号都撞上额度上限」并退出 1。
+        code = self._run(ca.AUTO,
+                         {"acct2": self.LIMIT_LINE, "acct3": self.LIMIT_LINE,
+                          "default": self.FINE},
+                         out_of_quota={"acct2", "acct3"})
+        self.assertEqual(self.spawned, ["acct2", "acct3", "default"])
+        self.assertEqual(code, ca.EXIT["success"])
+        self.assertNotIn("全部", self.printed)
+
+    def test_换号前把上一个账号的元数据删掉(self):
+        # 不删的话第二次尝试会被 cmd_run 自己的跨账号同名护栏挡住，
+        # 而且留下的那份会变成 find_meta 再也够不着的孤儿。
+        self._run(ca.AUTO,
+                  {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                  out_of_quota={"acct2"})
+        self.assertFalse(ca.meta_path(ca.isolation_home("acct2"), "t").exists())
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct3"), "t").exists())
+        self.assertEqual(len(ca.all_metas()), 1, "一个任务只许住一个隔离目录")
+
+    def test_撞上限要把恢复时间记下来(self):
+        self._run(ca.AUTO,
+                  {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                  out_of_quota={"acct2"})
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct2")), self.RESET_AT)
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct3")),
+                          "没撞上限的账号不许被记一笔")
+
+    def test_全部撞上限_退出1且逐个报出恢复时间(self):
+        code = self._run(ca.AUTO, self._all(self.LIMIT_LINE),
+                         out_of_quota={"default", "acct2", "acct3"})
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertIn("全部", self.printed)
+        for account in ("acct2", "acct3", "default"):
+            with self.subTest(账号=account):
+                # 账号名和它的恢复时间必须**成对**出现在同一行，
+                # 分开断言的话「三个账号名 + 一个时间」也能让它绿。
+                行 = [l for l in self.printed.splitlines() if account in l]
+                self.assertTrue(any("09-25 17:04" in l for l in 行),
+                                f"{account} 和它的恢复时间没有出现在同一行：{行}")
+
+    def test_全部撞上限之后status仍然列得出这个任务(self):
+        # **最后一个候选不许删元数据。** 删了的话任务凭空消失：
+        # status 列表为空、status <任务名> 说「没有这个任务」。
+        # 调 cmd_status 而不是只调 find_meta：要钉的是调用方看得见的那一面。
+        self._run(ca.AUTO, self._all(self.LIMIT_LINE),
+                  out_of_quota={"default", "acct2", "acct3"})
+        with _capture_stdout() as printed:
+            ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+        self.assertIn("t", printed["text"])
+        with _capture_stdout() as printed:
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        self.assertNotIn("还没有任何任务", printed["text"])
+
+    def test_日志有额度字样但探测说正常_不换号也不删状态(self):
+        # 这是整条链路的核心：日志只决定「要不要花 15 秒探一下」，
+        # **换不换账号由探测决定**。日志里混着 brief 原文和 codex 读文件的回显。
+        code = self._run(ca.AUTO,
+                         {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                         out_of_quota=set())
+        self.assertEqual(self.spawned, ["acct2"], "探测说没满就不许换号")
+        self.assertEqual(self.probed, ["acct2"], "闸门只该开一次")
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists(),
+                        "没换号就不许删元数据——任务会凭空消失")
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "探测说没满，不许往盘上记一笔限流")
+        self.assertEqual(code, ca.EXIT["failed"], "退出码照原判据，不被探测改写")
+
+    def test_brief里有额度字样又真被打断_退130且一次探测都没有(self):
+        # 打断标记是本工具自己写的，不可伪造（见 judge 里「打断排最前」）。
+        # 走到探测就已经错了：那意味着判据把「resume 就行」当成了额度问题。
+        self.brief.write_text(self.LIMIT_LINE)
+        被打断 = self.LIMIT_LINE + ca.INTERRUPT_MARK + "\n"
+        code = self._run(ca.AUTO, self._all(被打断), out_of_quota={"acct2"})
+        self.assertEqual(code, ca.EXIT["interrupted"])
+        self.assertEqual(code, 130)
+        self.assertEqual(self.probed, [], "被打断的轮次一次都不该去探额度")
+        self.assertEqual(self.spawned, ["acct2"])
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists(),
+                        "被打断的任务元数据必须留着——下一步是 resume")
+
+    def test_不是额度问题就立刻停(self):
+        # 换号救不了「代码写错了」，只会白烧一轮。代价是后面那个能用的账号
+        # 这一次不会被试到——这是刻意选的，见 spec。
+        code = self._run(ca.AUTO,
+                         {"acct2": self.BROKEN, "acct3": self.FINE, "default": self.FINE},
+                         out_of_quota={"acct2"})
+        self.assertEqual(self.spawned, ["acct2"])
+        self.assertEqual(self.probed, [], "日志里没有额度字样，闸门就不该开")
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists())
+
+    def test_强制指定账号撞上限_记录但不换号(self):
+        code = self._run("acct2",
+                         {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                         out_of_quota={"acct2"})
+        self.assertEqual(self.spawned, ["acct2"], "强制模式不许换号")
+        self.assertEqual(self.probed, ["acct2"], "只探一次")
+        self.assertEqual(code, ca.EXIT["failed"])
+        # 但事实照记：强制模式踩到的坑要让 auto 模式变聪明
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct2")), self.RESET_AT)
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists(),
+                        "强制模式没有下一个候选，元数据必须留着")
+
+    def test_每个候选最多启动一次(self):
+        self._run(ca.AUTO, self._all(self.LIMIT_LINE),
+                  out_of_quota={"default", "acct2", "acct3"})
+        候选 = ca.accounts_by_availability("t")
+        self.assertEqual(len(self.spawned), len(set(self.spawned)), "每个候选最多启动一次")
+        self.assertEqual(sorted(self.spawned), sorted(候选))
+
+    def test_任务住的那个账号掉了登录态_不许把元数据变成两份(self):
+        """计划 v2 里写过「auto 模式不需要跨账号同名护栏：任务已有的那个家排在
+        最前，第一轮就对上」——**这句话有个反例，上一轮实测到了**。
+
+        登录态过滤把该账号整个剔出了候选（`accounts_by_availability`），于是
+        「排在最前」根本轮不上。第一轮就写到别的 home，旧的那份还在，
+        `find_meta` 当场数出两份并拒绝——`status t` / `stop t` 从此全退 2，
+        任务既停不掉也查不了。codex 的 access_token 只活十天，这条路很好走。
+
+        所以迁移要**显式做**：把旧 home 那份删掉，并说清楚搬去了哪。
+        """
+        self._run("acct3", self._all(self.FINE), out_of_quota=set())
+        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home("acct3"),
+                         "前提不成立：任务没住进 acct3，下面测的就不是这件事")
+
+        (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
+        self.assertNotIn("acct3", ca.accounts_by_availability("t"),
+                         "前提不成立：掉了登录态的账号仍在候选里")
+
+        self.spawned.clear()
+        code = self._run(ca.AUTO, self._all(self.FINE), out_of_quota=set())
+        self.assertEqual(code, ca.EXIT["success"])
+        self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
+        self.assertIn("acct3", self.printed, "要点名是哪个账号够不着了")
+
+    def test_所有账号都没登录态_拒跑并逐个点名(self):
+        for q in self.home.glob(".codex-accounts/*/auth.json"):
+            q.unlink()
+        (self.home / ".codex" / "auth.json").unlink()
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args(ca.AUTO))
+        for account in ("default", "acct2", "acct3"):
+            with self.subTest(账号=account):
+                self.assertIn(account, got.exception.message)
+
+    def test_限流记录写不进去也要照常换号(self):
+        # 记录是优化不是前提。写失败把重试打断的话，一次本来还能被下一个账号
+        # 救回来的任务就这么死了。**让真的写入失败**（目标位置被一个目录占住），
+        # 不 mock write_usage_limit——那样测的是 mock 的行为，不是代码的。
+        ca.ensure_isolation("acct2")
+        ca.usage_limit_path(ca.isolation_home("acct2")).mkdir()
+        code = self._run(ca.AUTO,
+                         {"acct2": self.LIMIT_LINE, "acct3": self.FINE, "default": self.FINE},
+                         out_of_quota={"acct2"})
+        self.assertEqual(self.spawned, ["acct2", "acct3"], "写盘失败不许把重试打断")
+        self.assertEqual(code, ca.EXIT["success"])
+        self.assertIn("codex-sub-agent", self.printed, "写不进去要出声，不许静默失效")
+
+
 class TestResumeGuards(_HomeSandbox):
     def setUp(self):
         super().setUp()
