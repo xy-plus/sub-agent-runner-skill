@@ -1544,13 +1544,13 @@ def run_codex(kind, home, task, meta, make_argv):
             busy.append("codex 本身还在跑")
         if not busy:
             busy.append("刚刚才安静下来——超时和它停下撞在了一起")
-        下一步 = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
-                  "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
-                  if kind == "interrupt-and-resume" else
-                  f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
-                  f"（run 还可以换个任务名）。")
+        next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
+                     "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
+                     if kind == "interrupt-and-resume" else
+                     f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
+                     f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
-               + "；".join(busy) + "。\n" + 下一步)
+               + "；".join(busy) + "。\n" + next_step)
 
     # writer 身份在这里盖，**而且只在这里**：run_codex 是唯一的 spawn 入口，
     # run / resume / interrupt-and-resume 三条路都经过它，调用方不需要记住任何事。
@@ -1814,18 +1814,27 @@ def cmd_run(args):
     if verdict.state == "failed" and hit_usage_limit(runtime_error_lines(this_round.text)):
         # 从**本轮的文本**解析，绝不另读整份历史日志——那会把上一轮、上一个任务
         # 的旧额度错误和旧恢复时间当成本轮事实。
-        hit = parse_reset_time(this_round.text, now=datetime.datetime.now())
-        if hit is None:
-            记 = "日志里没有恢复时间可记（现网确有这种形态）"
+        # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
+        # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
+        reset = parse_reset_time(this_round.text, now=datetime.datetime.now())
+        if reset is None:
+            record_note = "日志里没有恢复时间可记（现网确有这种形态）"
         else:
-            write_usage_limit(home, *hit)         # 写失败它自己吞掉并出声
-            记 = f"恢复时间 {hit[0]:%m-%d %H:%M} 已记下"
+            write_usage_limit(home, *reset)       # 写失败它自己吞掉并出声
+            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
         # 下一个账号**算出来，不写死**：记完这一笔之后重新排一次序，第一个就是
         # 下次会跑的那个。说「下次 auto 会先试」而不是「重跑这条命令会换成」，
-        # 因为后者在两种情形下是假话：强制模式重跑的还是指定的那个账号；
-        # 全部账号都有记录时第一个可能仍是它自己。
-        print(f"[codex-sub-agent] {account} 撞上额度上限，{记}。"
-              f"下次 --account {AUTO} 会先试 {accounts_by_availability()[0]}。")
+        # 因为后者在强制模式下是假话——重跑的还是 `--account` 指定的那一个。
+        #
+        # **第一个仍是它自己时要换句话。** 那种情形下「下次会先试 <刚撞上限的
+        # 那个>」读起来像是在让人原地重试，而真相是没有更好的选择了。
+        # 判据是 `下一个 == 当前`，不是「只剩一个候选」——后者只是它的一个实例：
+        # 多账号但别的账号恢复得更晚时，第一个同样可能仍是它自己。
+        next_account = accounts_by_availability()[0]
+        whats_next = (f"下次 --account {AUTO} 会先试 {next_account}"
+                      if next_account != account else
+                      f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它")
+        print(f"[codex-sub-agent] {account} 撞上额度上限，{record_note}。{whats_next}。")
 
     _print_verdict(args.task, verdict)
     print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")

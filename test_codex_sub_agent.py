@@ -2257,11 +2257,11 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
         self.assertRegex(skill, r"--account auto`[^\n]*默认就写这个",
                          "「auto 是默认写法」这条没了")
-        self.assertRegex(skill, r"撞上额度上限[^\n]*自动换下一个",
-                         "「auto 撞上额度上限会自动换号重试」这条没了")
-        self.assertRegex(skill, r"全部满了[^\n]*什么时候恢复",
-                         "「全部满了会逐个告诉你什么时候恢复」这条没了")
-        self.assertRegex(skill, r"写它的名字[^\n]*\*\*不会\*\*换号",
+        self.assertRegex(skill, r"撞上额度上限\*\*不会自动重跑\*\*",
+                         "「撞上限不自动重跑」这条没了——调用方会以为树是干净的")
+        self.assertRegex(skill, r"重跑这条命令就会自动换号",
+                         "「重跑就换号」这条没了，调用方不知道下一步该干什么")
+        self.assertRegex(skill, r"写它的名字[^\n]*\*\*不换号\*\*",
                          "「写死账号名就不换号」这条没了——两种模式的差别没人守")
 
 
@@ -2950,6 +2950,26 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(下一个, "default", "前提不成立：换了初始状态答案却没变")
         self.assertRegex(self.printed, rf"下次[^\n]*{ca.AUTO}[^\n]*{下一个}",
                          "账号名是写死的，没有真的按新顺序算")
+
+    def test_没有别的账号可换时_不许假装下次会换一个(self):
+        """只有一个账号有登录态时，「下次 auto 会先试 X」里的 X 就是刚撞上限的
+        那一个，读起来像是在让人原地重试。
+
+        钉的条件是 **`下一个 == 当前`**，不是「只剩一个候选」——后者只是它的
+        一个实例。多账号但别的账号恢复得更晚时，第一个仍可能是它自己，
+        那句话同样是在骗人。
+        """
+        for q in self.home.glob(".codex-accounts/*/auth.json"):
+            q.unlink()                        # 只剩 default 有登录态
+        code = self._run(ca.AUTO, self.LIMIT_LINE)
+        self.assertEqual(self.spawned, ["default"])
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertEqual(ca.accounts_by_availability(), ["default"],
+                         "前提不成立：还有别的候选，这条测的就不是这件事")
+        self.assertRegex(self.printed, r"没有恢复得更早的账号",
+                         "没有别的账号可换时要说出来，不许含糊过去")
+        self.assertNotRegex(self.printed, r"会先试 default",
+                            "不许把「仍是它自己」印成一个像是换了号的句子")
 
     def test_解析不出恢复时间_不落盘但要说清楚(self):
         # 现网第三种形态（`hit your usage limit` 后面什么都没有）。
