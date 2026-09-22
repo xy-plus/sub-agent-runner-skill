@@ -868,7 +868,10 @@ def account_choices():
                    f"实测后果：目录叫 default 时候选里会出现两个 default、"
                    f"两次指向同一个隔离目录，find_meta 会对同一份元数据数出两份并误拒；"
                    f"目录叫 {AUTO} 时这个账号再也没法被明确指定。\n"
-                   f"把这个目录改个名。")
+                   f"改名要改**两个**：账号目录 {accounts_dir / name}，"
+                   f"以及它的隔离目录 {isolation_home(name)}。\n"
+                   f"只改前一个的话，住在后一个里的任务之后再也扫不到"
+                   f"——status 看不见、stop 停不掉，而且没有任何报错。")
     return ["default"] + extra
 
 

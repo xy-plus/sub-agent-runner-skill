@@ -1308,6 +1308,13 @@ class TestAccountChoicesGuards(_HomeSandbox):
                     ca.account_choices()
                 self.assertIn(name, got.exception.message)
                 self.assertIn(str(d), got.exception.message, "要点名是哪个目录")
+                # **迁移办法要给全的那一半。** 拒绝半径是整个 CLI
+                # （account_choices 挂在 build_parser 的 choices= 上），所以用户
+                # 只能照着这段话做。光改账号目录名不够：住在
+                # .codex-subagent-auto 里的任务之后再也扫不到，status 看不见、
+                # stop 停不掉——正是本函数上方注释反复要避免的静默失效。
+                self.assertIn(str(ca.isolation_home(name)), got.exception.message,
+                              "没告诉用户隔离目录也要一起改名，照做之后任务会从 status 消失")
                 d.rmdir()
 
     def test_候选各自指向不同的隔离目录(self):
