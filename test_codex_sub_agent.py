@@ -784,7 +784,8 @@ class TestJudge(unittest.TestCase):
         # **本组最重要的一条。** 日志里混着 brief 原文和 codex 转述的子进程输出，
         # 对整轮自由文本做子串匹配会把它们当成 codex 自己的错误。2026-09-22 实测：
         # 现网 3 份日志共 71 行「提到」这句话却不是错误行，正是这么来的。
-        # 判成额度问题的后果不再只是「解释错了」——cmd_run 会据此删元数据、换账号重跑。
+        # 判成额度问题的后果不再只是「解释错了」——cmd_run 会据此给这个账号
+        # 记一笔限流，而它排序时永不过期，那个健康账号从此排到最后。
         brief_echo = "任务：排查为什么会 hit your usage limit\n"
         v = self._judge(brief_echo + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
@@ -865,7 +866,8 @@ class TestJudge(unittest.TestCase):
         # 打断标记是本工具自己写的，是关于「我们做了什么」的不可伪造证据；
         # 额度字样可以来自 brief 回显、codex 读文件的回显、子进程输出。
         # 两者同时出现，打断必须赢——否则一轮「被我们打断、上下文还在、resume 就行」
-        # 的任务，会被判成额度问题，进而（在 cmd_run 里）删元数据、换账号重跑。
+        # 的任务会被判成额度问题，进而（在 cmd_run 里）给一个健康账号记上限流记录，
+        # 而那条记录排序时永不过期。
         v = self._judge(ERR_USER_LAYER_REAL + "\n" + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
@@ -1708,7 +1710,7 @@ class TestMeta(_HomeSandbox):
         self.assertIn("缺字段", cm.exception.message)
 
     def test_同名任务出现在两个隔离目录就拒绝_不许猜(self):
-        # 这条路很好走：撞额度上限 → 换账号重跑同名任务
+        # 这条路很好走：auto 挑中另一个账号 → 同一个任务名在两个隔离目录里各一份
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
         for account in ("default", "acct2"):

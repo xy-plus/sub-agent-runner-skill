@@ -777,8 +777,10 @@ def judge(round):
         # 一个完全正常的账号，因为任务内容涉及额度处理，日志里就出现了
         # `ERROR: …hit your usage limit`。
         # 「两者都真」几乎不可能：codex 撞上限会自己退出，那时没有进程可以被 INT。
-        # 顺序反了的代价是不对称的：把「被打断、resume 就行」判成额度问题，
-        # cmd_run 会删掉元数据、换账号把整个任务重跑一遍。
+        # 顺序反了的代价是不对称的：把「被打断、resume 就行」判成额度问题之后，
+        # cmd_run 会给这个账号记一笔限流——配上「不做过期清理」和「纯按 reset_at
+        # 排序」，那个**完全健康**的账号从此排到最后，auto 再也不会先试它；
+        # 而这一轮真正该做的事（接着 resume）也被这个结论盖掉了。
         # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
         # 留下 failed to record rollout items），那些照常进 detail，不改状态。
         if has_interrupt_mark(round_text):
@@ -1275,8 +1277,9 @@ def find_meta(task):
     的地方都得记得把它剥掉，而「必须记得」正是这个工具存在的理由本身。
 
     查到多份就拒绝，不"取第一个"：那会让 status/resume/stop 静默作用到扫描顺序
-    更靠前的那个会话上。而任务名撞车这条路很好走——撞额度上限就该换账号重跑。
-    cmd_run 已经不让这个状态建起来，这里是第二道。
+    更靠前的那个会话上。而任务名撞车这条路很好走——`auto` 挑中另一个账号时，
+    同一个任务名就会在两个隔离目录里各有一份。`cmd_run` 用显式迁移不让这个状态
+    建起来（旧的那份当场 unlink），这里是第二道。
     """
     found = []
     for account in account_choices():
