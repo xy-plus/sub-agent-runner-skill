@@ -123,10 +123,11 @@ ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
 # 没有经过任何转写。判据要是再一次押在某个会变的字符上，这条第一个红。
 ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 25th, 2026 5:04 PM.'
 # **第二种真实形态：只有时刻，没有日期。** 2026-09-22 全量核对现网日志时发现的，
-# spec 和计划都没写到它：27 份带额度错误的日志里，11 份是这个形状（共 22 行）。
-# 它解析不出日期，`parse_reset_time` 返回 None——**这是对的，不是缺陷**：
-# 补日期就得读当前时钟再猜「是今天还是明天」，而本功能刻意一处都不读时钟。
-# None 的含义是「无记录＝排最前＝照样会被试到」，落在安全的那一边。
+# spec 和计划都没写到它：29 份带额度错误的日志里，11 份是这个形状（共 22 行，
+# 占真实消息的 39%），来自 Plus 账号的 5 小时档。
+# 歧义（4:02 是今天还是明天）只在**读到这条消息的那一刻**存在，而消息说的是
+# "try again **at**"——未来，所以 `parse_reset_time` 取 >= now 的下一个该时刻。
+# 时钟只在那一处读一次，排序（`accounts_by_availability`）一次都不读。
 # 逐字节拷自 /home/xy/.codex-subagent-acct3/logs/bn5m-engine-5min.log。
 ERR_USER_LAYER_REAL_NO_DATE = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:02 AM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
@@ -957,65 +958,146 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
 
 
 class TestParseResetTime(unittest.TestCase):
-    """真实消息长这样（2026-09-22 从现网日志取，全量 54 行同一个形状）：
+    """真实消息有**两种**形态（2026-09-22 对现网 269 份日志全量核对）：
 
-        ERROR: You’ve hit your usage limit. Upgrade to Pro (…), visit
-        https://chatgpt.com/codex/settings/usage to purchase more credits
-        or try again at Sep 25th, 2026 5:04 PM.
+        try again at Sep 25th, 2026 5:04 PM     34 行 / 17 份   Pro，周额度
+        try again at 11:10 AM                   22 行 / 11 份   Plus，5 小时档
+
+    第二种**只有时刻没有日期**，占真实消息的 39%。
+
+    `now` 一律显式传：这是本功能唯一读时钟的地方，隐式的 `datetime.now()`
+    会让「今天还是明天」随测试运行的时刻飘。
     """
 
+    NOW = datetime.datetime(2026, 9, 22, 9, 0)
+
     def test_解析真实消息(self):
-        got = ca.parse_reset_time("or try again at Sep 25th, 2026 5:04 PM.")
+        got = ca.parse_reset_time("or try again at Sep 25th, 2026 5:04 PM.", now=self.NOW)
         self.assertEqual(got[0], datetime.datetime(2026, 9, 25, 17, 4))
         self.assertEqual(got[1], "Sep 25th, 2026 5:04 PM")
 
     def test_从整行真实日志字节里也解析得出(self):
         # 未经我手的那一份（见 ERR_USER_LAYER_REAL）。fixture 自己敲的那些
         # 只能证明正则和我的假设自洽，证明不了它对得上现实。
-        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL)[0],
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL, now=self.NOW)[0],
                          datetime.datetime(2026, 9, 25, 17, 4))
 
-    def test_第二种真实形态_只有时刻没有日期_返回None而不是猜一个(self):
-        """现网 27 份带额度错误的日志里，11 份是这个形状（`try again at 11:10 AM.`）。
-        spec 和计划都只写了带日期的那一种。
+    def test_只有时刻没有日期的那种_换算成下一个该时刻(self):
+        # 现网 11 份日志是这种（Plus 账号的 5 小时档）。
+        # 消息说的是 "try again AT"——未来，所以取 >= now 的下一个该时刻。
+        # 时钟只在这里读一次；排序一次都不读（见 accounts_by_availability）。
+        got = ca.parse_reset_time("or try again at 11:10 AM.", now=self.NOW)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 22, 11, 10), "同一天的晚些时候")
+        self.assertEqual(got[1], "11:10 AM")
 
-        **返回 None 是结论，不是妥协。** 要从「11:10 AM」算出一个 datetime，
-        就得读当前时钟再猜是今天还是明天——而本功能刻意一处都不读时钟
-        （见 `accounts_by_availability` 为什么不做过期清理）。None 会让这个账号
-        退化成「无记录＝排最前＝照样会被试到」，落在安全的那一边；
-        它撞没撞上限仍然由 `hit_usage_limit` 独立判定，不受这里影响。
+    def test_只有时刻_已经过了就算明天(self):
+        now = datetime.datetime(2026, 9, 22, 15, 0)
+        got = ca.parse_reset_time("or try again at 11:10 AM.", now=now)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 23, 11, 10))
+
+    def test_只有时刻_正好等于now就算今天(self):
+        # 边界：消息说 at 11:10，此刻正好 11:10，那就是现在，不是明天
+        now = datetime.datetime(2026, 9, 22, 11, 10)
+        self.assertEqual(ca.parse_reset_time("try again at 11:10 AM.", now=now)[0], now)
+
+    def test_只有时刻_从整行真实日志字节里也解析得出(self):
+        # 未经我手的那一份（见 ERR_USER_LAYER_REAL_NO_DATE），4:02 AM。
+        # now 取 9:00，所以答案是**明天**的 4:02。
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL_NO_DATE, now=self.NOW)[0],
+                         datetime.datetime(2026, 9, 23, 4, 2))
+
+    def test_带日期的那种不受now影响(self):
+        # 带日期的消息自带全部信息，不许被 now 改写
+        for now in (datetime.datetime(2020, 1, 1), datetime.datetime(2030, 1, 1)):
+            with self.subTest(now=now):
+                self.assertEqual(
+                    ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM", now=now)[0],
+                    datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_只有时刻那一支必须紧贴try_again_at_不许在全文里捡时刻(self):
+        """松开那个锚点，突变**存活**——所以这条是专门来杀它的。
+
+        承重在于：`probe_account_quota` 喂进来的是**整段 stdout+stderr**，
+        不是单独一行。全文里随便哪儿的 `3:00 PM`（报告正文、brief 回显、
+        另一条无关日志）都会被捡走，变成一个凭空捏造的恢复时间落盘。
+        而带日期那一支只要格式稍有出入（少个序数后缀）就匹配不上，
+        于是「捡时刻」这条路真的会被走到。
         """
-        self.assertIsNone(ca.parse_reset_time(ERR_USER_LAYER_REAL_NO_DATE))
-        self.assertTrue(ca.hit_usage_limit([ERR_USER_LAYER_REAL_NO_DATE]),
-                        "前提不成立：这条样本本来就该被判成撞上限，"
-                        "否则这条测的不是「解析不出时间」而是「根本没撞上」")
+        for name, text in (
+                ("带日期但格式不对", "try again at Sep 25, 2026 5:04 PM"),
+                ("全文里的无关时刻", "报告：下午 3:00 PM 部署\n"
+                                     "ERROR: You’ve hit your usage limit.\n")):
+            with self.subTest(情形=name):
+                self.assertIsNone(ca.parse_reset_time(text, now=self.NOW))
+
+    def test_两种形态都要用现网真实字节验一次(self):
+        # fixture 经过我的手，真实字节没有。见模块头清单第 8 条。
+        seen = set()
+        lines = 0
+        # 走 `Path.home()` 而不是写死 /home/xy：本类不是 _HomeSandbox 的子类，
+        # 沙箱 patch 在这里没生效，拿到的就是真实 HOME。只读，不写。
+        for f in pathlib.Path.home().glob(".codex-subagent*/logs/*.log"):
+            for line in ca.runtime_error_lines(f.read_text(errors="replace")):
+                if ca.USAGE_LIMIT_MARK not in line:
+                    continue
+                lines += 1
+                got = ca.parse_reset_time(line, now=self.NOW)
+                if got is not None:
+                    seen.add("带日期" if got[1][0].isalpha() else "只有时刻")
+        self.assertTrue(lines, "这台机器上没有带额度错误的现网日志，本条验证不了任何东西")
+        self.assertEqual(seen, {"带日期", "只有时刻"},
+                         "现网两种形态都必须解析得出；只覆盖一种说明判据还有一半是瞎的")
 
     def test_四种序数后缀都要认(self):
         for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (4, "th")):
             with self.subTest(日=day):
                 self.assertEqual(
-                    ca.parse_reset_time(f"try again at Sep {day}{suffix}, 2026 5:04 PM")[0].day,
-                    day)
+                    ca.parse_reset_time(f"try again at Sep {day}{suffix}, 2026 5:04 PM",
+                                        now=self.NOW)[0].day, day)
 
     def test_中午和午夜(self):
         # 12 AM = 0 点、12 PM = 12 点。直接 +12 会把两者都算错。
-        self.assertEqual(ca.parse_reset_time("try again at Sep 1st, 2026 12:30 AM")[0].hour, 0)
-        self.assertEqual(ca.parse_reset_time("try again at Sep 1st, 2026 12:30 PM")[0].hour, 12)
+        for form in ("Sep 1st, 2026 12:30", "12:30"):
+            with self.subTest(形态=form):
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at {form} AM", now=self.NOW)[0].hour, 0)
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at {form} PM", now=self.NOW)[0].hour, 12)
+
+    def test_小时不在1到12的畸形消息返回None_不许静默编一个出来(self):
+        # `int("99") % 12 + 12 == 15`——取模会把一条畸形消息静默编造成一个
+        # 看起来完全合理的恢复时间，而这个值要落盘、要排序、要显示给人看。
+        # 两种形态各有一条路，**两条都要挡**。
+        for form in ("Sep 1st, 2026 99:04", "99:04"):
+            with self.subTest(形态=form):
+                self.assertIsNone(ca.parse_reset_time(f"try again at {form} PM", now=self.NOW))
 
     def test_没这句话就返回None(self):
-        self.assertIsNone(ca.parse_reset_time("ERROR: something else entirely"))
+        self.assertIsNone(ca.parse_reset_time("ERROR: something else entirely", now=self.NOW))
 
     def test_月份名乱写返回None不崩(self):
-        # 正则的 [A-Z][a-z]{2} 会匹配 "Foo"，所以月份必须再查一次表
-        self.assertIsNone(ca.parse_reset_time("try again at Foo 1st, 2026 5:04 PM"))
+        # 正则的 [A-Z][a-z]{2} 会匹配 "Foo"，所以月份必须再查一次表。
+        # **不许退回「只有时刻」那一支**：这条消息自带日期，拿它的时刻当今天／明天
+        # 就是编一个假恢复时间出来，而 None 只是退化成「无记录＝照样会被试到」。
+        self.assertIsNone(ca.parse_reset_time("try again at Foo 1st, 2026 5:04 PM",
+                                              now=self.NOW))
 
     def test_不存在的日期返回None不崩(self):
-        self.assertIsNone(ca.parse_reset_time("try again at Feb 31st, 2026 5:04 PM"))
+        self.assertIsNone(ca.parse_reset_time("try again at Feb 31st, 2026 5:04 PM",
+                                              now=self.NOW))
 
     def test_返回朴素时间_不编造时区(self):
         # 消息里没有时区，实测也推不出来。编一个出来就是撒谎；
         # 这个值只当排序键，朴素时间足够。
-        self.assertIsNone(ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM")[0].tzinfo)
+        for text in ("try again at Sep 25th, 2026 5:04 PM", "try again at 5:04 PM"):
+            with self.subTest(形态=text):
+                self.assertIsNone(ca.parse_reset_time(text, now=self.NOW)[0].tzinfo)
+
+    def test_now必填_不许有隐式的当前时钟(self):
+        # 仓库规范第 6 条：不要缺省值。这是本功能唯一读时钟的地方，
+        # 给了缺省就会有人不传，于是「今天还是明天」随调用时刻飘而没人看得见。
+        with self.assertRaises(TypeError):
+            ca.parse_reset_time("try again at 11:10 AM")
 
 
 class TestUsageLimitFile(unittest.TestCase):

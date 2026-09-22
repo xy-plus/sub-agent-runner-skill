@@ -450,10 +450,15 @@ def hit_usage_limit(error_lines):
     return any(USAGE_LIMIT_MARK in line for line in error_lines)
 
 
+# 两条正则对应现网两种真实形态（见 `parse_reset_time`）。
 # 分组全部具名，不用位置号：`raw` 这一组划定的就是**落盘时那个审计串**
 # （只含日期时间，不含 "try again at " 这个引子），而位置号会随着日后加一个
 # 括号整体漂移，漂了之后 raw 里悄悄多出半句英文，谁也不会发现。
-_RESET_AT = re.compile(
+#
+# 「只有时刻」这条**紧贴在 `try again at` 之后**（不是在全文里找时刻）：
+# 松开这个锚点，带日期消息里的 `5:04 PM` 会被它截胡，于是一条自带完整日期的
+# 消息被当成「今天／明天的 5:04」——比解析不出更坏。
+_RESET_AT_DATED = re.compile(
     r"try again at\s+"
     r"(?P<raw>"
     r"(?P<month>[A-Z][a-z]{2})\s+"              # Sep
@@ -462,13 +467,43 @@ _RESET_AT = re.compile(
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*"   # 5:04
     r"(?P<half>[AP]M)"                          # PM
     r")")
+_RESET_AT_TIME_ONLY = re.compile(
+    r"try again at\s+"
+    r"(?P<raw>(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<half>[AP]M))")
 _MONTHS = {name: number for number, name in enumerate(
     ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
 
 
-def parse_reset_time(text):
+def _to_24h(hour, half):
+    """12 小时制换 24 小时制；小时不在 1–12 就返回 `None`。
+
+    **不取模。** `int("99") % 12 + 12 == 15`——一条畸形消息会被静默编造成
+    一个看起来合理的恢复时间，而这个值要落盘、要排序、要显示给人看。
+    12 AM = 0 点、12 PM = 12 点，所以合法区间内仍然要取模。
+    """
+    hour = int(hour)
+    if not 1 <= hour <= 12:
+        return None
+    return hour % 12 + (12 if half == "PM" else 0)
+
+
+def parse_reset_time(text, now):
     """从撞上限的那段话里抠出恢复时间，抠不到就 `None`。
+
+    现网两种形态（2026-09-22 对 269 份日志全量核对）：
+
+        try again at Sep 25th, 2026 5:04 PM     34 行 / 17 份   Pro，周额度
+        try again at 11:10 AM                   22 行 / 11 份   Plus，5 小时档
+
+    第二种**只有时刻没有日期**，占真实消息的 39%。不认它的代价是：
+    5 小时窗口里每次 run 都要白撞这个账号一次、白探一轮。
+
+    歧义（11:10 是今天还是明天）只在读到消息的那一刻存在，而消息说的是
+    "try again **at**"——未来。所以取 **>= now 的下一个该时刻**。
+    `now` **必填**：这是本功能唯一读时钟的地方，调用方必须显式交出它用的是哪个，
+    否则测试里一个隐式的 `datetime.now()` 会让「明天还是今天」随测试运行的时刻飘。
+    排序（`accounts_by_availability`）**一次都不读时钟**。
 
     返回 `(时间, 原始串)`——两样必须来自**同一次匹配**：原始串是落盘时的审计线索
     （解析错了一眼看得出），拆成两个函数就可能各匹配各的、对不上。
@@ -479,30 +514,33 @@ def parse_reset_time(text):
     以内时才改变顺序，代价是多一次 codex 启动。
 
     抠不到宁可返回 `None`——调用方会退化成「无记录＝排最前＝照样会被试到」，
-    比写一个假时间进去安全得多。
-
-    **额度消息有第二种形态，它就是抠不到的那一类。** 2026-09-22 全量核对现网
-    268 份日志：27 份带真·额度错误，其中 16 份写 `try again at Sep 25th,
-    2026 5:04 PM.`（带日期），另外 11 份写 `try again at 11:10 AM.`
-    ——**只有时刻，没有日期**。后者刻意不解析：补出日期就得读当前时钟再猜
-    「是今天还是明天」，而本功能一处都不读时钟（`accounts_by_availability`
-    不做过期清理，理由同源）。它退化成 `None`，那个账号照样会被试到，
-    而「它撞没撞上限」由 `hit_usage_limit` 独立判定，不受这里影响。
+    比写一个假时间进去安全得多。**带日期那一支匹配上但内容非法（月份名乱写、
+    Feb 31st、小时不在 1–12）时直接 `None`，不退回「只有时刻」那一支**：
+    这条消息自带日期，拿它的时刻当今天／明天就是编一个假恢复时间出来。
     """
-    m = _RESET_AT.search(text)
+    m = _RESET_AT_DATED.search(text)
+    if m is not None:
+        month = _MONTHS.get(m.group("month"))   # [A-Z][a-z]{2} 会匹配 "Foo"，必须再查表
+        hour = _to_24h(m.group("hour"), m.group("half"))
+        if month is None or hour is None:
+            return None
+        try:
+            return (datetime.datetime(int(m.group("year")), month, int(m.group("day")),
+                                      hour, int(m.group("minute"))),
+                    m.group("raw"))
+        except ValueError:              # Feb 31st 这种
+            return None
+
+    m = _RESET_AT_TIME_ONLY.search(text)
     if m is None:
         return None
-    month = _MONTHS.get(m.group("month"))   # [A-Z][a-z]{2} 会匹配 "Foo"，必须再查表
-    if month is None:
+    hour = _to_24h(m.group("hour"), m.group("half"))
+    if hour is None:
         return None
-    # 12 AM = 0 点、12 PM = 12 点。直接 +12 会把这两个都算错。
-    hour = int(m.group("hour")) % 12 + (12 if m.group("half") == "PM" else 0)
-    try:
-        return (datetime.datetime(int(m.group("year")), month, int(m.group("day")),
-                                  hour, int(m.group("minute"))),
-                m.group("raw"))
-    except ValueError:                  # Feb 31st 这种
-        return None
+    when = now.replace(hour=hour, minute=int(m.group("minute")), second=0, microsecond=0)
+    if when < now:                      # 今天这个点已经过了，那说的就是明天
+        when += datetime.timedelta(days=1)
+    return when, m.group("raw")
 
 
 USAGE_LIMIT_FILE = "usage_limit.json"
