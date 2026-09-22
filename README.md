@@ -12,9 +12,12 @@
 （干什么、在哪干、多难），其余由代码保证。写错的参数**当场拒跑**，
 而不是静默跑出一个「零工作量的成功」。
 
+撞上账号额度上限也归它管：`--account auto` 会自己挑一个没在限流的账号，撞上了就换
+下一个重跑，全部满了才报错，并告诉你每个账号什么时候恢复。
+
 ```bash
 codex-sub-agent run --task <任务名> --dir /abs/repo --brief brief.md \
-                --effort high --account default --no-skill
+                --effort high --account auto --no-skill
 codex-sub-agent status [任务名]
 codex-sub-agent resume <任务名> --brief follow.md --effort high --no-skill
 codex-sub-agent interrupt-and-resume <任务名> --brief msg.md --effort high --no-skill
@@ -46,4 +49,4 @@ python3 -m unittest test_codex_sub_agent -v
 
 设计上的取舍和踩过的坑都写在代码注释里，贴在防住它的那行旁边——
 `test_codex_sub_agent.py` 的模块 docstring 是维护者入口，那里记着这个仓库
-在「空测试」上栽过的七种形态和它们的解药。
+在「空测试」上栽过的八种形态和它们的解药。

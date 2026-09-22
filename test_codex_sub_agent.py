@@ -86,7 +86,7 @@
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
-行数（现在 65 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+行数（现在 71 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
 删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以只能
 interrupt-and-resume、退出码怎么读），正好把这次重写的目的做反。
 这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
@@ -2280,6 +2280,9 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         r"session id|session_id": "extract_session_id / 元数据",
         r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
         r"不得使用任何 skill": "build_skill_guard（兜底句由 --skill/--no-skill 每轮派生）",
+        # 「怎么判断该不该换账号」整条链路都归代码：文档只说 auto 会换号，
+        # 不说它是靠单独探一次问出来的、恢复时间记在哪个文件里。
+        r"usage_limit\.json|探测": "probe_account_quota / write_usage_limit",
     }
 
     def test_没有一条代码级约束泄漏进文档(self):
@@ -2338,6 +2341,17 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         self.assertRegex(skill, r"前四列.*任务名.*账号.*状态.*退出码",
                          "前四列是哪四列、什么顺序——这条没了，调用方就得自己猜")
         self.assertRegex(skill, r"缩进的行是明细", "「缩进的行不是任务」这条没了")
+        # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
+        # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
+        # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
+        self.assertRegex(skill, r"--account auto`[^\n]*默认就写这个",
+                         "「auto 是默认写法」这条没了")
+        self.assertRegex(skill, r"撞上额度上限[^\n]*自动换下一个",
+                         "「auto 撞上额度上限会自动换号重试」这条没了")
+        self.assertRegex(skill, r"全部满了[^\n]*什么时候恢复",
+                         "「全部满了会逐个告诉你什么时候恢复」这条没了")
+        self.assertRegex(skill, r"写它的名字[^\n]*\*\*不会\*\*换号",
+                         "「写死账号名就不换号」这条没了——两种模式的差别没人守")
 
 
 class TestTaskName(unittest.TestCase):
