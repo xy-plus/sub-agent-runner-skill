@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from typing import NamedTuple
 
 # 护栏拒绝走独立退出码。裸 `raise SystemExit("人话")` 的退出码是 1，和
@@ -45,7 +46,7 @@ def reject(message):
 # 而那是**正则**，`.` 和 `|` 都是元字符。2026-09-19 实测任务名 `a` 的
 # `…/reports/a.md` 命中了任务 `aXmd` 的进程（`a`+任意字符+`md`），
 # `stop a` 会把 SIGINT 发到 aXmd 的 codex 上。
-# 那个理由现在没了——反查改成扫 /proc 做 argv 元素精确比对（见 find_codex_pid），
+# 那个理由现在没了——反查改成扫 /proc 做 argv 元素精确比对（见 find_agent_pid），
 # 正则语义一点都不引入。但上面两条（文件名）依然成立，所以限制保留。
 #
 # 放在 argparse 的 type= 上，四个子命令一个都绕不过去。
@@ -254,7 +255,7 @@ def interrupt_codex(pid, log_path, cause):
     以及「前台误跑也能活」那条缓解措施，全都架在它上面。换 codex 大版本时值得重验。
 
     **返回值刻意不给。**「它本来就没在跑」这件事由调用方在**调用之前**用
-    `find_codex_pid` 判，那才是判它的地方；给个 bool 出来只是多一个「谁检查」
+    `find_agent_pid` 判，那才是判它的地方；给个 bool 出来只是多一个「谁检查」
     的滥用面。这里的 ProcessLookupError 只是「刚好在这一瞬退出了」——
     信号没送出去就不该留下假痕迹，所以直接返回。
 
@@ -1203,6 +1204,216 @@ def codex_env(home):
     return env
 
 
+# ────────────────────────── deepseek runner ──────────────────────────
+# 下面这一段是 `claude-deepseek -p` 那一侧的全部特殊性。**它们不是三件事而是七件**
+# （隔离目录、隔离不变量、环境+工作目录、起跑 argv、续跑 argv、tee 与收尾、
+# PID 反查的 needle），散开写就会在 `run_codex` 和五个 `cmd_*` 里长出一堆
+# `if runner ==`。接线点集中在 `run_codex` 一处，见那里。
+
+DEEPSEEK_BIN = "claude-deepseek"
+# 用户的硬约束（原话：「如果是 DeepSeek 的话，它的 effort 必须要是 max」）。
+# 写成常量而不是散落字面量：`cmd_run` 的硬拒绝和错误信息都指向它。
+DEEPSEEK_EFFORT = "max"
+
+# `claude-deepseek` 开头会扫环境里所有匹配这个模式的变量，值不等于它自己那个
+# 模型就**退 2**（它的注释：「静默跑错模型变成大声退 2」）。
+# **用户的场景正是「我现在正在用原生的 Claude Code」**——那一刻 `ANTHROPIC_MODEL`
+# 就是 `claude-*`，原样透传 `os.environ` 会让整个功能一次都跑不起来。
+# 实测：`ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p "说一个字：好"` → 退 2。
+# 模式逐字抄自 wrapper（`^(ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$`）：
+# 两边宽窄必须一致，我们这边窄一格就漏掉一个变量、它那边照样退 2。
+_MODEL_ENV = re.compile(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$")
+
+
+def deepseek_env(home):
+    """deepseek 侧的隔离：`CLAUDE_CONFIG_DIR` + **清掉继承来的模型变量**。
+
+    2026-09-23 实测 `CLAUDE_CONFIG_DIR` 指向空目录照跑——auth 走环境变量里的 token，
+    不在配置目录里，所以空目录正是我们要的隔离：子代理一个 skill、一个 MCP、
+    一个 hook 都看不见。
+
+    删模型变量**不改变正确性**：`claude-deepseek` 自己 export 全套（11 个），
+    而且它显式传 `--model`，命令行优先级最高。这里删的只是「别处定的那一份」。
+    只删模型变量、不清空整个环境：子进程还要 `PATH`／`HOME`／代理设置。
+    """
+    env = {k: v for k, v in os.environ.items() if not _MODEL_ENV.match(k)}
+    env["CLAUDE_CONFIG_DIR"] = str(home)
+    return env
+
+
+def new_session_id():
+    """铸一个新的会话 id。**只有 deepseek 用得上**（`codex exec` 自己生成）。"""
+    return str(uuid.uuid4())
+
+
+def _deepseek_base_argv(effort):
+    # `--output-format stream-json` 实测**强制要 `--verbose`**（不带退 1）。
+    # 不用单块 json：它只在结束时吐一次，中途被打断日志里什么都不剩，
+    # 而「被打断的那一轮也要判得出来」是本工具的承诺之一。
+    # `--dangerously-skip-permissions` 对应 codex 侧的 `--sandbox danger-full-access`
+    # + `approval_policy="never"`。**不给的话子代理一个字都写不成，而这一轮仍报
+    # success**（实测 permission_denials 三条全拒、工作目录为空）——正是 `--skill`
+    # 那次立项要杀的「零工作量的成功」。第二道防线见 `deepseek_log_lines`。
+    # **工作目录不在 argv 里**：`claude -p` 没有 `--cd` 等价物，它走 `Popen(cwd=)`。
+    return [DEEPSEEK_BIN, "-p", "--effort", effort,
+            "--output-format", "stream-json", "--verbose",
+            "--dangerously-skip-permissions"]
+
+
+def build_deepseek_argv(effort, session_id, brief):
+    """第一轮。**session id 由我们铸，且必须是独立 argv 元素。**
+
+    `--session-id=<uuid>` 会并成一个元素，让 `find_agent_pid` 的 argv 元素精确
+    比对静默失配——于是 `status` 说不在跑、`stop` 不发信号、`run` 放行第二轮，
+    两个写者共写一份日志。
+
+    **签名里没有工作目录**，虽然 codex 那两个 builder 有。收一个不进 argv 的参数
+    是骗调用方（「传了就管用」），而工作目录只有一个家：`run_codex` 的 `Popen(cwd=)`。
+    """
+    return _deepseek_base_argv(effort) + ["--session-id", session_id, brief]
+
+
+def build_deepseek_resume_argv(effort, session_id, brief):
+    """续跑。**不再传 `--session-id`**——那会另起一个会话，上下文全丢。
+
+    实测：同一个 uuid 再用 `--session-id` 会得到
+    `Error: Session ID … is already in use.` 退 1。
+    """
+    return _deepseek_base_argv(effort) + ["--resume", session_id, brief]
+
+
+def keep_deepseek_line(line):
+    """这一行要不要进日志。**只滤 `thinking_tokens`，别的一个不动。**
+
+    实测它每 token 一条：8 秒 2320 条、462 KB，约 **58 KB/s**；一次 spec 审查的
+    日志跑到了 12 MB。没有任何开关能关掉它，而判据要扫日志。
+    实测过滤比例：行数 99.8%、字节 92.4%（这种行短而密，两个口径差很多）。
+
+    **坏行要留着**（解析不出来就放行）：残行是「这一轮被杀在半路」的现场证据，
+    滤掉它等于把事实也抹掉。
+    """
+    text = line.strip()
+    if not text.startswith(b"{"):
+        return True
+    try:
+        event = json.loads(text)
+    except (ValueError, UnicodeDecodeError):
+        return True
+    return not (event.get("type") == "system" and event.get("subtype") == "thinking_tokens")
+
+
+def split_complete_lines(buffer):
+    """`(完整行的列表, 还没收齐的残片)`。两样都是 `bytes`。
+
+    **残片必须攒着**：丢掉它就是丢掉一个事件（`b"\n".join(...)` 再 `splitlines()`
+    那种写法正是这么静默丢的）；当成完整行则是把半个 JSON 交给解析器。
+
+    按 bytes 切而不是先 decode：一个多字节字符完全可能被切在两块之间，
+    逐块 `decode(errors="replace")` 会把它变成两个替换字符——日志里就多了
+    两个凭空出现的字节，而日志是判据的输入。
+    """
+    if b"\n" not in buffer:
+        return [], buffer
+    *lines, leftover = buffer.split(b"\n")
+    return lines, leftover
+
+
+def _last_result_event(round_text):
+    """本轮 JSONL 里**最后一条** `result` 事件；没有就 `None`。
+
+    **逐行 try/except，坏行跳过。** 实测进程被 SIGINT 杀掉时最后一行必然是残的，
+    `status` 读活日志时同样会撞到——一个残行让整条判据抛异常是不可接受的。
+
+    取最后一条而不是第一条：日志是追加的，本轮文本里可能混进上一轮的尾巴，
+    而「本轮的结论由本轮最后那次收尾决定」。
+    """
+    found = None
+    for line in round_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "result":
+            found = event
+    return found
+
+
+def deepseek_log_lines(round_text):
+    """要补进日志的错误行；一切正常就是空列表。
+
+    `judge` 的 `detail` 来自 `runtime_error_lines`，认的是 `^ERROR:` / tracing /
+    `^Error:`。JSONL 每行以 `{` 开头，**一条都不会命中**——不补的话 deepseek 失败时
+    `detail` 是空的，调用方拿不到任何线索。
+    补一行现有分类器原样认得的，比给 `judge` 加分支好：**判据还是一个家**。
+
+    两种要补：
+
+        非 success    → `failed`（报告没写）
+        工具调用被拒  → 报告在 + 有错误行 = `suspect`，退 3「干完了但要人看一眼」。
+                        **这是「零工作量的成功」的第二道防线**：第一道是
+                        `--dangerously-skip-permissions`，万一它失效，
+                        这里让那一轮变红而不是静默判成功。
+
+    **代价要写明：** 除这两种由本函数产生的行之外，deepseek 侧的 `errors` 恒为空，
+    所以「codex 中途已恢复的工具错误」那类 `suspect` 在 deepseek 侧**结构性不可达**。
+    """
+    event = _last_result_event(round_text)
+    if event is None:
+        return []
+    lines = []
+    if event.get("subtype") != "success":
+        head = (event.get("result") or "").strip().splitlines()
+        lines.append(f"ERROR: {event.get('subtype')}: {head[0] if head else '没有更多信息'}")
+    denied = event.get("permission_denials") or []
+    if denied:
+        names = "、".join(sorted({d.get("tool_name", "?") for d in denied}))
+        lines.append(f"ERROR: 本轮有 {len(denied)} 次工具调用被拒（{names}）"
+                     f"——子代理可能什么都没做成，报告不可尽信")
+    return lines
+
+
+def finish_deepseek_round(round_text, report_path, log_path):
+    """把本轮的产物摆成 `judge` 认识的形状。**这是 deepseek 侧唯一的收尾入口。**
+
+    两件事焊在一起，调用方没有「只写报告、忘了补错误行」这种写法：
+      ① **只在真 success 时**把 `result` 写进报告文件
+      ② 把 `deepseek_log_lines` 那几行追加进日志
+
+    ① 是 `judge` 一行不改的全部原因：现有那条「报告没出现＝没正常收尾」原样生效，
+    打断（`error_during_execution`）于是自动落到 `interrupted`／退 130，和 codex
+    侧逐字一致。把结构化信号用在这里、而不是给 `judge` 加分支，判据就仍然只有一个家。
+
+    ② 必须在 `run_codex` 回传 `Round` **之前**做完，否则补的行落在本轮边界之外，
+    `judge` 看不见——那就等于没补。
+    """
+    event = _last_result_event(round_text)
+    if event is not None and event.get("subtype") == "success":
+        report_path.write_text(event.get("result") or "")
+    lines = deepseek_log_lines(round_text)
+    if lines:
+        with open(log_path, "ab") as log:
+            log.write(("\n".join(lines) + "\n").encode())
+
+
+def agent_comm(runner):
+    """这个 runner 的进程在 `/proc/<pid>/comm` 里叫什么。
+
+    实测：`claude-deepseek` 是 `exec` 掉自己的 bash 包装，所以真实进程的 comm 是
+    **`claude`**，不是可执行文件名，也没有多一层——`Popen.pid` 就是它。
+
+    未知 runner 当场炸，**不给默认值**：静默默认会让「runner 写错了」变成
+    「去问错的那个进程名」，而那没有任何信号（和 `_require_enum` 同一条教条）。
+    """
+    if runner == CODEX:
+        return b"codex"
+    if runner == DEEPSEEK:
+        return b"claude"
+    raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+
+
 def meta_path(home, task):
     return home / "tasks" / f"{task}.json"
 
@@ -1292,13 +1503,13 @@ def _writer_identity():
     恒成立，一个还在排干的任务被**静默判死**——而 `_load_meta` 今天的设计注释
     明写「只校验键在不在」，为这两个字段开一道非对称的类型校验会把那条原则破掉。）
 
-    只有 writer 记身份，codex 那侧继续用 `find_codex_pid` 现场反查。分界线是
+    只有 writer 记身份，codex 那侧继续用 `find_agent_pid` 现场反查。分界线是
     **有没有现场特征**：codex 有（comm=codex、argv 里有报告路径），而「还有没有人
     往日志里写字」没有任何现场特征。现场事实不依赖「有人记得写下来」，而 writer
     正是这条链上唯一会死的那个进程——所以只有它必须自报。
 
     读不到自己就直接炸：`/proc` 读不到自己意味着本工具的全部存活判定
-    （`find_codex_pid` 也在内）都不成立，没有第二条路可走。
+    （`find_agent_pid` 也在内）都不成立，没有第二条路可走。
     """
     pid = str(os.getpid())
     fields = _read_stat_fields(pid)
@@ -1321,8 +1532,16 @@ def new_meta(task, runner, account, workdir, effort, skills):
     而且 `_resume_round` 会拿它去 `ensure_isolation`——记 `"deepseek"` 会指向
     `~/.codex-subagent-deepseek` 这个不存在的账号目录并因缺 auth 拒跑。
 
-    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_codex_pid），
+    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_agent_pid），
     存下来的 PID 会过期、还会被系统复用，留着它只会诱导别人犯这个设计本来要防的错。
+
+    **deepseek 的 session id 在这里铸，不在 `cmd_run` 里。** 理由和 writer 身份
+    自取完全同一条：本函数产出的是「一份**此刻开始**的任务的完整记录」，而
+    「这一轮是哪个会话」就是这份记录的一部分。放在调用方那里等于给它开第二个家，
+    而且「**复用任务名 = 新一轮 = 新 uuid**」就从结构事实退回成一条要记住的软约定
+    ——沿用旧 uuid 会让 `run` 悄悄变成 `resume`（调用方看不出来），而实测再用一次
+    同一个 id 会直接 `Error: Session ID … is already in use.` 退 1。
+    codex 那侧仍是 `None`：`codex exec` 不收这个参数，它的 id 只能从日志里抠。
 
     **writer 的身份是另一回事，所以它有自己的名字。** 写日志的是包装器自己，
     而「它还在不在写」没有任何现场特征可查。身份是 **PID + 启动时刻**成对存
@@ -1350,7 +1569,8 @@ def new_meta(task, runner, account, workdir, effort, skills):
     _require_skill_paths(skills)
     writer_pid, writer_start = _writer_identity()
     return {"task": task, "runner": runner, "account": account, "dir": workdir,
-            "effort": effort, "skills": skills, "session_id": None,
+            "effort": effort, "skills": skills,
+            "session_id": new_session_id() if runner == DEEPSEEK else None,
             "started_at": _now_iso(), "writer_pid": writer_pid, "writer_start": writer_start}
 
 
@@ -1433,8 +1653,14 @@ def pid_alive(pid):
     return True
 
 
-def find_codex_pid(report_path):
+def find_agent_pid(runner, needle):
     """存活判定只有一个可靠判据：真实 PID。日志判不了，$! 给不出。
+
+    `comm` 按 runner 取（见 `agent_comm`），`needle` 是要在 argv 里**精确比对**
+    的那一个元素：codex 传报告路径（`-o` 的那一项），deepseek 传 session id
+    （`--session-id` / `--resume` 的那一项）。两侧都恰好是独立一项，
+    所以下面那条「元素相等、绝不用正则」对两侧同样成立。
+    **调用方一般不该直接调它**——用 `find_task_agent_pid`，needle 由它派生。
 
     回合用尽的 codex 留下的 log 和还在跑的长得一模一样（末尾都是正常输出、
     没有收尾标记），所以 tail 日志只能看它在干什么，判不了存活。
@@ -1456,11 +1682,13 @@ def find_codex_pid(report_path):
     顺带省掉每次 1+N 次子进程（一个 pgrep 加每个候选一个 ps）。
     """
     me = os.getuid()
-    # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点。
-    # 全模块只在这里从 Path 落到 str：别处一律传 Path（_wait_previous_round_ends
-    # 连报告路径都不收，自己从 (home, task) 派生）。同一个东西两种传法，
+    comm = agent_comm(runner)
+    # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点
+    # （deepseek 的 needle 本来就是 str，`str()` 对它是恒等）。
+    # 全模块只在这里从 Path 落到 str：别处一律传 Path（`find_task_agent_pid`
+    # 连 needle 都不收，自己从 (runner, home, task) 派生）。同一个东西两种传法，
     # 正是「好 API 难被误用」要消掉的那种缝。
-    needle = str(report_path).encode()
+    needle = str(needle).encode()
     for entry in pathlib.Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -1468,7 +1696,7 @@ def find_codex_pid(report_path):
             # 进程随时可能退出，每一步都可能 ENOENT——一律跳过，不让它打断扫描
             if entry.stat().st_uid != me:
                 continue
-            if (entry / "comm").read_bytes().strip() != b"codex":
+            if (entry / "comm").read_bytes().strip() != comm:
                 continue
             if needle not in (entry / "cmdline").read_bytes().split(b"\0"):
                 continue
@@ -1478,6 +1706,37 @@ def find_codex_pid(report_path):
         if pid_alive(pid):
             return pid
     return None
+
+
+def find_task_agent_pid(runner, home, task):
+    """这个任务此刻有没有活着的 agent 进程；没有返回 `None`。
+
+    **needle 一律从磁盘派生，不收调用方手里那份 meta。** 两侧的派生方式不同，
+    而这条不对称是**外部约束造成的**，不是设计选择：
+
+        codex     报告路径由 (home, task) 算得出，**元数据不在也查得到**。
+                  这条不能丢——元数据被手删、而上一轮的 codex 还占着会话时，
+                  「没元数据就放行」会让新一轮当场撞上它的写锁
+                  （`_wait_previous_round_ends` 那段注释写的就是这件事）。
+        deepseek  session id 只住在元数据里，算不出来。而 `run` 的每一轮都铸
+                  新 uuid，**拿本轮那个去找上一轮的进程恒为 None**——所以这里
+                  必须现读磁盘。传进来的 meta 在 `run_codex` 里正是「刚造好的
+                  那一份」，用它等待就变成了空操作，两个写者共写一份日志。
+                  没有元数据就老实答「查不到」，不瞎猜。
+
+    收 `(runner, home, task)` 三个而不是 `(home, meta)`：六个调用点里有五个手里
+    是 `(home, meta)`，但 `_wait_previous_round_ends` 那一个**必须**问磁盘而不是
+    问手里那份——收 meta 就给了它一个传错的写法，而传错是静默算对的。
+    """
+    if runner == CODEX:
+        return find_agent_pid(CODEX, _report_path(home, task))
+    if runner != DEEPSEEK:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+    q = meta_path(home, task)
+    if not q.exists():
+        return None
+    session_id = _load_meta(q)["session_id"]
+    return find_agent_pid(DEEPSEEK, session_id) if session_id else None
 
 
 def _previous_writer_alive(home, task):
@@ -1606,15 +1865,21 @@ ROUND_END_TIMEOUT = 60
 ROUND_END_POLL_INTERVAL = 0.2
 
 
-def _wait_previous_round_ends(home, task, timeout, poll_interval):
-    """等到**上一轮的 writer 停了**、而且**codex 也停了**。返回是否等到。
+def _wait_previous_round_ends(runner, home, task, timeout, poll_interval):
+    """等到**上一轮的 writer 停了**、而且**上一轮的 agent 也停了**。返回是否等到。
 
     两个条件问的是两件事，缺一不可：
 
         还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
-        会话还被占着吗   find_codex_pid           现场反查
+        会话还被占着吗   find_task_agent_pid      现场反查
 
-    只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
+    **两个谓词都从磁盘取事实，绝不用传进来的 meta。** codex 那半是本来就没有
+    可传的东西（needle 由 (home, task) 派生）；deepseek 那半则是**承重的**——
+    `run` 的每一轮都铸新 uuid，传进来那份记的是本轮，拿它去找上一轮的进程
+    恒为 None，等待整个变成空操作，上一轮还在写、这一轮已经开跑，
+    两个写者共写一份日志。详见 `find_task_agent_pid`。
+
+    只看 agent 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
     argv 精确比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上
     **孤儿 codex**：SIGKILL 掉包装器之后 codex 存活并跑完（实测），续跑撞上它的写锁。
 
@@ -1626,19 +1891,21 @@ def _wait_previous_round_ends(home, task, timeout, poll_interval):
     **只等，不发任何信号。** 超时的正确处置是让调用方稍后再来，不是加大火力：
     升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
 
-    报告路径**自己从 (home, task) 派生**，不收参数：收参数就能传错（把日志路径传
-    进来的话 find_codex_pid 永远找不到，等待整个变成空操作），而这里只有一个调用点。
+    needle **自己从 (runner, home, task) 派生**，不收参数：收参数就能传错（把日志
+    路径传进来的话反查永远找不到，等待整个变成空操作），而这里只有一个调用点。
 
     **没有「元数据不在就直接放行」这条捷径。** 那条早返回既多余（`_previous_writer_alive`
-    自己第一件事就是查文件在不在），又**开洞**：它连 codex 那一半都跳过了——
+    自己第一件事就是查文件在不在），又**开洞**：它连 agent 那一半都跳过了——
     元数据被手删、而上一轮的 codex 还占着会话时当场放行，新一轮撞上它的写锁。
     两个条件一个都不能少。
+    （deepseek 那侧「元数据不在就查不到」是另一回事：那是 needle 真的算不出来，
+    不是为了省事早返回。）
     """
-    report = _report_path(home, task)
     deadline = time.monotonic() + timeout
     said = False
     while True:
-        if not _previous_writer_alive(home, task) and find_codex_pid(report) is None:
+        if (not _previous_writer_alive(home, task)
+                and find_task_agent_pid(runner, home, task) is None):
             return True
         if not said:
             # **只在真要等的时候说，而且只进屏幕不进日志。** 等待排在分隔符之前，
@@ -1695,16 +1962,17 @@ def run_codex(kind, home, task, meta, make_argv):
     # 从前只有 interrupt-and-resume 会等，而 cmd_resume 同样只看 codex——
     # 上一轮被打断、codex 已没、writer 还在排干时它当场放行，老 writer 的输出
     # 会落在新分隔符之后，judge 把上一轮的尾巴算成这一轮。同一类 bug 换个入口。
-    if not _wait_previous_round_ends(home, task, ROUND_END_TIMEOUT, ROUND_END_POLL_INTERVAL):
+    if not _wait_previous_round_ends(meta["runner"], home, task,
+                                     ROUND_END_TIMEOUT, ROUND_END_POLL_INTERVAL):
         # 超时之后**再问一次两个谓词**：两种停不下来的现场不同，而这行 stderr
         # 是调用方唯一的线索。不让等待函数回一个成因枚举——那会多出一个实体，
         # 而「谁还没停」本来就是这两个谓词各问一次的事。
         busy = []
         if _previous_writer_alive(home, task):
-            busy.append("包装器还在读 codex 的输出（codex 起的后台进程继承了同一个 "
+            busy.append("包装器还在读子代理的输出（子代理起的后台进程继承了同一个 "
                         "stdout，它不退管道就不 EOF）")
-        if find_codex_pid(report) is not None:
-            busy.append("codex 本身还在跑")
+        if find_task_agent_pid(meta["runner"], home, task) is not None:
+            busy.append(f"{meta['runner']} 本身还在跑")
         if not busy:
             busy.append("刚刚才安静下来——超时和它停下撞在了一起")
         next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
@@ -1809,7 +2077,7 @@ def _tee_until_exit(proc, log, home, task, meta):
     # 开跑前要等的是**本进程**，不是 codex。本进程的身份就落在元数据的
     # writer_pid／writer_start 里（见 run_codex 里盖章那一行），
     # _wait_previous_round_ends 等的也正是它。
-    # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_codex_pid 就判 None
+    # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_agent_pid 就判 None
     # （僵尸的 cmdline 为空，argv 比对拒绝它），日志还要再长好几秒。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
         sys.stdout.buffer.write(chunk)
@@ -1875,15 +2143,21 @@ def status_row(meta, verdict):
     # 先过枚举：退出码那一列是 EXIT[state]，裸下标对写错的状态只给一个 KeyError，
     # 调用方看不出是什么坏了。和 kind／cause 同一条做法。
     _require_enum(verdict.state, tuple(EXIT), "state")
-    task, account, workdir = meta["task"], meta["account"], meta["dir"]
-    for label, field in (("任务名", task), ("账号", account)):
+    task, workdir = meta["task"], meta["dir"]
+    # 第二列是「派给谁跑」：codex 要连账号一起说（`codex:acct2`），deepseek 没有
+    # 账号维度，就只有 runner 名。**复用这一列而不是加第五列**：前四列无空白 +
+    # `split(maxsplit=4)` 是机器切分的契约，加一列会把每个解析它的调用方打断。
+    # 顺带消掉一个真 bug：deepseek 的 account 是 `None`，原来那句 `f"{account:<8}"`
+    # 会当场 TypeError——status 一个任务都列不出来。
+    who = meta["runner"] if meta["account"] is None else f"{meta['runner']}:{meta['account']}"
+    for label, field in (("任务名", task), ("runner 与账号", who)):
         if _WHITESPACE.search(field):
             reject(f"{label} {field!r} 含空白字符——status 的前四列就切不开了，"
                    f"调用方再也取不出 state。")
     for label, field in (("工作目录", workdir), ("reason", verdict.reason)):
         if _CONTROL_CHARS.search(field):
             reject(f"{label} {field!r} 含控制字符——「一行一任务」就不成立了。")
-    return (f"{task:<24} {account:<8} {verdict.state:<8} {EXIT[verdict.state]:<4} "
+    return (f"{task:<24} {who:<16} {verdict.state:<8} {EXIT[verdict.state]:<4} "
             f"{workdir}  {verdict.reason}")
 
 
@@ -1940,7 +2214,7 @@ def cmd_run(args):
     # 整个消失。run_codex 的注释写着「这一等排在 write_meta 之前，所以超时不留
     # 半个状态」，而迁移是从**外面**把那条不变量破掉的。
     #
-    # **为什么查 `find_codex_pid` 就够**（不必把整个 `_wait_previous_round_ends`
+    # **为什么查 `find_agent_pid` 就够**（不必把整个 `_wait_previous_round_ends`
     # 搬出来重跑一遍）：能走到迁移，说明 `find_meta` 只数出一份元数据（两份它当场
     # 拒），于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
     # `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的就只剩
@@ -1951,7 +2225,7 @@ def cmd_run(args):
     # writer 和 codex 排干了没有」，每轮都必须做。
     home = isolation_home(CODEX, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
-        if find_codex_pid(_report_path(candidate_home, args.task)) is not None:
+        if find_task_agent_pid(CODEX, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `codex-sub-agent stop {args.task}`")
 
@@ -2054,7 +2328,7 @@ def cmd_status(args):
     worst = "success"
     for home, meta in rows:
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
-        pid = find_codex_pid(report)
+        pid = find_task_agent_pid(meta["runner"], home, meta["task"])
         # 还在跑就**不读日志**：判据在这一支根本用不到它，而 status 是轮询用的
         # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
         # 列全部任务还要乘任务数。
@@ -2161,7 +2435,7 @@ def cmd_resume(args):
     # 相反，是**刻意的**：「拒绝必须在动手之前」约束的是**副作用**，而这条路一个
     # 副作用都没有，闸序只决定人先看到哪句话——「还在跑」是这里最可操作的那句。
     # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
-    if find_codex_pid(_report_path(home, args.task)) is not None:
+    if find_task_agent_pid(meta["runner"], home, args.task) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `codex-sub-agent interrupt-and-resume {args.task}`。")
     return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
@@ -2205,8 +2479,8 @@ def cmd_interrupt_and_resume(args):
     # 的那一轮会在收尾时写元数据），但无损：差异字段只有 session_id（为空早被
     # 上面的闸拒了）、effort／started_at（本来就要刷新），以及 writer_pid／
     # writer_start——后两个由 run_codex 临落盘前现盖，这里拿的是哪一份都不影响。
-    report, log = _report_path(home, args.task), _log_path(home, args.task)
-    pid = find_codex_pid(report)
+    log = _log_path(home, args.task)
+    pid = find_task_agent_pid(meta["runner"], home, args.task)
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
@@ -2235,7 +2509,7 @@ def cmd_stop(args):
     home, meta = find_meta(args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    pid = find_codex_pid(_report_path(home, args.task))
+    pid = find_task_agent_pid(meta["runner"], home, args.task)
     if pid is None:
         print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]

@@ -240,9 +240,15 @@ def _full_meta(task, **over):
 # 三个测试类都要用它们，而跨类写成 `TestPid._wait_argv(self, …)` 会在 `self`
 # 上找不到兄弟方法当场炸——炸点在陪练的 `kill()` **之前**，于是 `finally` 里的
 # `wait()` 会永久挂住一个 `tail -f`，**整套测试跟着挂死**（原型上挂过两次）。
-def _fake_codex(tmp):
-    """把一个真二进制命名成 codex —— comm 就会报 codex。"""
-    fake = tmp / "codex"
+def _fake_agent(tmp, comm):
+    """把一个真二进制命名成 `comm` —— `/proc/<pid>/comm` 就会报这个名字。
+
+    收 `comm` 而不是内部按 runner 推：两个 runner 的 comm 是 `codex` 和 `claude`，
+    而**后者不是可执行文件名**（可执行文件叫 `claude-deepseek`，它 `exec` 掉自己，
+    真实进程的 comm 是 `claude`）。让调用方写出它要的那个 comm，测试读起来就是
+    「我要一个 comm 长这样的进程」，不必回去查那张映射表。
+    """
+    fake = tmp / comm
     fake.write_bytes(pathlib.Path("/usr/bin/tail").read_bytes())
     fake.chmod(0o755)
     return fake
@@ -690,7 +696,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
-             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
             popen.side_effect = self._race(d)
             ca.cmd_resume(args)
@@ -704,7 +710,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         ca.write_meta(d, "t", _full_meta("t"))
         ca._log_path(d, "t").write_text("随便什么\n")
         args = ca.build_parser().parse_args(["status", "t"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "read_last_round") as r:
             self.assertEqual(ca.cmd_status(args), 4)   # 绝对值：还在跑就是 4
         r.assert_not_called()
@@ -731,7 +737,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             seen.append(v)
             return v
 
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              mock.patch.object(ca, "judge", side_effect=spy):
             ca.cmd_status(args)
         self.assertEqual(len(seen), 1, "前提不成立：judge 没被调到，这条什么都没测")
@@ -1794,6 +1800,437 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
 
 
+class TestDeepseekRunner(_HomeSandbox):
+    """deepseek runner 的纯函数。**`judge` 一行不改**——runner 的职责是把本轮的
+    产物摆成 judge 已经认识的形状：报告文件 + 本轮日志文本。
+
+    **本类只测函数自己。** 「这些函数真的被接上了线」由 `TestDeepseekWiring`
+    用假 `Popen` 驱动真实 `run_codex` 来钉——两者缺一不可：plan v2 只有前者，
+    而审查照着它搭出的参考实现里这些函数**一个调用点都没有**，31 条测试照样全绿。
+    """
+
+    OK = ('{"type":"result","subtype":"success","is_error":false,'
+          '"result":"干完了","session_id":"sid-1","permission_denials":[]}')
+    INT = ('{"type":"result","subtype":"error_during_execution","is_error":true,'
+           '"result":"","session_id":"sid-1","permission_denials":[]}')
+    DENIED = ('{"type":"result","subtype":"success","is_error":false,"result":"我写不进去",'
+              '"session_id":"sid-1","permission_denials":'
+              '[{"tool_name":"Write"},{"tool_name":"Bash"}]}')
+
+    def test_uuid是独立argv元素不是等号连接(self):
+        # **承重。** PID 反查按 argv 元素精确比对（不是正则——codex 那条注释记了
+        # 实测事故：任务 a 的报告路径拿去 pgrep 命中了 aXmd）。写成 --session-id=<uuid>
+        # 就成了一个元素，精确匹配静默失配 → status 说不在跑、stop 不发信号、
+        # run 放行第二轮 → 两个写者共写一份日志。
+        argv = ca.build_deepseek_argv("max", "sid-123", "干活")
+        self.assertIn("--session-id", argv)
+        self.assertEqual(argv[argv.index("--session-id") + 1], "sid-123")
+        self.assertNotIn("--session-id=sid-123", argv)
+        rargv = ca.build_deepseek_resume_argv("max", "sid-123", "接着干")
+        self.assertEqual(rargv[rargv.index("--resume") + 1], "sid-123")
+        self.assertNotIn("--resume=sid-123", rargv)
+        self.assertNotIn("--session-id", rargv, "续跑不许再指定 session-id，那会另起一个会话")
+
+    def test_两条路的可执行名都是claude_deepseek(self):
+        for argv in (ca.build_deepseek_argv("max", "s", "b"),
+                     ca.build_deepseek_resume_argv("max", "s", "b")):
+            with self.subTest(argv=argv[:2]):
+                self.assertEqual(argv[0], "claude-deepseek")
+                self.assertIn("-p", argv)
+
+    def test_argv要带权限开关(self):
+        # 不给的话子代理一个字都写不成，而这一轮仍然报 success——
+        # 实测 permission_denials 三条全拒、工作目录为空。
+        # 这正是 --skill 那次立项要杀的「零工作量的成功」。
+        for argv in (ca.build_deepseek_argv("max", "s", "b"),
+                     ca.build_deepseek_resume_argv("max", "s", "b")):
+            with self.subTest(argv=argv[:2]):
+                self.assertIn("--dangerously-skip-permissions", argv)
+
+    def test_argv要stream_json且要verbose(self):
+        # 实测 stream-json 不带 --verbose 退 1；而单块 json 中途被杀就什么都不剩。
+        for argv in (ca.build_deepseek_argv("max", "s", "b"),
+                     ca.build_deepseek_resume_argv("max", "s", "b")):
+            with self.subTest(argv=argv[:2]):
+                self.assertEqual(argv[argv.index("--output-format") + 1], "stream-json")
+                self.assertIn("--verbose", argv)
+
+    def test_effort原样进argv(self):
+        self.assertEqual(ca.build_deepseek_argv("max", "s", "b")[
+            ca.build_deepseek_argv("max", "s", "b").index("--effort") + 1], "max")
+
+    def test_两个builder都不收工作目录_它走cwd(self):
+        # claude -p 没有 --cd 等价物。工作目录必须由 Popen(cwd=) 交过去，
+        # 否则子代理在包装器的 cwd 里干活，而元数据说的是 --dir——元数据说谎。
+        # **签名里也不留这个参数**：收一个不进 argv 的参数是骗调用方，
+        # 让人以为「传了就管用」。工作目录只有一个家，在 run_codex 的 Popen(cwd=)。
+        for builder in (ca.build_deepseek_argv, ca.build_deepseek_resume_argv):
+            with self.subTest(builder=builder.__name__):
+                self.assertNotIn("--cd", builder("max", "s", "b"))
+                self.assertEqual(builder.__code__.co_argcount, 3,
+                                 "签名里多一个参数就是留了个骗人的口子")
+
+    def test_brief是最后一个argv元素(self):
+        self.assertEqual(ca.build_deepseek_argv("max", "s", "干活")[-1], "干活")
+        self.assertEqual(ca.build_deepseek_resume_argv("max", "s", "接着干")[-1], "接着干")
+
+    def test_隔离走CLAUDE_CONFIG_DIR(self):
+        # 实测指向空目录照跑——auth 走环境变量里的 token，不在配置目录里，
+        # 所以空目录正是我们要的隔离：一个 skill、一个 MCP、一个 hook 都看不见。
+        env = ca.deepseek_env(pathlib.Path("/d"))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/d")
+        self.assertNotIn("CODEX_HOME", env, "codex 的隔离变量不该出现在 deepseek 的环境里")
+
+    def test_交出去的env里一个模型变量都没有(self):
+        """**没有这一条，整个功能在用户的真实场景下一次都跑不起来。**
+
+        `claude-deepseek` 开头会扫环境里所有
+        `^(ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$` 的变量，值不等于
+        `deepseek-flash[1m]` 就退 2（它自己的注释：「静默跑错模型变成大声退 2」）。
+        而用户的原话场景是「我现在正在用原生的 Claude Code」——那一刻
+        `ANTHROPIC_MODEL` 就是 `claude-*`。实测：
+            ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p "说一个字：好"
+            → claude-deepseek: 别处在定模型，拒绝启动
+        删掉它们不改变正确性：wrapper 自己 export 全套模型变量。
+        """
+        dirty = {"ANTHROPIC_MODEL": "claude-opus-5",
+                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4",
+                 "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku",
+                 "CLAUDE_CONTEXT_COLLAPSE_MODEL": "claude-x",
+                 "ANTHROPIC_CUSTOM_MODEL_OPTION_1": "别的",
+                 "CLAUDE_CODE_NO_MODEL_FALLBACK": "1"}
+        with mock.patch.dict(os.environ, dirty):
+            env = ca.deepseek_env(pathlib.Path("/d"))
+        leaked = [k for k in env if re.match(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$", k)]
+        self.assertEqual(leaked, [], f"这些会让 claude-deepseek 当场退 2：{leaked}")
+        self.assertIn("PATH", env, "只删模型变量，别把整个环境清空——子进程还要 PATH")
+
+    def test_成功才写报告(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.OK, rp, lp)
+        self.assertEqual(rp.read_text(), "干完了")
+
+    def test_被打断不写报告(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.INT, rp, lp)
+        self.assertFalse(rp.exists())
+
+    def test_收尾把报告和错误行一起做完_不可能只做一半(self):
+        # 两件事焊在一个函数里：调用方没有「只写报告、忘了补错误行」这种写法。
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.DENIED, rp, lp)
+        self.assertTrue(rp.exists())
+        self.assertIn("ERROR: ", lp.read_text())
+
+    def test_一切正常时不往日志里补任何东西(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.OK, rp, lp)
+        self.assertEqual(lp.read_bytes(), b"")
+        self.assertEqual(ca.deepseek_log_lines(self.OK), [])
+
+    def test_失败时补一行judge认识的错误行(self):
+        lines = ca.deepseek_log_lines(self.INT)
+        self.assertTrue(any(l.startswith("ERROR: ") for l in lines))
+        self.assertIn("error_during_execution", "\n".join(lines))
+        self.assertEqual(ca.runtime_error_lines("\n".join(lines)), lines)
+
+    def test_工具被拒时也补一行_于是judge给suspect(self):
+        # 报告在（它确实收尾了）+ 有错误行 → suspect → 退 3「要人看一眼」。
+        # 用的是现有状态机，零新分支。
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.DENIED, rp, lp)
+        lines = ca.deepseek_log_lines(self.DENIED)
+        self.assertTrue(any("被拒" in l for l in lines))
+        self.assertIn("Write", "".join(lines))
+        v = ca.judge(ca.Round(rp, "\n".join(lines)))
+        self.assertEqual(v.state, "suspect")
+        self.assertEqual(ca.EXIT[v.state], 3)
+
+    def test_打断的那一轮judge给interrupted_和codex侧逐字一致(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.INT, rp, lp)
+        text = "\n".join([self.INT, ca.INTERRUPT_MARK, lp.read_text()])
+        v = ca.judge(ca.Round(rp, text))
+        self.assertEqual(v.state, "interrupted")
+        self.assertEqual(ca.EXIT[v.state], 130)
+
+    def test_成功那一轮judge给success(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(self.OK, rp, lp)
+        self.assertEqual(ca.judge(ca.Round(rp, self.OK)).state, "success")
+
+    def test_JSONL本身一条都不该被judge当成错误行(self):
+        # 这是「非补不可」的根据：judge 的 detail 来自 runtime_error_lines，
+        # 认的是 ^ERROR: / tracing / ^Error:，而 JSONL 每行以 { 开头。
+        # 不补的话 deepseek 失败时 detail 是空的——调用方拿不到任何线索。
+        self.assertEqual(ca.runtime_error_lines("\n".join([self.OK, self.INT, self.DENIED])), [])
+
+    def test_尾部坏行不许让解析崩(self):
+        # 实测：进程被 SIGINT 杀掉时最后一行必然是残的；status 读活日志也会撞到。
+        torn = self.OK + '\n{"type":"system","subty'
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round(torn, rp, lp)
+        self.assertEqual(rp.read_text(), "干完了")
+        self.assertEqual(ca.deepseek_log_lines(torn), [])
+
+    def test_没有result事件就不写报告(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round('{"type":"system","subtype":"init"}\n', rp, lp)
+        self.assertFalse(rp.exists())
+        self.assertEqual(ca.deepseek_log_lines('{"type":"system","subtype":"init"}\n'), [])
+
+    def test_取的是最后一条result事件(self):
+        # 日志是追加的，本轮文本里可能混进上一条 result。取最后一条，
+        # 和「本轮的结论由本轮最后那次收尾决定」一致。
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round("\n".join([self.INT, self.OK]), rp, lp)
+        self.assertEqual(rp.read_text(), "干完了")
+
+    def test_result为空也照写_让judge那条报告为空的判据接住(self):
+        rp, lp = self.home / "r.md", self.home / "t.log"
+        lp.write_bytes(b"")
+        ca.finish_deepseek_round('{"type":"result","subtype":"success","result":"",'
+                                 '"permission_denials":[]}', rp, lp)
+        self.assertEqual(rp.read_text(), "")
+        self.assertEqual(ca.judge(ca.Round(rp, "")).state, "failed")
+
+    def test_PID反查的进程名按runner取(self):
+        # 实测读 /proc/<pid>/comm：claude-deepseek 是 exec 掉的 bash 包装，
+        # 所以真实进程的 comm 是 claude，没有多一层。
+        self.assertEqual(ca.agent_comm(ca.CODEX), b"codex")
+        self.assertEqual(ca.agent_comm(ca.DEEPSEEK), b"claude")
+
+    def test_未知runner当场炸_不许静默给个默认值(self):
+        # 和 _require_enum 同一条教条：静默默认值会让「runner 写错了」变成
+        # 「去问错的那个进程名」，而那是没有任何信号的。
+        with self.assertRaises(ValueError):
+            ca.agent_comm("gpt4")
+
+    def test_过滤只滤thinking_tokens_别的一个不动(self):
+        keep = ca.keep_deepseek_line
+        self.assertFalse(keep(b'{"type":"system","subtype":"thinking_tokens","n":1}'))
+        for good in (b'{"type":"result","subtype":"success"}', b'{"type":"assistant"}',
+                     b'{"type":"system","subtype":"init"}',
+                     b'{"type":"user","subtype":"thinking_tokens"}'):
+            with self.subTest(line=good):
+                self.assertTrue(keep(good))
+
+    def test_坏行要留着_它是现场证据(self):
+        # 残行是「这一轮被杀在半路」的现场证据。滤掉它等于把事实也抹掉。
+        self.assertTrue(ca.keep_deepseek_line(b'{"type":"system","subty'))
+        self.assertTrue(ca.keep_deepseek_line(b'\xff\xfe not json'))
+        self.assertTrue(ca.keep_deepseek_line(b''))
+
+    def test_攒行_残片要留着不许丢也不许当成完整行(self):
+        """`split_complete_lines` 的全部契约。
+
+        丢掉残片 = 丢掉一个事件；当成完整行 = 把半个 JSON 交给解析器。
+        突变「`b"\\n".join(...)` 再 `splitlines()`」会**静默丢掉尾部残片**，
+        这条必须红。
+        """
+        self.assertEqual(ca.split_complete_lines(b'{"a":1}\n{"b'), ([b'{"a":1}'], b'{"b'))
+        self.assertEqual(ca.split_complete_lines(b'{"b":2}\n'), ([b'{"b":2}'], b''))
+        没换行 = '没有换行'.encode()
+        self.assertEqual(ca.split_complete_lines(没换行), ([], 没换行))
+        self.assertEqual(ca.split_complete_lines(b''), ([], b''))
+        self.assertEqual(ca.split_complete_lines(b'a\nb\nc'), ([b'a', b'b'], b'c'))
+        # 多字节字符被切在两块之间：按 bytes 攒才不会把它切坏
+        head, tail = b'\xe5\xa5', b'\xbd\n'
+        self.assertEqual(ca.split_complete_lines(head), ([], head))
+        self.assertEqual(ca.split_complete_lines(head + tail), ([b'\xe5\xa5\xbd'], b''))
+
+    def test_每一轮都是新uuid(self):
+        # run 的语义两侧一致：新会话、无上下文。沿用旧 uuid 会让 run 悄悄变成
+        # resume，而调用方看不出来；实测复用同一个 session-id 直接
+        # `Error: Session ID … is already in use.` 退 1。
+        self.assertNotEqual(ca.new_session_id(), ca.new_session_id())
+        self.assertEqual(len(ca.new_session_id()), 36)
+
+    def test_新任务的uuid由构造器铸_codex那侧仍然是None(self):
+        # 放在构造器里而不是 cmd_run 里：本函数产出的是「一份**此刻开始**的任务的
+        # 完整记录」，「这一轮是哪个会话」就是这份记录的一部分——和 writer 身份
+        # 自取同一条论证。于是「复用任务名 = 新一轮 = 新 uuid」是结构事实，
+        # 不是一条要记住的软约定。
+        a = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())["session_id"]
+        b = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())["session_id"]
+        self.assertTrue(a and b and a != b)
+        # codex 的 session id 只能从日志里抠（codex exec 不收这个参数）
+        self.assertIsNone(ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ())["session_id"])
+
+
+class TestFindAgentPid(unittest.TestCase):
+    """PID 反查按 runner 取 comm 和 needle。**argv 元素精确比对这条原样保留。**"""
+
+    UUID = "11111111-2222-3333-4444-555555555555"
+
+    def _fake_claude(self, argv_tail):
+        """起一个 `comm=claude` 的陪练，argv 尾巴由调用方给。
+
+        陪练是 `tail`（改名成 claude），所以**不能给它 `--session-id` 这种它不认的
+        长选项**——它会当场退出，测试变成「进程根本不存在」那类空测试（本文件
+        总纲第 1 条踩过）。uuid 直接当独立的 argv 元素传，而这正是被测的性质：
+        真实 argv 里 `--session-id` 和 uuid 也是两个独立元素，needle 比对的是后者。
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = _fake_agent(tmp, "claude")
+        mark = tmp / "keep.txt"
+        mark.write_text("")
+        proc = subprocess.Popen([str(fake), "-f", str(mark)] + argv_tail,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
+    def test_comm是claude且argv里有这个uuid才算命中(self):
+        proc = self._fake_claude([self.UUID])
+        _wait_argv(self, proc, self.UUID)
+        self.assertEqual(ca.find_agent_pid(ca.DEEPSEEK, self.UUID), proc.pid)
+
+    def test_不相干的claude进程不许命中(self):
+        # spec 判据 9 后半。用户机器上随时有别的 claude 在跑（他自己就在用原生的），
+        # 不按 uuid 比对的话 stop 会把 SIGINT 发到他正在用的那个会话上。
+        别人的 = "99999999-9999-9999-9999-999999999999"
+        proc = self._fake_claude([别人的])
+        _wait_argv(self, proc, 别人的)
+        self.assertIsNone(ca.find_agent_pid(ca.DEEPSEEK, self.UUID))
+
+    def test_uuid出现在brief正文里不算_必须是独立argv元素(self):
+        # 和 codex 侧那条同一个形状：brief 是最后一项，正文里完全可能提到别的
+        # 任务的 uuid。按子串匹配就成了误命中。
+        other = "88888888-8888-8888-8888-888888888888"
+        proc = self._fake_claude([self.UUID, f"请参考 {other} 那一轮的结论再动手"])
+        _wait_argv(self, proc, self.UUID)
+        self.assertEqual(ca.find_agent_pid(ca.DEEPSEEK, self.UUID), proc.pid)
+        self.assertIsNone(ca.find_agent_pid(ca.DEEPSEEK, other))
+
+    def test_comm不对就不算_codex的进程不会被当成deepseek的(self):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = _fake_agent(tmp, "codex")
+        mark = tmp / "keep.txt"
+        mark.write_text("")
+        proc = subprocess.Popen([str(fake), "-f", str(mark), self.UUID],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        _wait_argv(self, proc, self.UUID)
+        self.assertEqual(ca.find_agent_pid(ca.CODEX, self.UUID), proc.pid,
+                         "前提不成立：codex 那侧本来就该找得到")
+        self.assertIsNone(ca.find_agent_pid(ca.DEEPSEEK, self.UUID))
+
+
+class TestFindTaskAgentPid(_HomeSandbox):
+    """`find_task_agent_pid(runner, home, task)` —— needle 一律**从磁盘派生**。"""
+
+    def test_codex的needle是报告路径_元数据不在也查得到(self):
+        # 这条不能丢：元数据被手删、而上一轮的 codex 还占着会话时，
+        # 「元数据不在就放行」会让新一轮当场撞上它的写锁。
+        home = ca.ensure_isolation(ca.CODEX, "default")
+        report = ca._report_path(home, "t")
+        self.assertFalse(ca.meta_path(home, "t").exists(), "前提：这个任务没有元数据")
+        with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy:
+            self.assertEqual(ca.find_task_agent_pid(ca.CODEX, home, "t"), 4242)
+        spy.assert_called_once_with(ca.CODEX, report)
+
+    def test_deepseek的needle是元数据里的session_id(self):
+        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        meta = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
+        ca.write_meta(home, "t", meta)
+        with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy:
+            self.assertEqual(ca.find_task_agent_pid(ca.DEEPSEEK, home, "t"), 4242)
+        spy.assert_called_once_with(ca.DEEPSEEK, meta["session_id"])
+
+    def test_deepseek没有元数据就没有needle可查(self):
+        # 不对称，而且是外部约束造成的：codex 的 needle 由 (home, task) 派生，
+        # deepseek 的 session id 只住在元数据里。老实答「查不到」，不瞎猜。
+        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        with mock.patch.object(ca, "find_agent_pid", side_effect=AssertionError("不该问")):
+            self.assertIsNone(ca.find_task_agent_pid(ca.DEEPSEEK, home, "从来没有过的任务"))
+
+
+class TestWaitUsesOnDiskSessionId(_HomeSandbox):
+    """**承重。** `_wait_previous_round_ends` 要的是**上一轮**的 uuid。
+
+    run 的每一轮都铸新 uuid，拿本轮这个去找上一轮的进程**恒为 None**——
+    等待变成空操作，上一轮还在写、这一轮已经开跑，两个写者共写一份日志。
+    和 `_previous_writer_alive` 那条「绝不用传进来的 meta 参数」同一个道理。
+    """
+
+    def test_等的是磁盘上那一轮的uuid_不是本轮新铸的(self):
+        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        上一轮 = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
+        ca.write_meta(home, "t", 上一轮)
+        本轮 = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
+        self.assertNotEqual(上一轮["session_id"], 本轮["session_id"], "前提：两轮 uuid 不同")
+
+        问过的 = []
+
+        def 记下来(runner, needle):
+            问过的.append(needle)
+            return None
+
+        with mock.patch.object(ca, "find_agent_pid", side_effect=记下来):
+            ca._wait_previous_round_ends(ca.DEEPSEEK, home, "t", 0.05, 0.01)
+        self.assertIn(上一轮["session_id"], 问过的)
+        self.assertNotIn(本轮["session_id"], 问过的,
+                         "拿本轮新铸的 uuid 去找上一轮，恒为 None——等待变成空操作")
+
+
+class TestDeepseekTaskIsReachable(_HomeSandbox):
+    """spec 判据 11：`status` / `stop` 对 deepseek 任务全部有效。
+
+    只测到 `find_meta` 那一层是不够的——审查突变实测：把 `cmd_stop` / `cmd_status`
+    的 runner 化去掉（恒按 codex 反查），只测 `find_meta` 的那条照样绿。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # **不许写成 `self.home = …`**：`_HomeSandbox` 的 `Path.home()` patch 是
+        # `lambda: self.home`，盖掉它整个沙箱就指到隔离目录里去了（静默）。
+        self.d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.meta = ca.new_meta("dst", ca.DEEPSEEK, None, "/tmp", "max", ())
+        ca.write_meta(self.d, "dst", self.meta)
+
+    def test_status按deepseek反查_并列出这个任务(self):
+        out = io.StringIO()
+        with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy, \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(ca.cmd_status(argparse.Namespace(task="dst")), ca.EXIT["running"])
+        spy.assert_called_once_with(ca.DEEPSEEK, self.meta["session_id"])
+        self.assertIn("dst", out.getvalue())
+        self.assertIn("deepseek", out.getvalue(), "status 得看得出这个任务派给了谁")
+
+    def test_stop按deepseek反查_并真的发信号(self):
+        out = io.StringIO()
+        with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy, \
+             mock.patch.object(ca, "interrupt_codex") as kill, \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(ca.cmd_stop(argparse.Namespace(task="dst")), ca.EXIT["success"])
+        spy.assert_called_once_with(ca.DEEPSEEK, self.meta["session_id"])
+        self.assertEqual(kill.call_args[0][0], 4242)
+
+    def test_status的第二列不含空白_deepseek的account是None(self):
+        # account 是 None，`f"{None:<8}"` 会当场 TypeError；而这一列还是
+        # split(maxsplit=4) 的切分边界。两件事一起在这里钉住。
+        row = ca.status_row(self.meta, ca.Verdict("success", "正常收尾", []))
+        self.assertEqual(len(row.split(maxsplit=4)), 5)
+        self.assertEqual(row.split()[1], "deepseek")
+        codex_row = ca.status_row(_full_meta("t", account="acct2"),
+                                  ca.Verdict("success", "正常收尾", []))
+        self.assertEqual(codex_row.split()[1], "codex:acct2")
+
+
 class TestFixedArgs(unittest.TestCase):
     """两条命令都必须带上的固定参数。
 
@@ -1972,7 +2409,7 @@ class TestMetaShape(_HomeSandbox):
         self.assertIn("dir", self.FIELDS)
         self.assertIn("session_id", self.FIELDS)
         # **codex** 的存活必须每次现查：存下来的 PID 会过期、会被系统复用，
-        # 而且它有现场特征可查（comm=codex + argv 里的报告路径），见 find_codex_pid。
+        # 而且它有现场特征可查（comm=codex + argv 里的报告路径），见 find_agent_pid。
         self.assertNotIn("pid", self.FIELDS)
         # **writer 是另一回事**，所以它有自己的名字：写日志的是包装器自己，
         # 「它还在不在写」没有任何现场特征。身份**成对**存——只存 PID 就退回
@@ -2068,7 +2505,7 @@ class TestMetaShape(_HomeSandbox):
         args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "high",
              "--skill", str(second)])
-        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
         meta = json.loads(ca.meta_path(d, "t").read_text())
         self.assertEqual(meta["skills"], [str(second)], "skills 没跟着 effort 一起刷新")
@@ -2084,7 +2521,7 @@ class TestMetaShape(_HomeSandbox):
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
              "--skill", str(skill)])
-        with _no_codex(), mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_interrupt_and_resume(args)
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
@@ -2303,7 +2740,7 @@ class TestPid(unittest.TestCase):
         # 没法真拿别人的账号起进程，就反过来做：把「当前用户」换成别人，
         # 我们自己这个 comm=codex、argv 对得上的进程就该落选。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = _fake_codex(tmp)
+        fake = _fake_agent(tmp, "codex")
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
@@ -2311,9 +2748,9 @@ class TestPid(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_argv(self, proc, mark)
-            self.assertEqual(ca.find_codex_pid(mark), proc.pid)   # 前提：本来找得到
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, mark), proc.pid)   # 前提：本来找得到
             with mock.patch.object(ca.os, "getuid", return_value=os.getuid() + 12345):
-                self.assertIsNone(ca.find_codex_pid(mark))
+                self.assertIsNone(ca.find_agent_pid(ca.CODEX, mark))
         finally:
             proc.kill()
             proc.wait()
@@ -2327,7 +2764,7 @@ class TestPid(unittest.TestCase):
         proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", mark])
         try:
             _wait_argv(self, proc, mark)
-            self.assertIsNone(ca.find_codex_pid(mark))
+            self.assertIsNone(ca.find_agent_pid(ca.CODEX, mark))
         finally:
             proc.kill()
             proc.wait()
@@ -2335,7 +2772,7 @@ class TestPid(unittest.TestCase):
     def test_comm真是codex的进程会被找到_反向也要成立(self):
         # 只测"排除"的话，一个永远返回 None 的实现也能全绿。
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = _fake_codex(tmp)
+        fake = _fake_agent(tmp, "codex")
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
@@ -2343,7 +2780,7 @@ class TestPid(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_argv(self, proc, mark)
-            self.assertEqual(ca.find_codex_pid(mark), proc.pid)
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, mark), proc.pid)
         finally:
             proc.kill()
             proc.wait()
@@ -2357,7 +2794,7 @@ class TestPid(unittest.TestCase):
         所以比对必须是**元素相等**，不是子串包含。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = _fake_codex(tmp)
+        fake = _fake_agent(tmp, "codex")
         (tmp / "reports").mkdir()
         mine = str(tmp / "reports" / "mine.md")
         others = str(tmp / "reports" / "others.md")
@@ -2367,8 +2804,8 @@ class TestPid(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_argv(self, proc, brief)
-            self.assertEqual(ca.find_codex_pid(mine), proc.pid)   # 前提：自己找得到自己
-            self.assertIsNone(ca.find_codex_pid(others))
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, mine), proc.pid)   # 前提：自己找得到自己
+            self.assertIsNone(ca.find_agent_pid(ca.CODEX, others))
         finally:
             proc.kill()
             proc.wait()
@@ -2382,7 +2819,7 @@ class TestPid(unittest.TestCase):
         补这条测试就是给它一个家。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = _fake_codex(tmp)
+        fake = _fake_agent(tmp, "codex")
         (tmp / "reports").mkdir()
         mark = str(tmp / "reports" / "t.md")
         pathlib.Path(mark).write_text("")
@@ -2390,7 +2827,7 @@ class TestPid(unittest.TestCase):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_argv(self, proc, mark)
-            self.assertEqual(ca.find_codex_pid(mark), proc.pid, "前提不成立：活着时就找不到它")
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, mark), proc.pid, "前提不成立：活着时就找不到它")
             proc.kill()
             _wait_zombie(self, proc.pid)
             self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/comm").read_bytes().strip(), b"codex",
@@ -2399,7 +2836,7 @@ class TestPid(unittest.TestCase):
                              "前提不成立：僵尸的 cmdline 不空，这条测的就不是那件事")
             self.assertTrue(ca.pid_alive(proc.pid),
                             "前提不成立：裸 PID 对僵尸都说「死了」，那它本来就挡得住")
-            self.assertIsNone(ca.find_codex_pid(mark))
+            self.assertIsNone(ca.find_agent_pid(ca.CODEX, mark))
         finally:
             proc.kill()
             proc.wait()
@@ -2416,7 +2853,7 @@ class TestPid(unittest.TestCase):
         所以反查必须是 **argv 精确元素匹配**，不能有任何正则语义。
         """
         tmp = pathlib.Path(tempfile.mkdtemp())
-        fake = _fake_codex(tmp)
+        fake = _fake_agent(tmp, "codex")
         (tmp / "reports").mkdir()
         victim = str(tmp / "reports" / "aXmd.md")   # 任务 aXmd 的报告路径
         hunter = str(tmp / "reports" / "a.md")      # 任务 a 的报告路径
@@ -2426,8 +2863,8 @@ class TestPid(unittest.TestCase):
         try:
             _wait_argv(self, proc, victim)
             # 前提：它找得到自己，否则下面那条断言是空的
-            self.assertEqual(ca.find_codex_pid(victim), proc.pid)
-            self.assertIsNone(ca.find_codex_pid(hunter))
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, victim), proc.pid)
+            self.assertIsNone(ca.find_agent_pid(ca.CODEX, hunter))
         finally:
             proc.kill()
             proc.wait()
@@ -2446,7 +2883,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
     OWNED_BY_CODE = {
         r"--cd": "build_run_argv / build_resume_argv",
         r"/dev/null|DEVNULL": "run_codex 的 stdin=subprocess.DEVNULL",
-        r"/proc|pgrep|pkill": "find_codex_pid / _previous_writer_alive",
+        r"/proc|pgrep|pkill": "find_agent_pid / _previous_writer_alive",
         r"kill -INT|SIGTERM|SIGINT": "run_codex 的信号转发 + cmd_stop",
         r"mkdir -p": "ensure_isolation",
         r"--color": "build_run_argv（resume 不认它）",
@@ -2994,7 +3431,7 @@ class TestRunGuards(_HomeSandbox):
         ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
         """
         ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t", _full_meta("t"))
-        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
         message = cm.exception.message
@@ -3075,7 +3512,7 @@ class TestRunGuards(_HomeSandbox):
         # 日志是追加的，历史不丢。
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex() as popen:
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
         self.assertTrue(popen.called, "同账号、已结束的同名任务被拒了，它应该允许复用")
 
@@ -3464,11 +3901,11 @@ class TestAutoAccountPick(_HomeSandbox):
         之后 `reject` ——任务从 status / stop / resume 三条路上整个消失。
 
         入口那道闸原本只查 `old_home`，查不到选中的那个 home 上的 codex。
-        为什么查 `find_codex_pid` 就够（而不必把整个 `_wait_previous_round_ends`
+        为什么查 `find_agent_pid` 就够（而不必把整个 `_wait_previous_round_ends`
         搬出来）：能走到迁移，说明 `find_meta` 只数出**一份**元数据（两份它当场拒），
         于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
         `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
-        就只剩 `find_codex_pid` 这一条。
+        就只剩 `find_agent_pid` 这一条。
         """
         ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
@@ -3476,10 +3913,10 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(ca.accounts_by_availability()[0], "acct2",
                          "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
 
-        def 只有acct2上有活的(report_path):
-            return 4242 if report_path == 选中的报告 else None
+        def 只有acct2上有活的(runner, home, task):
+            return 4242 if ca._report_path(home, task) == 选中的报告 else None
 
-        with mock.patch.object(ca, "find_codex_pid", 只有acct2上有活的):
+        with mock.patch.object(ca, "find_task_agent_pid", 只有acct2上有活的):
             with self.assertRaises(ca.Rejected) as got:
                 ca.cmd_run(self._args(ca.AUTO))
         self.assertIn("还在跑", got.exception.message)
@@ -3533,7 +3970,7 @@ class TestResumeGuards(_HomeSandbox):
     def test_还在跑就拒绝resume_写锁冲突和SIGTERM锁死长得一样(self):
         ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t",
                       _full_meta("t", session_id="s1", dir=str(self.workdir)))
-        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t"))
         self.assertIn("还在跑", cm.exception.message)
@@ -3541,7 +3978,7 @@ class TestResumeGuards(_HomeSandbox):
     def test_没有session_id就拒绝(self):
         ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t2",
                       _full_meta("t2", dir=str(self.workdir)))
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t2"))
         self.assertIn("session id", cm.exception.message)
@@ -3551,7 +3988,7 @@ class TestResumeGuards(_HomeSandbox):
         # 和 `--cd` 给相对路径同款症状，而 run 那条路是被人话拒绝的
         ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t4",
                       _full_meta("t4", session_id="s1", dir=str(self.home / "已经删了的worktree")))
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t4"))
         self.assertIn("不在了", cm.exception.message)
@@ -3565,7 +4002,7 @@ class TestResumeGuards(_HomeSandbox):
         ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
         (d / "config.toml").unlink()
         (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t5"))
         self.assertIn("软链", cm.exception.message)
@@ -3575,7 +4012,7 @@ class TestResumeGuards(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t6", _full_meta("t6", session_id="s1", dir=str(self.workdir),
                                           started_at="2020-01-01T00:00:00"))
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
             ca.cmd_resume(self._args("t6"))
         meta = json.loads(ca.meta_path(d, "t6").read_text())
         self.assertNotEqual(meta["started_at"], "2020-01-01T00:00:00")
@@ -3584,7 +4021,7 @@ class TestResumeGuards(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
         (d / "reports" / "t3.md").write_text("上一轮的报告")
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), _no_codex():
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
             ca.cmd_resume(self._args("t3"))
         self.assertFalse((d / "reports" / "t3.md").exists())
 
@@ -3621,7 +4058,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_在跑时顺序是先打断再续跑(self):
         order = []
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex",
                                side_effect=lambda *a: order.append("打断")), \
              mock.patch.object(ca, "_resume_round",
@@ -3631,7 +4068,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
     def test_没在跑时不发信号直接续跑(self):
         # 调用方无法可靠知道自己在哪种情况——查完到动手之间任务可能刚好跑完
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca, "_resume_round", return_value=0):
             self.assertEqual(ca.cmd_interrupt_and_resume(self._args()), 0)
@@ -3643,7 +4080,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         # 「收到 INT 后 60 秒还没退出」——指错方向。等待搬进 run_codex 之后，
         # 这几条闸测试一个 mock 都不需要：它们在 _resume_round 之前就拒绝了。
         ca.write_meta(self.d, "t2", _full_meta("t2", dir=str(self.workdir)))
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -3664,7 +4101,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         ca.write_meta(self.d, "t9", _full_meta("t9", session_id="s9", dir=str(self.workdir)))
         bad = self.home / "自带兜底句.md"
         bad.write_text("**不得使用任何 skill。**\n\n顺便把 X 也改了")
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -3677,7 +4114,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
     def test_工作目录没了时绝不发信号(self):
         ca.write_meta(self.d, "t3", _full_meta("t3", session_id="s3",
                                                dir=str(self.home / "已经删了的worktree")))
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -3687,7 +4124,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         k.assert_not_called()
 
     def test_brief不是文件时绝不发信号(self):
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k:
             with self.assertRaises(ca.Rejected) as cm:
@@ -3714,7 +4151,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         """
         with open(ca._log_path(self.d, "t"), "a") as f:
             f.write(ca.INTERRUPT_MARK + "\n")
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca.os, "kill") as k, \
              mock.patch.object(ca, "_resume_round", return_value=0):
@@ -3732,7 +4169,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
                        + ca.INTERRUPT_MARK + "\n"
                        + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净\n")
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "interrupt_codex") as ic, \
              mock.patch.object(ca, "_resume_round", return_value=0):
             ca.cmd_interrupt_and_resume(self._args())
@@ -3744,7 +4181,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
     def test_日志分隔符写的是interrupt_and_resume_而不是resume(self):
         # 日志要看得出这一轮是被插话打断后续上的
         seen = {}
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              mock.patch.object(ca, "run_codex",
                                side_effect=lambda kind, *a, **k: seen.update(kind=kind) or 0), \
              mock.patch.object(ca, "judge", return_value=ca.Verdict("success", "ok", [])):
@@ -3822,7 +4259,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "low",
              "--skill", str(self.skill)])
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -3834,7 +4271,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
              "--no-skill"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(
                 lambda: ca.cmd_interrupt_and_resume(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
@@ -3871,7 +4308,9 @@ class TestStatusIsSplittable(_HomeSandbox):
                             ca.Verdict("failed", self.REASON_WITH_SPACES, []))
         self.assertGreater(len(self.REASON_WITH_SPACES.split()), 1,
                            "前提不成立：reason 不含空格的话，这条根本测不到东西")
-        self.assertEqual(row.split(maxsplit=4)[:4], ["t1", "default", "failed", "1"])
+        # 第二列是「派给谁跑」：codex 连账号一起说，deepseek 没有账号维度就只有
+        # runner 名。**复用第二列而不是加第五列**，正是为了不动 maxsplit=4 这条契约。
+        self.assertEqual(row.split(maxsplit=4)[:4], ["t1", "codex:default", "failed", "1"])
 
     def test_第五段是工作目录加reason_dir含空格也切得开(self):
         row = ca.status_row(_full_meta("t1", dir="/abs/my repo"),
@@ -3897,7 +4336,7 @@ class TestStatusIsSplittable(_HomeSandbox):
                                         + "\n" + ERR_FATAL + "\n")
         ca._report_path(d, "t").write_text("干完了\n")
         screen = io.StringIO()
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(screen):
             ca.cmd_status(ca.build_parser().parse_args(["status"]))
         lines = [l for l in screen.getvalue().splitlines() if l]
@@ -3905,7 +4344,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         detail = [l for l in lines if l[0].isspace()]
         self.assertEqual(len(data), 1, f"数据行不止一行：{lines}")
         self.assertTrue(detail, "前提不成立：这一轮没有明细行，那这条测不到可分性")
-        self.assertEqual(data[0].split(maxsplit=4)[:3], ["t", "default", "suspect"])
+        self.assertEqual(data[0].split(maxsplit=4)[:3], ["t", "codex:default", "suspect"])
 
     def test_reason含制表符时当场拒绝(self):
         with self.assertRaises(ca.Rejected) as cm:
@@ -3964,14 +4403,14 @@ class TestStatusIsSplittable(_HomeSandbox):
                 ca.round_separator("run", name, "2026-09-19T00:00:00") + "\n"
                 + ca.INTERRUPT_MARK + "\n")
         screen = io.StringIO()
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(screen):
             ca.cmd_status(ca.build_parser().parse_args(["status"]))
         data = [l for l in screen.getvalue().splitlines() if l and not l[0].isspace()]
         self.assertEqual([l.split(maxsplit=4)[0] for l in data], ["alpha", "beta"])
         for line in data:
             with self.subTest(line=line):
-                self.assertEqual(line.split(maxsplit=4)[1:4], ["default", "interrupted", "130"])
+                self.assertEqual(line.split(maxsplit=4)[1:4], ["codex:default", "interrupted", "130"])
                 tail = line.split(maxsplit=4)[4]
                 self.assertTrue(tail.startswith("/abs/repo"), tail)
                 self.assertIn(" ", tail[len("/abs/repo"):].strip(),
@@ -4022,7 +4461,7 @@ class TestExitCodeContract(_HomeSandbox):
     def _resume(self, report_text, log_extra=""):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
-        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with _no_codex() as popen, mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
             return ca.cmd_resume(self._resume_args())
 
@@ -4061,7 +4500,7 @@ class TestExitCodeContract(_HomeSandbox):
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
              "--no-skill"])
         # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
-        with _no_codex() as popen, mock.patch.object(ca, "find_codex_pid", return_value=None):
+        with _no_codex() as popen, mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
             return ca.cmd_interrupt_and_resume(args)
 
@@ -4090,7 +4529,7 @@ class TestExitCodeContract(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         args = ca.build_parser().parse_args(["status", "t"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=99999):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             self.assertEqual(ca.cmd_status(args), 4)
 
     def test_status_一个任务都没有时退出0_查询没查到不是失败(self):
@@ -4432,7 +4871,7 @@ class TestInterruptCodex(unittest.TestCase):
         self._assert_appended("只发 INT 这条路")
 
     def test_刻意不给返回值(self):
-        """「它本来就没在跑」由调用方在**调用之前**用 find_codex_pid 判，
+        """「它本来就没在跑」由调用方在**调用之前**用 find_agent_pid 判，
         那才是判它的地方。给个 bool 出来，就多出一个「谁检查」的滥用面。
         """
         with mock.patch.object(ca.os, "kill"):
@@ -4443,7 +4882,7 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
     """「上一轮结束了没有」＝**两个都停了**，缺一不可。
 
         还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
-        会话还被占着吗   find_codex_pid           现场反查
+        会话还被占着吗   find_agent_pid           现场反查
 
     只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
     argv 比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上**孤儿 codex**：
@@ -4459,7 +4898,7 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
 
     def test_没有上一轮就直接放行(self):
         self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
-        self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+        self.assertTrue(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 5, 0.01))
 
     def test_没有元数据但codex还在跑_不许放行(self):
         """「文件不在就直接放行」是**多余且开洞**的。
@@ -4470,37 +4909,37 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
         它的写锁。两个条件一个都不能少，没有「文件不在」这条例外。
         """
         self.assertFalse(ca.meta_path(self.d, "t").exists(), "前提不成立：元数据居然已经在了")
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242):
-            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242):
+            self.assertFalse(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.3, 0.01))
 
     def test_两个都停了才放行(self):
         self._写盘()
         self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立：默认身份居然还在写")
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 5, 0.01))
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            self.assertTrue(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 5, 0.01))
 
     def test_上一轮的writer还在写就等到超时(self):
         # **突变锁：只等 codex。** 只看 codex 的话这里会立刻放行——那正是病根本身。
         self._写盘(**_live_writer(self))
         self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            self.assertFalse(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.3, 0.01))
 
     def test_孤儿codex_writer没了codex还在_不许放行(self):
         # **突变锁：只等 writer。** SIGKILL 掉包装器之后 codex 会存活并跑完（实测），
         # 只看包装器就会放行，续跑撞上它的写锁。
         self._写盘()
         self.assertFalse(ca._previous_writer_alive(self.d, "t"), "前提不成立")
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242):
-            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242):
+            self.assertFalse(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.3, 0.01))
 
     def test_codex早变僵尸而writer还在排干时必须继续等(self):
         """**本次回归锁**，整条链一起验：真起一个 comm=codex、argv 对得上的陪练，
-        杀掉但不回收 → 它是僵尸、`cmdline` 已空 → `find_codex_pid` 判 None，
+        杀掉但不回收 → 它是僵尸、`cmdline` 已空 → `find_agent_pid` 判 None，
         而上一轮的 writer 还在写 → 必须继续等到超时。
         """
         (self.d / "reports").mkdir(exist_ok=True)
-        fake = _fake_codex(self.d)
+        fake = _fake_agent(self.d, "codex")
         report = ca._report_path(self.d, "t")
         report.write_text("")
         # 陪练身份要在起僵尸**之前**拿：_live_writer 会建 Popen，而 Popen.__init__
@@ -4510,15 +4949,15 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             _wait_argv(self, proc, str(report))
-            self.assertEqual(ca.find_codex_pid(report), proc.pid, "前提不成立：活着时就找不到它")
+            self.assertEqual(ca.find_agent_pid(ca.CODEX, report), proc.pid, "前提不成立：活着时就找不到它")
             proc.kill()
             _wait_zombie(self, proc.pid)
             self.assertEqual(pathlib.Path(f"/proc/{proc.pid}/cmdline").read_bytes(), b"",
                              "前提不成立：僵尸的 cmdline 不空，那 argv 过滤就不是免费做对的")
-            self.assertIsNone(ca.find_codex_pid(report), "前提不成立：僵尸居然还被当成在跑")
+            self.assertIsNone(ca.find_agent_pid(ca.CODEX, report), "前提不成立：僵尸居然还被当成在跑")
             self._写盘(**写者)
             self.assertTrue(ca._previous_writer_alive(self.d, "t"), "前提不成立：陪练居然不算在写")
-            self.assertFalse(ca._wait_previous_round_ends(self.d, "t", 0.3, 0.01))
+            self.assertFalse(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.3, 0.01))
         finally:
             proc.kill()
             proc.wait()
@@ -4527,16 +4966,16 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
         # 超时的正确处置是告诉调用方稍后再来，不是加大火力。
         # 升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
         self._写盘()
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
-            ca._wait_previous_round_ends(self.d, "t", 0.05, 0.01)
+            ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.05, 0.01)
         k.assert_not_called()
 
     def test_等到了就立刻走_不把超时睡满(self):
         self._写盘()
         started = time.monotonic()
-        with mock.patch.object(ca, "find_codex_pid", return_value=None):
-            self.assertTrue(ca._wait_previous_round_ends(self.d, "t", 30, 0.01))
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+            self.assertTrue(ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 30, 0.01))
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_真要等的时候先说一句_否则run变成静默挂起(self):
@@ -4549,9 +4988,9 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
         """
         self._写盘(**_live_writer(self))
         buf = io.StringIO()
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(buf):
-            ca._wait_previous_round_ends(self.d, "t", 0.15, 0.01)
+            ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 0.15, 0.01)
         self.assertIn("上一轮还在收尾", buf.getvalue())
 
     def test_不用等的时候一个字都不说(self):
@@ -4559,9 +4998,9 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
         # （上一轮早就结束了），而假话说多了人就不看了。
         self._写盘()
         buf = io.StringIO()
-        with mock.patch.object(ca, "find_codex_pid", return_value=None), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(buf):
-            ca._wait_previous_round_ends(self.d, "t", 5, 0.01)
+            ca._wait_previous_round_ends(ca.CODEX, self.d, "t", 5, 0.01)
         self.assertEqual(buf.getvalue(), "")
 
     def test_两个常量的绝对值(self):
@@ -4609,7 +5048,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
                              "前提不成立：参数那份记的进程不在，突变就不会卡住")
         started = time.monotonic()
         with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
-             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex():
             ca.run_codex("run", self.d, "t", 活的, lambda r: ["codex"])
         self.assertLess(time.monotonic() - started, 0.3,
@@ -4624,7 +5063,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
         挡住它的是 `_previous_writer_alive` 里「本进程不算」那一行。
         """
         with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
-             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex():
             ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
             落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
@@ -4646,7 +5085,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
         日志.write_text("旧日志\n")
         旧元数据 = ca.meta_path(self.d, "t").read_text()
         with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
-             mock.patch.object(ca, "find_codex_pid", return_value=None), \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex() as popen:
             with self.assertRaises(ca.Rejected) as cm:
                 ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
@@ -4668,7 +5107,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
             with self.subTest(kind=kind):
                 ca.write_meta(self.d, "t", _full_meta("t", **陪练))
                 with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
-                     mock.patch.object(ca, "find_codex_pid", return_value=None), \
+                     mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
                      _no_codex():
                     with self.assertRaises(ca.Rejected) as cm:
                         ca.run_codex(kind, self.d, "t", _full_meta("t"), lambda r: ["codex"])
@@ -4691,7 +5130,7 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
         head = ROUND_SEP_SAMPLE + "\nsession id: 01a0b408-f718-7ff3-8123-d5202551acba\n"
         log.write_text(head)
         args = ca.build_parser().parse_args(["stop", "t"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
         k.assert_called_once_with(4242, signal.SIGINT)
@@ -4757,7 +5196,7 @@ class TestStop(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         args = ca.build_parser().parse_args(["stop", "t"])
-        with mock.patch.object(ca, "find_codex_pid", return_value=4242), \
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
         k.assert_called_once_with(4242, signal.SIGINT)
