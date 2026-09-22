@@ -113,18 +113,20 @@ import codex_sub_agent as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
-# 弯引号版本。**codex 实际输出的就是这个**（U+2019），2026-09-22 对 268 份日志
-# 全量核对：27 份日志、54 行真·额度错误，无一例外是弯引号。上面那条直引号版本
-# 留着不是历史包袱——两条一起跑，测的是「判据对引号免疫」这个性质。
+# 弯引号版本。**codex 实际输出的就是这个**（U+2019），2026-09-22 对 269 份日志
+# 全量核对（2026-09-23 复核同数）：56 行真·额度错误 / 28 份，无一例外是弯引号。
+# 上面那条直引号版本留着不是历史包袱——两条一起跑，测的是「判据对引号免疫」
+# 这个性质。
 ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
 # **未经我手的真实字节。** 上面两条都是我敲出来的，而第 8 种空测试形态的成因
 # 正是「fixture 经过了我的手」——我敲的引号和源码常量里的引号共享同一个假设。
 # 这一行是 2026-09-22 从 /home/xy/.codex-subagent-acct3/logs/audit-should-exist-2.log 逐字节拷出来的，
 # 没有经过任何转写。判据要是再一次押在某个会变的字符上，这条第一个红。
 ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 25th, 2026 5:04 PM.'
-# **第二种真实形态：只有时刻，没有日期。** 2026-09-22 全量核对现网日志时发现的，
-# spec 和计划都没写到它：29 份带额度错误的日志里，11 份是这个形状（共 22 行，
-# 占真实消息的 39%），来自 Plus 账号的 5 小时档。
+# **第二种真实形态：只有时刻，没有日期。** 2026-09-22 全量核对现网日志时发现的
+# ——设计文档最初只写了带日期那一种，是普查把它挖出来的：29 份带额度错误的日志里，
+# 11 份是这个形状（共 22 行，占真实消息的 39%），来自 Plus 账号的 5 小时档。
+# **教训本身比数字值钱：形态清单要从现网语料里数出来，不能从一两条样本里想出来。**
 # 歧义（4:02 是今天还是明天）只在**读到这条消息的那一刻**存在，而消息说的是
 # "try again **at**"——未来，所以 `parse_reset_time` 取 >= now 的下一个该时刻。
 # 时钟只在那一处读一次，排序（`accounts_by_availability`）一次都不读。
@@ -766,7 +768,9 @@ class TestJudge(unittest.TestCase):
 
     def test_撞额度上限_直引号和弯引号和真实字节都要认(self):
         # 判据要是押在某一个引号字符上，换一个就全瞎——2026-09-22 之前正是这样：
-        # 常量写的是 ASCII 直引号，现网 54 行额度错误全是弯引号，这条特判死了一个版本。
+        # 常量写的是 ASCII 直引号，现网 56 行额度错误全是弯引号，这条特判死了一个版本。
+        # 而 fixture 当时也是我敲的直引号，两边共享同一个错假设，测试照常绿
+        # （模块头第 8 种空测试形态）。所以这里的第三个 case 是**未经我手的字节**。
         for name, text in (("直引号", ERR_USER_LAYER),
                            ("弯引号", ERR_USER_LAYER_CURLY),
                            ("真实字节", ERR_USER_LAYER_REAL)):
@@ -1056,10 +1060,22 @@ class TestParseResetTime(unittest.TestCase):
         self.assertEqual(got[0], datetime.datetime(2026, 9, 22, 11, 10), "同一天的晚些时候")
         self.assertEqual(got[1], "11:10 AM")
 
-    def test_只有时刻_已经过了就算明天(self):
-        now = datetime.datetime(2026, 9, 22, 15, 0)
-        got = ca.parse_reset_time("or try again at 11:10 AM.", now=now)
-        self.assertEqual(got[0], datetime.datetime(2026, 9, 23, 11, 10))
+    def test_只有时刻_已经过了就算明天_跨月跨年也要对(self):
+        """「+1 天」不许自己拿 `day + 1` 拼——那在月末年末会造出 9 月 31 日。
+
+        实现用的是 `timedelta(days=1)`，日历进位归标准库。这三个 case 钉的就是
+        「进位没被自己实现一遍」：月末、年末各一条，删掉 timedelta 改成手拼当场红。
+        """
+        for name, now, want in (
+                ("同月内跨到明天", datetime.datetime(2026, 9, 22, 15, 0),
+                 datetime.datetime(2026, 9, 23, 11, 10)),
+                ("跨月", datetime.datetime(2026, 9, 30, 15, 0),
+                 datetime.datetime(2026, 10, 1, 11, 10)),
+                ("跨年", datetime.datetime(2026, 12, 31, 15, 0),
+                 datetime.datetime(2027, 1, 1, 11, 10))):
+            with self.subTest(情形=name):
+                got = ca.parse_reset_time("or try again at 11:10 AM.", now=now)
+                self.assertEqual(got[0], want)
 
     def test_只有时刻_正好等于now就算今天(self):
         # 边界：消息说 at 11:10，此刻正好 11:10，那就是现在，不是明天
@@ -1293,7 +1309,10 @@ class TestUsageLimitFile(unittest.TestCase):
 
     def test_写盘失败不许把调用方打断_但也不许静默(self):
         """记录是优化，不是前提：写不进去最多让下次排序少一条依据，
-        **绝不能把正在进行的重试打断**——那会让一次本可以换号救回来的任务直接死掉。
+        **绝不能把本轮的收尾打断**——判结论、印报告/日志路径、返回退出码都排在
+        它后面，抛出去的话调用方连「这一轮到底怎么了」都拿不到。
+        （v1~v3 这里写的是「不能把正在进行的重试打断」。v4 没有轮内重试了，
+        但这条约束原样成立，只是被保护的对象从「下一次尝试」变成了「本轮的收尾」。）
 
         约束做在函数自己身上，不是做在调用方的记性上。调用方每多一个就要记得
         包一层 try，而「必须记得」正是这个工具存在的理由本身（铁律 2）。
@@ -3031,7 +3050,9 @@ class TestAutoAccountPick(_HomeSandbox):
     LIMIT_LINE = ("ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
                   "settings/usage to purchase more credits or try again at "
                   "Sep 25th, 2026 5:04 PM.\n")
-    # 命中额度字样却没有时间的一行。现网见得到，但那是污染不是形态（见 spec 第三节）。
+    # 命中额度字样却没有时间的一行。现网见得到（2 行 / 1 份），但**那是污染不是
+    # 形态**——出自本项目自己的日志，codex 把报告正文引了进来；OpenAI 的两种真消息
+    # 都带时间。来源不改变这里该怎么做：解析不出就不落盘（见 usage_limit_reset）。
     NO_TIME = "ERROR: You’ve hit your usage limit\n"
     BROKEN = "Error: 代码写错了\n"
     FINE = "一切正常\n"
