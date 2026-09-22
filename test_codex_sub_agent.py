@@ -114,7 +114,7 @@ import codex_sub_agent as ca
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
 # 弯引号版本。**codex 实际输出的就是这个**（U+2019），2026-09-22 对 269 份日志
-# 全量核对（2026-09-23 复核同数）：56 行真·额度错误 / 28 份，无一例外是弯引号。
+# 全量核对：56 行真·额度错误 / 28 份，无一例外是弯引号。
 # 上面那条直引号版本留着不是历史包袱——两条一起跑，测的是「判据对引号免疫」
 # 这个性质。
 ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
