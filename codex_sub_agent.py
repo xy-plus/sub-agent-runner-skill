@@ -538,11 +538,21 @@ def write_usage_limit(home, reset_at, raw):
     `raw` 是审计线索：解析错了（时区、OpenAI 改文案）一眼看得出，不用翻日志。
     **没有 `seen_at`**——唯一的读者是排序，排序只看 `reset_at`；
     没有消费者的字段一旦加进去就再也删不掉了。
+
+    **写不进去只提示、不抛。** 这条记录是优化不是前提：写失败最多让下次排序少
+    一条依据，而抛出去会把**正在进行的换号重试打断**——一次本来还能被下一个
+    账号救回来的任务就这么死了。吞在这里而不是留给调用方包 try：调用方每多
+    一个就要记得包一层，而「必须记得」正是这个工具存在的理由本身。
+    吞掉但**出声**——静默失效是这个仓库反复在修的那类病。
     """
     tmp = _usage_limit_tmp(home, os.getpid())
-    tmp.write_text(json.dumps({"reset_at": reset_at.isoformat(), "raw": raw},
-                              ensure_ascii=False, indent=2))
-    os.replace(tmp, usage_limit_path(home))
+    try:
+        tmp.write_text(json.dumps({"reset_at": reset_at.isoformat(), "raw": raw},
+                                  ensure_ascii=False, indent=2))
+        os.replace(tmp, usage_limit_path(home))
+    except OSError as e:
+        print(f"[codex-sub-agent] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
+              f"不影响本轮，只是下次排账号顺序时少一条依据。")
 
 
 def read_usage_limit(home):
@@ -551,12 +561,25 @@ def read_usage_limit(home):
     **坏了返回 `None` 是刻意的**：调用方把 `None` 当成「无记录＝排最前＝照样会被
     试到」，那是安全的一边。反过来（读不出来就认定它还在限流）会把一个可用账号
     锁死，而调用方看不出原因——那正是本工具反复在修的那类谎。
+
+    有效的形状**只有一种**：两个键都在、`raw` 是字符串、`reset_at` 是**朴素**
+    ISO 串。剩下全部当没记录——**「像是对的」那两种才是会咬人的**：
+
+      带时区的 `reset_at`  `accounts_by_availability` 里要拿它和 `datetime.min`
+                           （朴素）比，实测 `TypeError: can't compare offset-naive
+                           and offset-aware datetimes`，一个手写坏的状态文件
+                           把整条 auto 命令打死。而按设计它最坏只该让顺序排差
+      缺 `raw` / 类型不对   不是本函数写出来的东西。审计线索没了就查不出解析
+                           错在哪，而这份记录的可信度本来就全靠它
     """
     try:
         got = json.loads(usage_limit_path(home).read_text())
-        return datetime.datetime.fromisoformat(got["reset_at"])
+        if not isinstance(got["raw"], str):
+            return None
+        when = datetime.datetime.fromisoformat(got["reset_at"])
     except (OSError, ValueError, TypeError, KeyError):
         return None
+    return None if when.tzinfo is not None else when
 
 
 def extract_session_id(log_text):

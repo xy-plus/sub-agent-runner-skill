@@ -1021,20 +1021,57 @@ class TestUsageLimitFile(unittest.TestCase):
         self.assertEqual(json.loads(ca.usage_limit_path(self.home).read_text())["raw"],
                          "Sep 25th, 2026 5:04 PM")
 
-    def test_四种读失败都退化成无记录(self):
+    def test_读不出一条有效记录时一律退化成无记录(self):
         # 读不出来就当「没有记录」＝排最前＝照样会被试到，那是安全的一边。
         # 反过来（读不出来就认定还在限流）会把可用账号锁死且调用方看不出原因。
+        # 有效的形状只有一种：两个键都在、reset_at 是朴素 ISO 串、raw 是字符串。
+        # 剩下全部无效——**包括「像是对的」那几种**，那几种才是会咬人的。
         q = ca.usage_limit_path(self.home)
         for name, content in (("文件不存在", None),
                               ("坏 json", "{不是 json"),
-                              ("缺键", '{"raw": "x"}'),
-                              ("时间串坏了", '{"reset_at": "昨天", "raw": "x"}')):
+                              ("整个不是对象", '"就一个字符串"'),
+                              ("缺 reset_at", '{"raw": "x"}'),
+                              ("缺 raw", '{"reset_at": "2026-09-25T17:04:00"}'),
+                              ("raw 类型不对", '{"reset_at": "2026-09-25T17:04:00", "raw": 5}'),
+                              ("reset_at 类型不对", '{"reset_at": 20260925, "raw": "x"}'),
+                              ("时间串坏了", '{"reset_at": "昨天", "raw": "x"}'),
+                              ("带时区", '{"reset_at": "2026-09-25T17:04:00+08:00", "raw": "x"}')):
             with self.subTest(情形=name):
                 if content is None:
                     q.unlink(missing_ok=True)
                 else:
                     q.write_text(content)
                 self.assertIsNone(ca.read_usage_limit(self.home))
+
+    def test_带时区的记录不许放行_否则排序当场炸(self):
+        """上一条只说「带时区＝无效」，这条说**为什么**。
+
+        `reset_at` 存的是**朴素**本地时间（`parse_reset_time` 刻意不编造时区）。
+        放行一个 aware 值，排序里 `read_usage_limit(home) or datetime.min`
+        就会拿 aware 和 naive 比——实测
+        `TypeError: can't compare offset-naive and offset-aware datetimes`，
+        一个手写坏的状态文件把整条 auto 命令打死。而按设计，状态文件最坏
+        只该让顺序排差。
+        """
+        ca.usage_limit_path(self.home).write_text(
+            '{"reset_at": "2026-09-25T17:04:00+08:00", "raw": "x"}')
+        got = ca.read_usage_limit(self.home)
+        # 这一行就是排序里那个表达式。放行 aware 值时它 TypeError，不是 assert 失败。
+        self.assertLess(got or datetime.datetime.min, datetime.datetime(2026, 1, 1))
+
+    def test_写盘失败不许把调用方打断_但也不许静默(self):
+        """记录是优化，不是前提：写不进去最多让下次排序少一条依据，
+        **绝不能把正在进行的重试打断**——那会让一次本可以换号救回来的任务直接死掉。
+
+        约束做在函数自己身上，不是做在调用方的记性上。调用方每多一个就要记得
+        包一层 try，而「必须记得」正是这个工具存在的理由本身（铁律 2）。
+        吞掉但**出声**：静默失效是这个仓库反复在修的那类病。
+        """
+        gone = self.home / "这个目录不存在"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ca.write_usage_limit(gone, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertIn("codex-sub-agent", out.getvalue(), "写不进去要说一声，不许静默失效")
+        self.assertIsNone(ca.read_usage_limit(gone))
 
     def test_临时文件名带pid_两个并发写者不会互相污染(self):
         # **这条钉的是本文件和 write_meta 的关键区别。** usage_limit.json 是账号级的，
