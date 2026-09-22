@@ -137,7 +137,11 @@ def skill_path(value):
     return value
 
 
-USAGE_LIMIT_MARK = "You've hit your usage limit"
+# 判据**刻意不含 `You've` 那一截**。codex 输出的是弯引号 U+2019，源码里写的是 ASCII
+# 直引号——2026-09-22 之前两者对不上，这条特判死了整整一个版本，status 把撞上限的
+# 任务全报成「报告缺失或为空」。修法不是把直引号换成弯引号（那仍然押在一个会变的
+# 字符上），而是**把判据缩短到不含任何标点的那一段**：剩下全是字母和空格。
+USAGE_LIMIT_MARK = "hit your usage limit"
 THREAD_LOCK_MARK = "already has an active writer"
 REPORT_PREVIEW_LINES = 5
 
@@ -427,6 +431,25 @@ def runtime_error_lines(round_text):
     return hits
 
 
+def hit_usage_limit(error_lines):
+    """本轮是不是撞上了账号额度上限。
+
+    **收的是 `runtime_error_lines()` 的返回值，不是整轮日志文本。** 这是承重的：
+    日志里混着 brief 原文和 codex 转述的子进程输出（本文件 `_ERR_*` 上方那段注释
+    已经为同一个理由否掉了裸 grep ERROR）。2026-09-22 全量核对 268 份现网日志：
+    27 份里有 54 行真·额度错误，另有 3 份里 71 行只是**提到**这句话（brief 原文、
+    源码引用）。对整轮文本做子串匹配，后面那 71 行会被判成额度问题——而在
+    `cmd_run` 里，那意味着**删掉元数据、换账号重跑整个任务**。判据一旦成为
+    控制依据，证据就必须来自**已经分类过的错误行**。
+
+    **`judge` 和 `cmd_run` 共用这一个谓词。** 两处各写一套必然漂移，
+    而判据漂移正是本工具反复在修的那类 bug。`cmd_run` 为此要多跑一次
+    `runtime_error_lines`（实测 0.83MB 日志约 7.6ms，而 run 是分钟级的）——
+    不为省这 8ms 给 `Verdict` 加字段：那要改 7 个构造点，churn 比多一次扫描大。
+    """
+    return any(USAGE_LIMIT_MARK in line for line in error_lines)
+
+
 def extract_session_id(log_text):
     m = _SESSION_ID.search(strip_ansi(log_text))
     return m.group(1) if m else None
@@ -500,7 +523,7 @@ def judge(round):
     if not report_text.strip():
         # 两种特判只改 reason、不新增状态：补救手段不同（换账号／新起任务），
         # 但都属于「没正常收尾」这一种事实，状态机不该为此变复杂。
-        if USAGE_LIMIT_MARK in round_text:
+        if hit_usage_limit(errors):
             return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
         if THREAD_LOCK_MARK in round_text:
             return Verdict("failed",

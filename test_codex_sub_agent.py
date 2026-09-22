@@ -60,6 +60,13 @@
     7. 突变算子把 `if` 体删空 → `IndentationError`。**红的是语法错，不是那条约束。**
        写突变脚本时先 `ast.parse` 一遍，语法错要和「它红了」分开记账，
        否则会把「我把代码改崩了」当成「这条约束有人守」。
+    8. **fixture 与被测常量共享同一个未经现实核对的假设。** 2026-09-22：
+       USAGE_LIMIT_MARK 写的是 ASCII 直引号，codex 输出的是弯引号 U+2019，
+       判据一次都没匹配上过；而 fixture 恰好也用直引号，于是测试照常绿。
+       **注意它不是「什么都不测」**——把匹配逻辑整个禁掉，两条测试都会红。
+       它测不出的是**另一类突变**：改掉引号字符（也就是现实里真正发生的那种偏差），
+       测试毫无反应。防法不是多写断言，而是让断言测**性质**
+       （两种引号都要通过），并引入**未经我手的真实字节**（见 ERR_USER_LAYER_REAL）。
 
     另有一类不是写测试时犯的，是**改接口时误伤**的：新加一个短路分支，可能把
     原本有效的断言吃掉。2026-09-20 加「不许等自己」那一行时，回归锁里「参数那份」
@@ -105,6 +112,15 @@ import codex_sub_agent as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+# 弯引号版本。**codex 实际输出的就是这个**（U+2019），2026-09-22 对 268 份日志
+# 全量核对：27 份日志、54 行真·额度错误，无一例外是弯引号。上面那条直引号版本
+# 留着不是历史包袱——两条一起跑，测的是「判据对引号免疫」这个性质。
+ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
+# **未经我手的真实字节。** 上面两条都是我敲出来的，而第 8 种空测试形态的成因
+# 正是「fixture 经过了我的手」——我敲的引号和源码常量里的引号共享同一个假设。
+# 这一行是 2026-09-22 从 /home/xy/.codex-subagent-acct3/logs/audit-should-exist-2.log 逐字节拷出来的，
+# 没有经过任何转写。判据要是再一次押在某个会变的字符上，这条第一个红。
+ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 25th, 2026 5:04 PM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
 ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
                "\x1b[2mcodex_models_manager::manager\x1b[0m\x1b[2m:\x1b[0m "
@@ -739,6 +755,40 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "failed")
         self.assertIn("额度", v.reason)
 
+    def test_撞额度上限_直引号和弯引号和真实字节都要认(self):
+        # 判据要是押在某一个引号字符上，换一个就全瞎——2026-09-22 之前正是这样：
+        # 常量写的是 ASCII 直引号，现网 54 行额度错误全是弯引号，这条特判死了一个版本。
+        for name, text in (("直引号", ERR_USER_LAYER),
+                           ("弯引号", ERR_USER_LAYER_CURLY),
+                           ("真实字节", ERR_USER_LAYER_REAL)):
+            with self.subTest(引号=name):
+                v = self._judge(text + "\n")
+                self.assertEqual(v.state, "failed")
+                self.assertIn("额度", v.reason)
+
+    def test_额度判据里不许有标点(self):
+        # 标点是会变的那一类字符（引号有半角全角两套写法）。判据只用字母和空格。
+        self.assertTrue(ca.USAGE_LIMIT_MARK.replace(" ", "").isalpha(),
+                        f"判据含非字母字符：{ca.USAGE_LIMIT_MARK!r}")
+
+    def test_brief里提到额度但实际是被打断_不许判成额度问题(self):
+        # **本组最重要的一条。** 日志里混着 brief 原文和 codex 转述的子进程输出，
+        # 对整轮自由文本做子串匹配会把它们当成 codex 自己的错误。2026-09-22 实测：
+        # 现网 3 份日志共 71 行「提到」这句话却不是错误行，正是这么来的。
+        # 判成额度问题的后果不再只是「解释错了」——cmd_run 会据此删元数据、换账号重跑。
+        brief_echo = "任务：排查为什么会 hit your usage limit\n"
+        v = self._judge(brief_echo + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(v.state, "interrupted")
+        self.assertNotIn("额度", v.reason)
+
+    def test_判据过宽时上面那条负例必须变红(self):
+        # 「不含标点」挡不住一个过宽的常量（比如单个字母）。这条钉的是：
+        # 负例的红是真的红，不是因为判据恰好没被触发。
+        with mock.patch.object(ca, "USAGE_LIMIT_MARK", "a"):
+            v = self._judge("任务：排查为什么会 hit your usage limit\n"
+                            + ERR_USER_LAYER + "\n")
+            self.assertIn("额度", v.reason, "判据过宽时应当误判——这条红了说明负例失效")
+
     def test_报告是散文也算success_并预览前几行(self):
         # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
         # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事。
@@ -849,10 +899,23 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertIn("resume", v.reason)
 
     def test_额度上限和写锁仍然是failed_它们resume救不回来(self):
-        # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
-        for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
-            with self.subTest(mark=mark):
-                v = ca.judge(ca.Round(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n"))
+        """这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉。
+
+        **喂的是成形的错误行，不是裸标记串。** 2026-09-22 把额度判据搬到
+        `runtime_error_lines()` 的返回值上之后，旧写法（`for mark in
+        (ca.USAGE_LIMIT_MARK, ...)`，直接把标记本身当成一整轮日志）当场变红。
+        那不是回归——是旧 fixture 连同「裸文本里提到就算数」这个错误假设一起
+        断言了进去，正是模块头第 8 种空测试形态。
+        """
+        for name, evidence in (("额度上限", ERR_USER_LAYER_REAL), ("写锁", ERR_FATAL)):
+            with self.subTest(情形=name):
+                # 前提：**光有打断标记时结论是 interrupted**。不钉这一条的话，
+                # 换个不带证据的 fixture 也能让下面两行绿，这条测试就悄悄
+                # 变成「打断标记 → failed」的反面版本，什么都不挡。
+                self.assertEqual(
+                    ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n")).state,
+                    "interrupted", "前提不成立：不加证据行时本来就不是 interrupted")
+                v = ca.judge(ca.Round(self.report, evidence + "\n" + ca.INTERRUPT_MARK + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
 
