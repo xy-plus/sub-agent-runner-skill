@@ -2820,11 +2820,25 @@ class TestRunGuards(_HomeSandbox):
         self.assertIn("brief", cm.exception.message)
 
     def test_同名任务还在跑就拒绝(self):
+        """**断言要钉入口那道闸自己的措辞，不能只钉「还在跑」三个字。**
+
+        2026-09-22 实测：把入口那条整个换成 `if False:`，**全套 316 条照样全绿**，
+        只是套件从 11 秒变 70 秒。原因是没了入口闸之后走到了 run_codex 里的
+        `_wait_previous_round_ends`，它等满 60 秒再 reject，而**那句话里也有
+        「codex 本身还在跑」**——两条不同的闸共用了同一个子串。
+
+        所以这里钉两件事：① 入口闸独有的那句下一步建议；
+        ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
+        """
         ca.write_meta(ca.ensure_isolation("default"), "t", _full_meta("t"))
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
-        self.assertIn("还在跑", cm.exception.message)
+        message = cm.exception.message
+        self.assertIn("还在跑", message)
+        self.assertIn("换个名字或先", message, "入口那道闸独有的下一步建议没了")
+        self.assertNotIn("等了", message,
+                         "拒绝来自 run_codex 里等满超时那条路，不是入口这道闸")
 
     def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
