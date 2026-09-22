@@ -26,7 +26,7 @@
 
 | 机制 | codex | deepseek | 怎么测的 |
 |---|---|---|---|
-| 隔离 | `CODEX_HOME` | **`CLAUDE_CONFIG_DIR`** | 指向空目录照跑；auth 走环境变量，不在配置目录里 |
+| 隔离 | `CODEX_HOME` | **`CLAUDE_CONFIG_DIR`**，且**必须清掉继承来的模型变量** | 指向空目录照跑（auth 走环境变量）。但 `claude-deepseek` 开头会拒绝「别处在定模型」：实测 `ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p …` → 退 2。**用户的场景正是「我现在正在用原生的 Claude Code」**，那一刻这个变量就是 `claude-*` |
 | 工作目录 | argv 里的 `--cd` | **`Popen(cwd=…)`** | `claude -p` 没有 `--cd` 等价物；实测设了 `cwd` 它就在那里干活 |
 | 权限 | `--sandbox danger-full-access` + `approval_policy="never"` | **`--dangerously-skip-permissions`** | 不给的话写入全被拒（见下），给了之后 denials=0、文件真落盘 |
 | 报告 | `-o <文件>` | **`result` 事件的 `result` 字段** | `--output-format stream-json`（强制要 `--verbose`，不带退 1） |
@@ -69,7 +69,16 @@ permission_denials: [Write 被拒, Bash 被拒, Bash 被拒]
 | **`ROUND_MARK`** = `"===== codex-sub-agent "` | **盘上契约**。它写在每一份日志里，`_ROUND_LINE` 整行匹配它。改掉之后 `read_last_round` 在旧日志上找不到轮次起点，会把整份日志当成这一轮——前几轮的错误全算进来 |
 | **`INTERRUPT_MARK`** = `"----- codex-sub-agent 本轮被 INT 打断……"` | 同上。改掉之后盘上已有的打断痕迹认不出，`interrupted` 退回 `failed`——正是代码里记着那个 28k token 的坑 |
 
-**一次全局 `sed` 会同时踩中后两条。** 改名必须逐处判断：是「工具的名字」还是「盘上的契约」。
+**一次全局 `sed` 会同时踩中后两条。** 改名必须逐处判断，而且是**三类**不是两类：
+
+| 类别 | 例子 | 改不改 |
+|---|---|---|
+| 工具的名字 | 命令名、`prog=`、文档、**打印给人看的下一步建议**（约 15 处 `[codex-sub-agent]` 前缀里有几句写着 `` `codex-sub-agent stop {task}` ``——不改就是打印一条不存在的命令）、`~/.local/bin` 的 symlink | **改** |
+| 盘上契约 | `ROUND_MARK`、`INTERRUPT_MARK`、`~/.codex-subagent*` 目录名 | **不改** |
+| 只写不读的文本 | `CONFIG_NOTE`（写进每个隔离目录的 `config.toml`，无人读回） | 可改 |
+
+两个标记的依赖面比「读日志」更宽——除了 `read_round`／`read_last_round`／`judge`，
+还有 **`cmd_interrupt_and_resume` 那道「不发第二发 INT」的闸**和 `interrupt_codex` 自己。
 
 不对称是刻意的：**用户敲的是命令名，盘上的东西谁都不该动。**
 
@@ -219,8 +228,8 @@ deepseek 侧**没有账号维度**（一个 token），`auth.json` 软链和 `co
 | `find_meta` / `all_metas` | 扫描根加上 deepseek 的家 |
 | `ensure_isolation` | 按 runner 分叉不变量；deepseek 只建三个子目录 |
 | `auth_source` | 只对 codex 有意义，加断言 |
-| `find_codex_pid` → `find_agent_pid` | `comm` 与 needle 按 runner 取；**保留「argv 元素精确比对、绝不用正则」** |
-| `run_codex` | `Popen` 加 `cwd=`；tee 按 runner 选分块／行模式；收尾调 runner 的钩子 |
+| `find_codex_pid` → `find_agent_pid` | `comm` 与 needle 按 runner 取；**保留「argv 元素精确比对、绝不用正则」**。**调用点有 6 处**：`_wait_previous_round_ends`(2)、`cmd_run` 的存活闸、`cmd_status`、`cmd_resume`、`cmd_interrupt_and_resume`、`cmd_stop`。其中 `_wait_previous_round_ends` 是承重的——它要的是**上一轮**的 uuid，必须**从磁盘读**（和它自己注释里 `_previous_writer_alive` 那条「绝不用传进来的 meta 参数」同一个道理），否则用本轮新铸的 uuid 去找，恒为 None，等待变成空操作，两个写者共写一份日志 |
+| `run_codex` | **`env = codex_env(home)` 是写死的，必须按 runner 分叉**（不接上 deepseek 子代理就完全没有隔离）；`Popen` 加 `cwd=`；tee 按 runner 选分块／行模式；收尾调 runner 的钩子；**铸 uuid 并落元数据** |
 | `_tee_until_exit` | 加行模式分支；**codex 那一支一个字节不动** |
 | `build_parser` | `--runner` 必填；`--account` 改可选 |
 | `cmd_run` | 三条硬拒绝，排在任何状态变更之前 |
@@ -228,13 +237,28 @@ deepseek 侧**没有账号维度**（一个 token），`auth.json` 软链和 `co
 | `cmd_status` | 多一列或复用第二列显示 runner |
 | `setUpModule`（测试） | 断言扩到 `claude-deepseek` |
 
+## 十、一条通用教训（这次审查逼出来的，值得记住）
+
+plan v2 定义了五个新函数、写了 31 条测试，**全绿**——而审查照着它搭出的参考实现里，
+那五个函数**一个调用点都没有**：deepseek runner 永不写报告、永不滤日志、**完全没有隔离**。
+
+> **定义了函数不等于接上了线。** 一份只测「函数自己对不对」的计划，
+> 给的是「测试通过了」的错觉，不是「功能在工作」。
+
+所以本 spec 的验收判据里，**每一条产物型判据都要有一个端到端的落点**
+（假 `Popen` 驱动真实 `run_codex` → 断言日志里真有那行、报告真出现/真不出现），
+而不是只断言那个函数被调用时返回什么。
+
 ## 验收判据
 
 1. **改名**：命令是 `sub-agent-runner`；**盘上契约一个都没改**——
    `~/.codex-subagent*` 原样、`ROUND_MARK` 与 `INTERRUPT_MARK` 的文本**一字未动**，
    且有测试钉住这两个字面量
-2. **三条硬拒绝**：各自退 2 且错误信息说清为什么；**且都发生在任何状态变更之前**
-   （构造一个「任务原属别的账号 + 参数非法」的场景，断言旧元数据还在）
+2. **三条硬拒绝**：各自退 2 且错误信息说清为什么；**被拒的调用不在盘上留任何痕迹**
+   ——断言隔离目录都没被建出来（`ensure_isolation` 是第一个落盘的动作）。
+   v2 写的是「排在删旧元数据的迁移分支之前」，**那半句不可达**：迁移分支的门是
+   `--account auto`，而这三条拒绝与 `auto` 互斥。按那个措辞写出来的测试是空的
+   （实测：把三条拒绝整个删掉、或挪到 `ensure_isolation` 之后，它照样绿）
 3. **真跑一次要产出真文件**：`--runner deepseek` 的冒烟必须在 `--dir` 里创建一个文件并核对内容
    ——**只断言「报告非空」挡不住「零工作量的成功」**
 4. **权限受阻要变红**：`permission_denials` 非空时日志有 `ERROR:` 行，`judge` 给 `suspect`／退 3
@@ -252,4 +276,15 @@ deepseek 侧**没有账号维度**（一个 token），`auth.json` 软链和 `co
 11. **deepseek 任务查得到**：`status`／`resume`／`stop` 对它们全部有效
 12. **测试护栏**：`setUpModule` 的断言挡得住 `claude-deepseek`；既有测试全绿；
     **codex 侧行为一字未变**
-13. **收尾**：结论内化进注释后删除 spec 与计划文档
+13. **接线有端到端落点**：假 `Popen` 驱动真实 `run_codex`，断言
+    ① 交给子进程的 env 里有 `CLAUDE_CONFIG_DIR` 且**没有任何模型变量**
+    ② 日志开头有那句「已滤掉 thinking_tokens」
+    ③ `thinking_tokens` 行不在日志里
+    ④ success 时报告出现、`error_during_execution` 时不出现
+    ⑤ `permission_denials` 非空时日志里有 `ERROR:` 行
+    **这五条缺一条，就是「函数写了但没接上」**
+14. **uuid 的生命周期**：`run` 铸新 uuid 落元数据；同一任务名 `run` 两次拿到**不同**的 uuid
+    （实测复用会得到 `Error: Session ID … is already in use.` 退 1）；
+    argv 里 `--session-id` 后面跟的就是元数据里那个
+15. **`~/.local/bin` 的 symlink 跟着改名**——不修的话结果是「旧命令坏了、新命令不存在」
+16. **收尾**：结论内化进注释后删除 spec 与计划文档
