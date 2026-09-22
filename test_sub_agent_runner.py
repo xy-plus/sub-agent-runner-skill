@@ -2322,6 +2322,55 @@ class TestDeepseekTaskIsReachable(_HomeSandbox):
         self.assertEqual(codex_row.split()[1], "codex:acct2")
 
 
+class TestInterruptedAfterProcessStops(_HomeSandbox):
+    """spec 判据 9 前半：**打断之后 `status` 真的变 `interrupted`**——进程确实停了，
+    不是只留下痕迹。
+
+    后半（不相干的 `claude` 进程不许命中）在 `TestFindAgentPid` 里，两半必须分开验：
+    只钉痕迹的话，一个「痕迹写了而进程还活着」的实现照样报 interrupted，而那一刻
+    正确的结论是 running(4)——stop 刚发出去、子代理还在收尾，正是常态。
+
+    这里用**真进程**走完整条链：活着时反查命中 → status 说 running(4)；真发 INT
+    打断（`interrupt_agent` 把发信号和留痕焊在一起）→ 进程真的没了 → 反查不到 →
+    status 才说 interrupted(130)。
+    """
+
+    def test_进程真停了之后status才说interrupted(self):
+        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        meta = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
+        ca.write_meta(home, "t", meta)
+        log = ca._log_path(home, "t")
+        # 本轮分隔符先写上：read_last_round 从它开始切，打断痕迹必须落在它之后
+        log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        fake = _fake_agent(tmp, "claude")
+        mark = tmp / "keep.txt"
+        mark.write_text("")
+        args = ca.build_parser().parse_args(["status", "t"])
+        proc = subprocess.Popen([str(fake), "-f", str(mark), meta["session_id"]],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)          # LIFO：先 kill 再 wait，绝不挂死
+        _wait_argv(self, proc, meta["session_id"])
+        self.assertEqual(ca.find_task_agent_pid(ca.DEEPSEEK, home, "t"), proc.pid,
+                         "前提不成立：活着的陪练没被反查命中，这条测不到「停了」那一步")
+        with contextlib.redirect_stdout(io.StringIO()) as screen:
+            self.assertEqual(ca.cmd_status(args), ca.EXIT["running"],
+                             "进程还活着就该是 running(4)，抢跑成 interrupted 会让人去 resume 一个在跑的会话")
+        self.assertIn("running", screen.getvalue())
+
+        ca.interrupt_agent(proc.pid, log, "stop")   # 真信号 + 留痕
+        proc.wait()
+        self.assertIsNone(ca.find_task_agent_pid(ca.DEEPSEEK, home, "t"),
+                          "进程真停了却还命中——那 status 会一直报 running")
+        self.assertTrue(ca.has_interrupt_mark(log.read_text()),
+                        "前提不成立：痕迹没写上，那这条测的不是「停了」而是「没痕迹」")
+        with contextlib.redirect_stdout(io.StringIO()) as screen:
+            self.assertEqual(ca.cmd_status(args), ca.EXIT["interrupted"])
+        self.assertIn("interrupted", screen.getvalue())
+
+
 @contextlib.contextmanager
 def _fake_agent_proc(output):
     """把 spawn 换成一个吐出 `output` 然后 EOF 的假进程，yield 出 `Popen` 的 mock。
