@@ -137,7 +137,17 @@ def skill_path(value):
     return value
 
 
-USAGE_LIMIT_MARK = "You've hit your usage limit"
+# 判据**刻意不含 `You've` 那一截**。codex 输出的是弯引号 U+2019，源码里写的是 ASCII
+# 直引号——2026-09-22 之前两者对不上，这条特判死了整整一个版本，status 把撞上限的
+# 任务全报成「报告缺失或为空」。修法不是把直引号换成弯引号（那仍然押在一个会变的
+# 字符上），而是**把判据缩短到不含任何标点的那一段**：剩下全是字母和空格。
+#
+# **它为什么能死一整版而没人发现：测试的 fixture 和这个常量共享同一个未经核对的
+# 假设**——我敲 fixture 时也敲的直引号，于是两边一起错、测试照常绿。所以判据这类
+# 常量要用**未经我手的真实字节**验（见测试里的 `ERR_USER_LAYER_REAL*`，逐字节拷自
+# 现网日志），断言要测**性质**（两种引号都得过），不是多写几条自洽的断言。
+# 往这里加任何新的字面量判据之前，先去现网日志里 grep 一次它真实的样子。
+USAGE_LIMIT_MARK = "hit your usage limit"
 THREAD_LOCK_MARK = "already has an active writer"
 REPORT_PREVIEW_LINES = 5
 
@@ -427,6 +437,291 @@ def runtime_error_lines(round_text):
     return hits
 
 
+def hit_usage_limit(error_lines):
+    """本轮是不是撞上了账号额度上限。
+
+    **收的是 `runtime_error_lines()` 的返回值，不是整轮日志文本。** 这是承重的：
+    日志里混着 brief 原文和 codex 转述的子进程输出（本文件 `_ERR_*` 上方那段注释
+    已经为同一个理由否掉了裸 grep ERROR）。2026-09-22 全量核对现网日志（269 份）：
+    **真·额度错误 56 行 / 28 份**
+    （**这是一次带日期的快照，不是常量**。日志只追加，这个数只会涨——
+    2026-09-23 就已经是 58 行 / 29 份，而涨的那两行正是本项目自己的审查任务写进去的。
+    别去「更新」它，那会变成一条永远在漂的注释；要新数就自己重测一次并另记日期），另有 **3 份**只是
+    **提到**这句话（brief 原文、源码引用），当时 71 行、次日复核已涨到 175 行
+    ——那 3 份正是本项目自己的审查任务日志，**这个数字会随着我们每谈论一次额度
+    判据而继续涨**，而它本身就是论据：污染源不是意外，是这个功能的日常。
+    对整轮文本做子串匹配，那些行会被判成额度问题——而在 `cmd_run` 里，
+    那意味着给一个**健康账号**写下限流记录。配上「不做过期清理」和
+    「纯按 reset_at 排序」，一条 2099 年的假记录会让它**永远排最后**，
+    auto 再也不会先试它。
+
+    **规矩：判据一旦成为控制依据，证据就必须来自已经分类过的错误行。**
+    同一条规矩在本文件有第二个实例——`judge` 里的 `THREAD_LOCK_MARK`。它比这条
+    更极端：现网语料里这个标记出现在 12 行里，已分类的错误行 **0 行**，
+    裸子串匹配 **12/12 全假阳**（全是 codex 带行号 `cat` 出本项目自己的源码）。
+    **两次都不是靠测试发现的**：把本谓词改回 `USAGE_LIMIT_MARK in round_text`，
+    当时全套 313 条测试毫无反应（见 `TestJudge.test_只是提到额度字样_不算撞上限`）。
+    「测试绿」不等于「这条约束有人守」——动这一行之前先问：改坏了谁会红。
+
+    **`judge` 和 `cmd_run` 共用这一个谓词。** 两处各写一套必然漂移，
+    而判据漂移正是本工具反复在修的那类 bug。`cmd_run` 不自己再扫一遍，
+    它喂的是 `verdict.detail`——failed 态下那就是本轮已分类的错误行
+    （三个 `Verdict("failed", …)` 构造点全传 `errors`，有测试守着这条契约：
+    `test_failed态的detail恒等于本轮已分类的错误行`）。这样两边看的是
+    **同一批行**，不是两次各自扫出来的两批。
+
+    「几点恢复」走 `usage_limit_reset()`，收的也是这同一批行——**两个谓词的输入
+    类型必须一样**，否则下一个人会给其中一个喂整轮文本（2026-09-22 真踩过）。
+    """
+    return any(USAGE_LIMIT_MARK in line for line in error_lines)
+
+
+# 两条正则对应现网两种真实形态（见 `parse_reset_time`）。
+# 分组全部具名，不用位置号：`raw` 这一组划定的就是**落盘时那个审计串**
+# （只含日期时间，不含 "try again at " 这个引子），而位置号会随着日后加一个
+# 括号整体漂移，漂了之后 raw 里悄悄多出半句英文，谁也不会发现。
+#
+# 「只有时刻」这条**紧贴在 `try again at` 之后**（不是在全文里找时刻）：
+# 松开这个锚点，带日期消息里的 `5:04 PM` 会被它截胡，于是一条自带完整日期的
+# 消息被当成「今天／明天的 5:04」——比解析不出更坏。
+_RESET_AT_DATED = re.compile(
+    r"try again at\s+"
+    r"(?P<raw>"
+    r"(?P<month>[A-Z][a-z]{2})\s+"              # Sep
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th),\s+"      # 25th,
+    r"(?P<year>\d{4})\s+"                       # 2026
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*"   # 5:04
+    r"(?P<half>[AP]M)"                          # PM
+    r")")
+_RESET_AT_TIME_ONLY = re.compile(
+    r"try again at\s+"
+    r"(?P<raw>(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<half>[AP]M))")
+_MONTHS = {name: number for number, name in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+
+
+def _to_24h(hour, half):
+    """12 小时制换 24 小时制；小时不在 1–12 就返回 `None`。
+
+    **不取模。** `int("99") % 12 + 12 == 15`——一条畸形消息会被静默编造成
+    一个看起来合理的恢复时间，而这个值要落盘、要排序、要显示给人看。
+    12 AM = 0 点、12 PM = 12 点，所以合法区间内仍然要取模。
+    """
+    hour = int(hour)
+    if not 1 <= hour <= 12:
+        return None
+    return hour % 12 + (12 if half == "PM" else 0)
+
+
+def parse_reset_time(text, now):
+    """从撞上限的那段话里抠出恢复时间，抠不到就 `None`。
+
+    现网两种形态（2026-09-22 对 269 份日志全量核对）：
+
+        try again at Sep 25th, 2026 5:04 PM     34 行 / 17 份   Pro，周额度
+        try again at 11:10 AM                   22 行 / 11 份   Plus，5 小时档
+
+    第二种**只有时刻没有日期**，占真实消息的 39%。不认它的代价是：无记录＝排最前，
+    于是 5 小时窗口里每次 run 都先挑中这个账号、白撞一整轮任务。
+
+    歧义（11:10 是今天还是明天）只在读到消息的那一刻存在，而消息说的是
+    "try again **at**"——未来。所以取 **>= now 的下一个该时刻**。
+    `now` **必填**：这是本功能唯一读时钟的地方，调用方必须显式交出它用的是哪个，
+    否则测试里一个隐式的 `datetime.now()` 会让「明天还是今天」随测试运行的时刻飘。
+    排序（`accounts_by_availability`）**一次都不读时钟**。
+
+    返回 `(时间, 原始串)`——两样必须来自**同一次匹配**：原始串是落盘时的审计线索
+    （解析错了一眼看得出），拆成两个函数就可能各匹配各的、对不上。
+
+    **返回朴素本地时间，不编造时区。** 消息里没有时区，实测也推不出来（恢复时间在
+    3~4 天后，拿文件 mtime 反推不出来）。这样做安全，是因为这个值**只当排序键**
+    （见 `accounts_by_availability`）：误差 ±12h 只在两个账号的恢复时间相差 12h
+    以内时才改变顺序，代价是多一次 codex 启动。
+
+    抠不到宁可返回 `None`——调用方会退化成「无记录＝排最前＝照样会被试到」，
+    比写一个假时间进去安全得多。**带日期那一支匹配上但内容非法（月份名乱写、
+    Feb 31st、小时不在 1–12）时直接 `None`，不退回「只有时刻」那一支**：
+    这条消息自带日期，拿它的时刻当今天／明天就是编一个假恢复时间出来。
+    """
+    m = _RESET_AT_DATED.search(text)
+    if m is not None:
+        month = _MONTHS.get(m.group("month"))   # [A-Z][a-z]{2} 会匹配 "Foo"，必须再查表
+        hour = _to_24h(m.group("hour"), m.group("half"))
+        if month is None or hour is None:
+            return None
+        try:
+            return (datetime.datetime(int(m.group("year")), month, int(m.group("day")),
+                                      hour, int(m.group("minute"))),
+                    m.group("raw"))
+        except ValueError:              # Feb 31st 这种
+            return None
+
+    m = _RESET_AT_TIME_ONLY.search(text)
+    if m is None:
+        return None
+    hour = _to_24h(m.group("hour"), m.group("half"))
+    if hour is None:
+        return None
+    when = now.replace(hour=hour, minute=int(m.group("minute")), second=0, microsecond=0)
+    if when < now:                      # 今天这个点已经过了，那说的就是明天
+        when += datetime.timedelta(days=1)
+    return when, m.group("raw")
+
+
+def usage_limit_reset(error_lines, now):
+    """这批错误行说这个账号几点恢复；说不出来就 `None`。
+
+    **收的是已分类的错误行，和 `hit_usage_limit` 一模一样。** 这是同一条规矩的
+    两半：判「撞没撞上」看已分类的错误行，判「几点恢复」也必须看同一批行。
+    只守前一半是没用的——2026-09-22 实测，污染行排在真错误**前面**时，
+    对整轮文本 `search()` 取到的是污染那一条：
+
+        47  ERR_USER_LAYER_REAL = '… or try again at Dec 31st, 2099 11:59 PM.'
+        ERROR: You’ve hit your usage limit. … or try again at Sep 25th, 2026 5:04 PM.
+
+    整轮文本给出 2099-12-31，已分类行给出 2026-09-25。前者会被落盘、会被当成
+    排序键、还会印给人看——而它是从一行 fixture 回显里捡来的。
+
+    **逐行试，取第一条解析得出的**，不把几行拼起来再 `search`——拼起来就又回到
+    「在一个大块文本里捡第一个匹配」，正是这个函数要消灭的东西。
+    **「往下走」的边界画在「命中额度字样」上，不画在行号上。** 命中的行每一条都是
+    codex 在说「我撞上限了」，取哪一条的时间都是同一件事的时间；没命中的行是一段
+    与额度无关的文本，从那里捡时间就是 C1 那个 bug 本身。所以命中却**没有时间**的
+    那一行只是**跳过**（下面 `for` 的 `continue`），不是终止——现网确有这个形状
+    （2 行 / 1 份），但**它们是污染不是形态**：出自本项目自己的日志，codex 把报告
+    正文引了进来，OpenAI 的两种真消息都带时间。一条命中行都解析不出时落点是
+    `None`，调用方据此退化成「无记录＝排最前＝照样会被试到」，而不是从别处捡一个
+    时间凑数。正反两面各有一条测试钉着，见 `TestUsageLimitReset`。
+    """
+    for line in error_lines:
+        if USAGE_LIMIT_MARK not in line:
+            continue
+        got = parse_reset_time(line, now=now)
+        if got is not None:
+            return got
+    return None
+
+
+USAGE_LIMIT_FILE = "usage_limit.json"
+
+
+def usage_limit_path(home):
+    """限流记录放隔离目录根部。
+
+    限流是**账号**的属性，而账号已经有一个家，不必为它新开一个状态目录。
+    `ensure_isolation` 的不变量是「五个子目录存在、共享扫描根为空、config.toml
+    不是软链、auth.json 软链到该账号」——**它不枚举也不拒绝顶层多余文件**
+    （2026-09-22 实测：放一个文件进去再跑一次，不拒且文件保留）。
+    """
+    return home / USAGE_LIMIT_FILE
+
+
+def _usage_limit_tmp(home, pid):
+    """写限流记录用的临时文件名。**带 pid，不能用固定名。**
+
+    和 `write_meta` 的关键区别：那份是**任务级**的，一个任务只可能有一个写者
+    （`cmd_run`/`cmd_resume` 都先拒绝「还在跑」的同名任务），所以固定名安全。
+    这份是**账号级、跨任务共享**的——同一个账号上的两个任务可以同时撞上限、
+    同时写。固定名会让两个写者把同一个临时文件写成混合内容，
+    然后原子替换把这份混合内容装进去，`read_usage_limit` 读出 `None`。
+    """
+    q = usage_limit_path(home)
+    return q.with_name(f"{q.name}.{pid}.tmp")
+
+
+def write_usage_limit(home, reset_at, raw):
+    """记下这个账号什么时候恢复。**只在 `parse_reset_time` 成功时调用。**
+
+    `raw` 是审计线索：解析错了（时区、OpenAI 改文案）一眼看得出，不用翻日志。
+    **没有 `seen_at`**——唯一的读者是排序，排序只看 `reset_at`；
+    没有消费者的字段一旦加进去就再也删不掉了。
+
+    **写不进去只提示、不抛，并返回 `False`。** 这条记录是优化不是前提：写失败
+    最多让下次排账号顺序时少一条依据，而抛出去会把本轮的收尾整个打断。
+    吞在这里而不是留给调用方包 try：调用方每多一个就要记得包一层，
+    而「必须记得」正是这个工具存在的理由本身。
+    吞掉但**出声**——静默失效是这个仓库反复在修的那类病。
+
+    **成败必须走返回值，光印一行不够。** 不返回的话调用方只能假定「写进去了」，
+    于是同一屏会出现两句矛盾的话——2026-09-22 实测：本函数印「限流记录写不进…」，
+    `cmd_run` 紧接着印「恢复时间 09-25 17:04 已记下」。约束做进签名，
+    调用方就说不错；做在注释里，下一个人照样会假定成功。
+    """
+    tmp = _usage_limit_tmp(home, os.getpid())
+    try:
+        tmp.write_text(json.dumps({"reset_at": reset_at.isoformat(), "raw": raw},
+                                  ensure_ascii=False, indent=2))
+        os.replace(tmp, usage_limit_path(home))
+    except OSError as e:
+        print(f"[codex-sub-agent] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
+              f"不影响本轮，只是下次排账号顺序时少一条依据。")
+        return False
+    return True
+
+
+def read_usage_limit(home):
+    """这个账号预计什么时候恢复；没记录或记录坏了都返回 `None`。
+
+    **坏了返回 `None` 是刻意的**：调用方把 `None` 当成「无记录＝排最前＝照样会被
+    试到」，那是安全的一边。反过来（读不出来就认定它还在限流）会把一个可用账号
+    锁死，而调用方看不出原因——那正是本工具反复在修的那类谎。
+
+    有效的形状**只有一种**：两个键都在、`raw` 是字符串、`reset_at` 是**朴素**
+    ISO 串。剩下全部当没记录——**「像是对的」那两种才是会咬人的**：
+
+      带时区的 `reset_at`  `accounts_by_availability` 里要拿它和 `datetime.min`
+                           （朴素）比，实测 `TypeError: can't compare offset-naive
+                           and offset-aware datetimes`，一个手写坏的状态文件
+                           把整条 auto 命令打死。而按设计它最坏只该让顺序排差
+      缺 `raw` / 类型不对   不是本函数写出来的东西。审计线索没了就查不出解析
+                           错在哪，而这份记录的可信度本来就全靠它
+    """
+    try:
+        got = json.loads(usage_limit_path(home).read_text())
+        if not isinstance(got["raw"], str):
+            return None
+        when = datetime.datetime.fromisoformat(got["reset_at"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+    return None if when.tzinfo is not None else when
+
+
+def accounts_by_availability():
+    """按「预计什么时候能用」给候选账号排序。
+
+    **额度记录只排顺序，不准拒绝**——本设计最重要的一条约束。
+    「这个账号真的没额度了」这个结论只能来自**真实尝试**，不能来自这里读到的
+    文件。文件会错（时区、时钟偏移、OpenAI 改文案，以及日志被回显污染——
+    见 `hit_usage_limit`）。只排顺序的话后果被限制在「顺序排差一格」；一旦允许
+    它拒绝，同一个错就变成「把好账号误判成死的、还告诉调用方没号可用」。
+
+    **登录态是唯一的例外，而且它不违反上面那条。** 那条约束管的是**额度记录**
+    ——一份会过期、会出错的缓存。登录态是当场可查的硬前提：没有 `auth.json`，
+    `ensure_isolation` 会直接 `reject` 退出 2，于是**一个账号缺登录态就会把整条
+    auto 命令打死**，哪怕别的账号完全可用。所以在这里就把它们滤掉。
+
+    排序键两段：
+    ① 恢复时间；没记录就是 `datetime.min`，排最前，照样会被试到。
+       **过期记录不会自动变成「无记录」**：本函数不读当前时间，一条过期记录
+       永远排在无记录之后。这不是 bug——它排进「恢复得早的那一批」，
+       批内按先后排，语义依然正确，而清理需要读时钟、需要定义「多久算过期」，
+       是纯增实体
+    ② 账号名——**第二键必须有**，否则顺序跟着 `account_choices()` 的扫描顺序漂，
+       同一个输入在两台机器上给出两种结果
+
+    **刻意没有「这个任务已经住在哪」这一键，也就不收 `task`。** v3 有过
+    （住着的排最前，沿用它的家），那是为**轮内重试**服务的：先试旧家，
+    撞上限再搬走。v4 去掉重试之后它变成陷阱——任务住的那个账号限流了也照样
+    被选中，于是每次重跑都选它、每次都撞上限，**永远换不掉**，而 auto 的
+    全部意义就是换掉它。搬家现在由 `cmd_run` 在入口处显式做一次。
+    """
+    def sort_key(account):
+        return (read_usage_limit(isolation_home(account)) or datetime.datetime.min,
+                account)
+    return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
+
+
 def extract_session_id(log_text):
     m = _SESSION_ID.search(strip_ansi(log_text))
     return m.group(1) if m else None
@@ -498,21 +793,37 @@ def judge(round):
     # 前提是每轮开跑前把上一轮的报告删掉（见 clear_report），否则旧报告会被
     # 当成本轮的产物，一次失败的运行会被判成 success。
     if not report_text.strip():
-        # 两种特判只改 reason、不新增状态：补救手段不同（换账号／新起任务），
-        # 但都属于「没正常收尾」这一种事实，状态机不该为此变复杂。
-        if USAGE_LIMIT_MARK in round_text:
-            return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
-        if THREAD_LOCK_MARK in round_text:
-            return Verdict("failed",
-                           "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
-                           errors)
-        # 排在额度上限和写锁之后：那两条意味着 resume 也救不回来（换账号／新起
-        # 任务），而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
+        # 三种特判只改 reason、不新增状态（打断那条除外，它本来就是第五态）：
+        # 补救手段不同（接着 resume／换账号／新起任务），但都属于「没正常收尾」
+        # 这一种事实，状态机不该为此变复杂。
+        #
+        # **打断排最前。** 这个标记是本工具自己写的（interrupt_codex 发完 INT 才写），
+        # 是关于「我们做了什么」的**不可伪造**证据；下面两条靠的是日志里的字面串，
+        # 而日志里混着 brief 原文、codex 读文件的回显、子进程输出——2026-09-22 实测：
+        # 一个完全正常的账号，因为任务内容涉及额度处理，日志里就出现了
+        # `ERROR: …hit your usage limit`。
+        # 「两者都真」几乎不可能：codex 撞上限会自己退出，那时没有进程可以被 INT。
+        # 顺序反了的代价是不对称的：把「被打断、resume 就行」判成额度问题之后，
+        # cmd_run 会给这个账号记一笔限流——配上「不做过期清理」和「纯按 reset_at
+        # 排序」，那个**完全健康**的账号从此排到最后，auto 再也不会先试它；
+        # 而这一轮真正该做的事（接着 resume）也被这个结论盖掉了。
         # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
         # 留下 failed to record rollout items），那些照常进 detail，不改状态。
         if has_interrupt_mark(round_text):
             return Verdict("interrupted",
                            "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
+        if hit_usage_limit(errors):
+            return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
+        # 和上面那条同一条规矩：**看已分类的错误行，不看整轮裸文本**。
+        # 现网实测：这个标记出现在 12 行里，已分类的错误行 **0 行**——12 行全是
+        # codex 带行号 cat 出本项目自己的源码和测试。裸子串匹配在真实语料上
+        # 是 12/12 全假阳，而这一支的处置是「只能新起一个任务」，
+        # 假阳会让人把一个其实只是没产出报告的任务整个丢掉重来。
+        # 真的写锁错误是 `Error: …` 开头（形式 C，一律致命），本来就在 errors 里。
+        if any(THREAD_LOCK_MARK in line for line in errors):
+            return Verdict("failed",
+                           "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
+                           errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
@@ -557,6 +868,12 @@ CONFIG_NOTE = '''# codex-sub-agent 的隔离配置。
 _BAD_IN_ACCOUNT = re.compile(r"[\s\x00-\x1f\x7f]")
 
 
+AUTO = "auto"
+# `default` 是主账号的固定名（不对应 ~/.codex-accounts 下的目录），
+# `auto` 是 `--account` 的模式词。两个都不许被真账号目录占用。
+RESERVED_ACCOUNT_NAMES = ("default", AUTO)
+
+
 def account_choices():
     """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。
 
@@ -577,6 +894,18 @@ def account_choices():
             reject(f"账号目录名 {accounts_dir / name} 含空白或控制字符 {hit.group()!r}"
                    f"（第 {hit.start()} 个字符）。账号名会进 status 数据行的第二列，"
                    f"那一列是按空白切分的边界。改掉这个目录名再跑。")
+        # 拒跑而不是静默去重：静默去重会让住在那个目录里的任务从 status 里消失，
+        # 正是本函数上面那段注释反复强调要避免的静默失效。
+        if name in RESERVED_ACCOUNT_NAMES:
+            reject(f"账号目录 {accounts_dir / name} 占用了保留名 {name!r}。\n"
+                   f"`default` 是主账号的固定名，`{AUTO}` 是 --account 的模式词。\n"
+                   f"实测后果：目录叫 default 时候选里会出现两个 default、"
+                   f"两次指向同一个隔离目录，find_meta 会对同一份元数据数出两份并误拒；"
+                   f"目录叫 {AUTO} 时这个账号再也没法被明确指定。\n"
+                   f"改名要改**两个**：账号目录 {accounts_dir / name}，"
+                   f"以及它的隔离目录 {isolation_home(name)}。\n"
+                   f"只改前一个的话，住在后一个里的任务之后再也扫不到"
+                   f"——status 看不见、stop 停不掉，而且没有任何报错。")
     return ["default"] + extra
 
 
@@ -980,8 +1309,9 @@ def find_meta(task):
     的地方都得记得把它剥掉，而「必须记得」正是这个工具存在的理由本身。
 
     查到多份就拒绝，不"取第一个"：那会让 status/resume/stop 静默作用到扫描顺序
-    更靠前的那个会话上。而任务名撞车这条路很好走——撞额度上限就该换账号重跑。
-    cmd_run 已经不让这个状态建起来，这里是第二道。
+    更靠前的那个会话上。而任务名撞车这条路很好走——`auto` 挑中另一个账号时，
+    同一个任务名就会在两个隔离目录里各有一份。`cmd_run` 用显式迁移不让这个状态
+    建起来（旧的那份当场 unlink），这里是第二道。
     """
     found = []
     for account in account_choices():
@@ -1086,7 +1416,8 @@ def _previous_writer_alive(home, task):
     **第四条是承重梁，不是锦上添花。** 实测：僵尸期的 `starttime` 与存活期
     **完全相同**，`os.kill(pid, 0)` 也照样「成功」——没有这一行，等的就变成
     「等它被父进程回收」，而回收时机归 harness 的 bash/node 管，是第三方。
-    spec 的版本小史里 v4 就是栽在这条前提上。
+    设计过程中有一版正是栽在这条前提上——写设计文档的人默认「进程退出了就查不到
+    了」，而僵尸态推翻了它。
     """
     q = meta_path(home, task)
     if not q.exists():
@@ -1293,13 +1624,13 @@ def run_codex(kind, home, task, meta, make_argv):
             busy.append("codex 本身还在跑")
         if not busy:
             busy.append("刚刚才安静下来——超时和它停下撞在了一起")
-        下一步 = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
-                  "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
-                  if kind == "interrupt-and-resume" else
-                  f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
-                  f"（run 还可以换个任务名）。")
+        next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
+                     "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
+                     if kind == "interrupt-and-resume" else
+                     f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
+                     f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
-               + "；".join(busy) + "。\n" + 下一步)
+               + "；".join(busy) + "。\n" + next_step)
 
     # writer 身份在这里盖，**而且只在这里**：run_codex 是唯一的 spawn 入口，
     # run / resume / interrupt-and-resume 三条路都经过它，调用方不需要记住任何事。
@@ -1497,33 +1828,131 @@ def cmd_run(args):
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
-    home = isolation_home(args.account)
     old_home, old_meta = find_meta(args.task)
-    if old_meta is not None:
-        # 换账号重跑同名任务很好走（撞额度上限时就该这么干），但那会让同一个名字
-        # 出现在两个隔离目录里：find_meta 按账号顺序查，另一份就成了再也够不着的
-        # 孤儿元数据，而「上一轮会被覆盖」那句提示在跨账号时还是假话（报告路径不同）。
-        if old_home != home:
-            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
-                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。")
-        if find_codex_pid(_report_path(home, args.task)) is not None:
-            reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-sub-agent stop {args.task}`")
-        print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
 
-    ensure_isolation(args.account)
-    report = _report_path(home, args.task)
-    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    if args.account == AUTO:
+        candidates = accounts_by_availability()
+        if not candidates:
+            reject("没有任何账号有登录态，auto 模式无从分配：\n"
+                   + "\n".join(f"  {a} 缺 {auth_source(a)}" for a in account_choices())
+                   + "\n先跑 `codex-acct login <账号>`。")
+        account = candidates[0]
+    else:
+        account = args.account
+        # 跨账号同名的护栏**只在强制模式下需要**：同一个名字出现在两个隔离目录里
+        # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
+        # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
+        # 挑中别的账号时在下面**显式**把旧的那份搬过来。
+        if old_meta is not None and old_home != isolation_home(account):
+            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
+                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
+                   f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
+
+    # 「这个任务名此刻有没有活着的 codex」——查一次，**在动任何状态之前**，
+    # 而且**旧的家和选中的家都要查**。
+    #
+    # 只查旧家是不够的：迁移那一支会先把旧元数据 unlink 掉再进 run_codex，而
+    # run_codex 里的 `_wait_previous_round_ends` 等满 60 秒之后会 `reject`——
+    # 那一刻旧的已经删了、新的还没写，任务从 status / stop / resume 三条路上
+    # 整个消失。run_codex 的注释写着「这一等排在 write_meta 之前，所以超时不留
+    # 半个状态」，而迁移是从**外面**把那条不变量破掉的。
+    #
+    # **为什么查 `find_codex_pid` 就够**（不必把整个 `_wait_previous_round_ends`
+    # 搬出来重跑一遍）：能走到迁移，说明 `find_meta` 只数出一份元数据（两份它当场
+    # 拒），于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
+    # `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的就只剩
+    # codex 这一条。把等待搬出来还会引入第二个调用点，而它之所以住在 run_codex
+    # 里，正是为了让调用方不必记得任何事。
+    #
+    # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
+    # writer 和 codex 排干了没有」，每轮都必须做。
+    home = isolation_home(account)
+    for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
+        if find_codex_pid(_report_path(candidate_home, args.task)) is not None:
+            reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
+                   f"换个名字或先 `codex-sub-agent stop {args.task}`")
+
+    home = ensure_isolation(account)
+    if old_meta is not None:
+        if old_home == home:
+            print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
+                  f"上一轮的报告会被删掉、日志会被追加")
+        else:
+            # 只有 auto 走得到这里（强制模式上面那道护栏已经拒了）。
+            # **措辞必须点明旧产物留在原处。** 上面那句「上一轮的报告会被删掉」
+            # 在跨账号时是**假话**：`clear_report` 只动这一轮要写的那个报告
+            # （新 home 的），旧 home 的 reports/ 和 logs/ 一个字节都没碰。
+            # 搬的只有元数据——不搬的话同一个名字出现在两个隔离目录里，
+            # find_meta 当场数出两份，status/stop 从此全退 2。
+            print(f"[codex-sub-agent] 任务 {args.task} 原本在账号 {old_meta['account']}，"
+                  f"本次改用 {account}：元数据搬过来，"
+                  f"旧账号的报告和日志留在 {old_home} 原处不动。")
+            meta_path(old_home, args.task).unlink(missing_ok=True)
+
     # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
     # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
-
+    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    verdict = judge(run_codex("run", home, args.task,
-                              new_meta(args.task, args.account, str(workdir),
-                                       args.effort, args.skills),
-                              lambda r: build_run_argv(str(workdir), args.effort, r, brief)))
+    this_round = run_codex("run", home, args.task,
+                           new_meta(args.task, account, str(workdir), args.effort, args.skills),
+                           lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+    verdict = judge(this_round)
+
+    # **撞上限只记一笔，不重跑。** v1~v3 在这里换账号重跑，安全论证是「撞上限的
+    # 那一轮 codex 从未拿到响应，零工作量」——269 份现网日志、56 条真·额度错误行
+    # 实测推翻了它：距本轮开头**中位 101 行、最小 41 行、最大 23,630 行**
+    # （1.19 MB，一整轮活干到一半），**0 条落在轮首 12 行以内**。
+    # 额度永远是在任务跑到一半用完的，一次例外都没有；而重跑用的是同一个 --dir、
+    # 同一份 brief、danger-full-access，落在一棵已经被改过的树上；而「这一轮到底
+    # 改没改过文件」没法可靠地知道——唯一的线索是日志文本，而日志正是被污染的
+    # 那个东西。于是「重试」从工具的一个循环，变成了调用方的一次重发，
+    # 而重发是安全的：重发时 auto 已经知道这个账号满了。
+    #
+    # **连带死掉的还有「独立探测」，别再把它捡回来。** v3 设计过一次：撞上限后
+    # 用一个写死在代码里、不含任何额度字样的 prompt 再问那个账号一次，用它
+    # 没被污染的输出决定换不换号。它存在的唯一理由是**让轮内重试变安全**——
+    # 重试没了，它就成了一个零消费者的实体（奥卡姆）。v4 里日志的权力已经收小
+    # 到「排序时往后挪一格」，不值得为此每次失败都多烧一轮 codex 启动。
+    # 真要做更强的判据，起点是 `codex exec --json`（结构化事件是「文本分不清
+    # 来源」的根因解法），不是再探一次。
+    #
+    # 判据不可靠这件事在这里的爆炸半径只有**记录**：误判最多给一个健康账号写条
+    # 限流记录，于是它排到后面——仍然会被选中、仍然会被试，只是顺序差一格。
+    # **证据只有一批：`verdict.detail`。** failed 态下它就是本轮已分类的错误行
+    # （`judge` 三个 failed 构造点全传 `errors`，有测试守着这条契约）。
+    # 不自己再扫一遍整轮文本：扫两遍就有两批行，而「判撞没撞上」和「判几点恢复」
+    # 一旦看的不是同一批，就是 2026-09-22 那个 bug 的形状——污染行排在真错误前面时，
+    # 对整轮文本 search() 取到的是污染那一条，于是一个健康账号被记上 2099 年的
+    # 恢复时间，从此永远排最后。
+    if verdict.state == "failed" and hit_usage_limit(verdict.detail):
+        # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
+        # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
+        reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
+        # 三路分叉，**不许把第三路并进第二路**：写失败时说「已记下」，
+        # 和 write_usage_limit 自己刚印的那行「写不进…」在同一屏上自相矛盾。
+        if reset is None:
+            record_note = "这几条错误行里没有恢复时间可记"
+        elif write_usage_limit(home, *reset):     # 写失败它自己吞掉并出声
+            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
+        else:
+            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 没能记下（原因见上一行）"
+        # 下一个账号**算出来，不写死**：记完这一笔之后重新排一次序，第一个就是
+        # 下次会跑的那个。说「下次 auto 会先试」而不是「重跑这条命令会换成」，
+        # 因为后者在强制模式下是假话——重跑的还是 `--account` 指定的那一个。
+        #
+        # **第一个仍是它自己时要换句话。** 那种情形下「下次会先试 <刚撞上限的
+        # 那个>」读起来像是在让人原地重试，而真相是没有更好的选择了。
+        # 判据是 `下一个 == 当前`，不是「只剩一个候选」——后者只是它的一个实例：
+        # 多账号但别的账号恢复得更晚时，第一个同样可能仍是它自己。
+        next_account = accounts_by_availability()[0]
+        whats_next = (f"下次 --account {AUTO} 会先试 {next_account}"
+                      if next_account != account else
+                      f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它")
+        print(f"[codex-sub-agent] {account} 撞上额度上限，{record_note}。{whats_next}。")
+
     _print_verdict(args.task, verdict)
-    print(f"  报告 {report}\n  日志 {_log_path(home, args.task)}")
+    print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
 
 
@@ -1805,7 +2234,13 @@ def build_parser():
     r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
-    r.add_argument("--account", required=True, choices=account_choices(), help="codex 账号")
+    # `--account` **仍然必填**：没有任何隐式选中的值。取值只是多了一个 AUTO。
+    r.add_argument("--account", required=True, choices=account_choices() + [AUTO],
+                   help=f"codex 账号；{AUTO} = 按记录的恢复时间自动挑一个")
+    # help 只说「这个参数选什么」。**撞上限之后会怎样，一个字都不在这里说**——
+    # 轮内重试删掉那一版，SKILL.md 和 README 都改对了，只有这句 help 还写着
+    # 「撞上额度上限就换下一个」，而它恰恰是子代理唯一会读的那份说明。
+    # 失败时的行为归判据，以及判据当场打印的那句话（见 cmd_run 尾部）。
     _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 

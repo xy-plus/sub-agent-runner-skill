@@ -60,6 +60,13 @@
     7. 突变算子把 `if` 体删空 → `IndentationError`。**红的是语法错，不是那条约束。**
        写突变脚本时先 `ast.parse` 一遍，语法错要和「它红了」分开记账，
        否则会把「我把代码改崩了」当成「这条约束有人守」。
+    8. **fixture 与被测常量共享同一个未经现实核对的假设。** 2026-09-22：
+       USAGE_LIMIT_MARK 写的是 ASCII 直引号，codex 输出的是弯引号 U+2019，
+       判据一次都没匹配上过；而 fixture 恰好也用直引号，于是测试照常绿。
+       **注意它不是「什么都不测」**——把匹配逻辑整个禁掉，两条测试都会红。
+       它测不出的是**另一类突变**：改掉引号字符（也就是现实里真正发生的那种偏差），
+       测试毫无反应。防法不是多写断言，而是让断言测**性质**
+       （两种引号都要通过），并引入**未经我手的真实字节**（见 ERR_USER_LAYER_REAL）。
 
     另有一类不是写测试时犯的，是**改接口时误伤**的：新加一个短路分支，可能把
     原本有效的断言吃掉。2026-09-20 加「不许等自己」那一行时，回归锁里「参数那份」
@@ -79,13 +86,14 @@
 
 还有一条验收判据容易被当成数字游戏：`SKILL.md` 的判据是
 **「已由代码保证的约束，在文档里泄漏数 = 0」**，不是行数。
-行数（现在 65 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
+行数（现在 71 行，实跑 wc -l）只说明它确实从 250 行收敛了；为了凑「≤ 50」去删内容，
 删掉的只会是代码替不了的那部分（effort 分档、没有收件箱所以只能
 interrupt-and-resume、退出码怎么读），正好把这次重写的目的做反。
 这条判据本身也有测试守着，见 TestSkillDocDoesNotRepeatCode。
 """
 import argparse
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -105,6 +113,25 @@ import codex_sub_agent as ca
 
 # 真实日志片段（2026-09-19 从 ~/.claude/jobs/2e6058df/tmp/codex-*.log 取）
 ERR_USER_LAYER = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+# 弯引号版本。**codex 实际输出的就是这个**（U+2019），2026-09-22 对 269 份日志
+# 全量核对：56 行真·额度错误 / 28 份，无一例外是弯引号。
+# 上面那条直引号版本留着不是历史包袱——两条一起跑，测的是「判据对引号免疫」
+# 这个性质。
+ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
+# **未经我手的真实字节。** 上面两条都是我敲出来的，而第 8 种空测试形态的成因
+# 正是「fixture 经过了我的手」——我敲的引号和源码常量里的引号共享同一个假设。
+# 这一行是 2026-09-22 从 /home/xy/.codex-subagent-acct3/logs/audit-should-exist-2.log 逐字节拷出来的，
+# 没有经过任何转写。判据要是再一次押在某个会变的字符上，这条第一个红。
+ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 25th, 2026 5:04 PM.'
+# **第二种真实形态：只有时刻，没有日期。** 2026-09-22 全量核对现网日志时发现的
+# ——设计文档最初只写了带日期那一种，是普查把它挖出来的：29 份带额度错误的日志里，
+# 11 份是这个形状（共 22 行，占真实消息的 39%），来自 Plus 账号的 5 小时档。
+# **教训本身比数字值钱：形态清单要从现网语料里数出来，不能从一两条样本里想出来。**
+# 歧义（4:02 是今天还是明天）只在**读到这条消息的那一刻**存在，而消息说的是
+# "try again **at**"——未来，所以 `parse_reset_time` 取 >= now 的下一个该时刻。
+# 时钟只在那一处读一次，排序（`accounts_by_availability`）一次都不读。
+# 逐字节拷自 /home/xy/.codex-subagent-acct3/logs/bn5m-engine-5min.log。
+ERR_USER_LAYER_REAL_NO_DATE = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:02 AM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
 ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
                "\x1b[2mcodex_models_manager::manager\x1b[0m\x1b[2m:\x1b[0m "
@@ -739,6 +766,35 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "failed")
         self.assertIn("额度", v.reason)
 
+    def test_撞额度上限_直引号和弯引号和真实字节都要认(self):
+        # 判据要是押在某一个引号字符上，换一个就全瞎——2026-09-22 之前正是这样：
+        # 常量写的是 ASCII 直引号，现网 56 行额度错误全是弯引号，这条特判死了一个版本。
+        # 而 fixture 当时也是我敲的直引号，两边共享同一个错假设，测试照常绿
+        # （模块头第 8 种空测试形态）。所以这里的第三个 case 是**未经我手的字节**。
+        for name, text in (("直引号", ERR_USER_LAYER),
+                           ("弯引号", ERR_USER_LAYER_CURLY),
+                           ("真实字节", ERR_USER_LAYER_REAL)):
+            with self.subTest(引号=name):
+                v = self._judge(text + "\n")
+                self.assertEqual(v.state, "failed")
+                self.assertIn("额度", v.reason)
+
+    def test_额度判据里不许有标点(self):
+        # 标点是会变的那一类字符（引号有半角全角两套写法）。判据只用字母和空格。
+        self.assertTrue(ca.USAGE_LIMIT_MARK.replace(" ", "").isalpha(),
+                        f"判据含非字母字符：{ca.USAGE_LIMIT_MARK!r}")
+
+    def test_brief里提到额度但实际是被打断_不许判成额度问题(self):
+        # **本组最重要的一条。** 日志里混着 brief 原文和 codex 转述的子进程输出，
+        # 对整轮自由文本做子串匹配会把它们当成 codex 自己的错误。2026-09-22 实测：
+        # 现网 3 份日志共 71 行「提到」这句话却不是错误行，正是这么来的。
+        # 判成额度问题的后果不再只是「解释错了」——cmd_run 会据此给这个账号
+        # 记一笔限流，而它排序时永不过期，那个健康账号从此排到最后。
+        brief_echo = "任务：排查为什么会 hit your usage limit\n"
+        v = self._judge(brief_echo + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(v.state, "interrupted")
+        self.assertNotIn("额度", v.reason)
+
     def test_报告是散文也算success_并预览前几行(self):
         # 实测 156 份真实报告只有 4 份能解析成 JSON：-o 写的是 agent 的最后一条
         # 消息，通常是 markdown 散文。报告里该有什么字段是任务层的事。
@@ -789,9 +845,69 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
 
-    def test_撞额度上限比被打断更该被说出来(self):
-        # 两个都命中时，「换账号」比「可以 resume」更接近真正的处置
-        self.assertIn("额度", self._judge(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n").reason)
+    def test_只是提到写锁字样_不算被写锁占住(self):
+        """和上一条同一个病，`THREAD_LOCK_MARK` 这一支之前是整轮裸子串匹配。
+
+        **现网数据：这个标记出现在 12 行里，已分类的错误行 0 行**——12 行全是
+        codex 带行号 cat 出本项目自己的源码和测试（`THREAD_LOCK_MARK = …`、
+        `ERR_FATAL = …`、`assertIn("already has an active writer", …)`）。
+        裸子串匹配在真实语料上是 12/12 全假阳。
+
+        后果不只是「解释错了」：写锁那句 reason 的处置是**「只能新起一个任务」**
+        ——让人把一个其实只是没产出报告的任务整个丢掉重来。
+
+        真的写锁错误是 `Error: …` 开头（见 `ERR_FATAL`），本来就进
+        `runtime_error_lines()`，所以收窄是安全的。
+        """
+        污染 = '        141\tTHREAD_LOCK_MARK = "already has an active writer"'
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行")
+        v = self._judge(污染 + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+        self.assertNotIn("写锁", v.reason, "判据在拿整轮裸文本做子串匹配")
+        # 真的写锁错误仍然要认出来，否则这条就只是把功能删了
+        self.assertIn("写锁", self._judge(ERR_FATAL + "\n").reason,
+                      "收窄过头了：真的写锁错误也不认了")
+
+    def test_只是提到额度字样_不算撞上限(self):
+        """**这条钉的是整个额度判据的地基，而它之前一条测试都没有。**
+
+        2026-09-22 实测突变：把 `hit_usage_limit(errors)` 改回
+        `USAGE_LIMIT_MARK in round_text`，**全套 313 条照样全绿**。
+        原因是模块头第 5/6 条那个形状：既有那条钉优先级的测试喂的是
+        「额度字样 + 打断标记」，而打断分支排最前，**短路把断言吃掉了**。
+
+        所以这里喂的是一行**不以 `ERROR:` 开头**、只是提到该字样的文本，
+        而且是真实现场的形状：codex 带行号 `cat` 出了含这个字面串的源码行。
+        它进不了 `runtime_error_lines()`，就不该被判成额度问题。
+        """
+        污染 = "    47  ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. …'"
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行，那它本来就该算数")
+        v = self._judge(污染 + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+        self.assertNotIn("额度", v.reason,
+                         "判据在拿整轮裸文本做子串匹配——brief 回显、源码引用都会命中")
+
+    def test_打断标记优先于额度字样(self):
+        # 打断标记是本工具自己写的，是关于「我们做了什么」的不可伪造证据；
+        # 额度字样可以来自 brief 回显、codex 读文件的回显、子进程输出。
+        # 两者同时出现，打断必须赢——否则一轮「被我们打断、上下文还在、resume 就行」
+        # 的任务会被判成额度问题，进而（在 cmd_run 里）给一个健康账号记上限流记录，
+        # 而那条记录排序时永不过期。
+        v = self._judge(ERR_USER_LAYER_REAL + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(v.state, "interrupted")
+        self.assertIn("resume", v.reason)
+
+    def test_没有打断标记时_额度字样要点名(self):
+        # 原来这条叫「撞额度上限比被打断更该被说出来」，钉的是相反的优先级。
+        # 那是额度判据还只是「给人看的解释」时写的；现在它要决定删不删元数据、
+        # 换不换账号，而打断标记是不可伪造的那一个。见 test_打断标记优先于额度字样。
+        v = self._judge(ERR_USER_LAYER_REAL + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("额度", v.reason)
 
     def test_非UTF8的报告不许把判据打崩(self):
         # codex 被 SIGINT 打断时可能只写出半截字节
@@ -848,13 +964,51 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
 
-    def test_额度上限和写锁仍然是failed_它们resume救不回来(self):
-        # 这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉
-        for mark in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
-            with self.subTest(mark=mark):
-                v = ca.judge(ca.Round(self.report, mark + "\n" + ca.INTERRUPT_MARK + "\n"))
+    def test_failed态的detail恒等于本轮已分类的错误行(self):
+        """**`cmd_run` 靠这条契约省掉一次重复扫描**，所以它得有人守着。
+
+        `Verdict.detail` 的注释写着「suspect／failed：出事的那几行」。三个
+        `Verdict("failed", …)` 构造点全传 `errors`，而 `errors` 就是
+        `runtime_error_lines(round_text)`。哪天有人给某一支传了个**过滤过**的
+        清单，`cmd_run` 就会静默地少看几行——撞上限却不记录，而没有任何信号。
+        """
+        for name, text in (
+                ("额度上限", ERR_USER_LAYER_REAL + "\n"),
+                ("写锁", ERR_FATAL + "\n"),
+                ("报告缺失", "什么都没有\n"),
+                ("报告缺失且有杂错误", "ERROR: boom\n" + ERR_TRACING_UNKNOWN + "\n")):
+            with self.subTest(情形=name):
+                v = ca.judge(ca.Round(self.report, text))
+                self.assertEqual(v.state, "failed", "前提不成立：这条根本不是 failed")
+                self.assertEqual(v.detail, ca.runtime_error_lines(text))
+
+    def test_没有打断标记时_额度上限和写锁仍然是failed(self):
+        """这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉。
+
+        **喂的是成形的错误行，不是裸标记串。** 2026-09-22 把额度判据搬到
+        `runtime_error_lines()` 的返回值上之后，旧写法（`for mark in
+        (ca.USAGE_LIMIT_MARK, ...)`，直接把标记本身当成一整轮日志）当场变红。
+        那不是回归——是旧 fixture 连同「裸文本里提到就算数」这个错误假设一起
+        断言了进去，正是模块头第 8 种空测试形态。
+
+        **前提里刻意不带打断标记。** 这条原先叫「额度上限和写锁仍然是 failed
+        _它们 resume 救不回来」，喂的是「证据行 + 打断标记」，钉的是「额度／写锁
+        压过打断」。那个优先级已被推翻（见 `judge` 里「打断排最前」那段注释与
+        `TestJudge.test_打断标记优先于额度字样`）：标记是本工具自己写的、不可伪造，
+        而这两条靠的是会被 brief 原文和 codex 读文件回显污染的字面串。
+        本条要钉的那件事——第五态不许顺手吃掉这两种处置——在没有标记时原样成立。
+        """
+        for name, evidence, 处置 in (("额度上限", ERR_USER_LAYER_REAL, "换账号"),
+                                     ("写锁", ERR_FATAL, "新起一个任务")):
+            with self.subTest(情形=name):
+                v = ca.judge(ca.Round(self.report, evidence + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
+                # reason 必须钉住：`failed` 这个状态还有一条「报告缺失」的兜底，
+                # 它对任何输入都成立。只断言状态的话，换一行毫无关系的垃圾
+                # 也能让这条绿——那就又是一条什么都不挡的空测试。
+                self.assertIn(处置, v.reason,
+                              "命中的是「报告缺失」那条兜底，不是这一支特判")
 
     def test_打断与错误行共存时状态取interrupted_错误行照常进detail(self):
         """被 INT 打断几乎必然留下
@@ -873,6 +1027,442 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertIn("codex_core::session", v.detail[0])
 
 
+class TestParseResetTime(unittest.TestCase):
+    """真实消息有**两种**形态（2026-09-22 对现网 269 份日志全量核对）：
+
+        try again at Sep 25th, 2026 5:04 PM     34 行 / 17 份   Pro，周额度
+        try again at 11:10 AM                   22 行 / 11 份   Plus，5 小时档
+
+    第二种**只有时刻没有日期**，占真实消息的 39%。
+
+    `now` 一律显式传：这是本功能唯一读时钟的地方，隐式的 `datetime.now()`
+    会让「今天还是明天」随测试运行的时刻飘。
+    """
+
+    NOW = datetime.datetime(2026, 9, 22, 9, 0)
+
+    def test_解析真实消息(self):
+        got = ca.parse_reset_time("or try again at Sep 25th, 2026 5:04 PM.", now=self.NOW)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 25, 17, 4))
+        self.assertEqual(got[1], "Sep 25th, 2026 5:04 PM")
+
+    def test_从整行真实日志字节里也解析得出(self):
+        # 未经我手的那一份（见 ERR_USER_LAYER_REAL）。fixture 自己敲的那些
+        # 只能证明正则和我的假设自洽，证明不了它对得上现实。
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL, now=self.NOW)[0],
+                         datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_只有时刻没有日期的那种_换算成下一个该时刻(self):
+        # 现网 11 份日志是这种（Plus 账号的 5 小时档）。
+        # 消息说的是 "try again AT"——未来，所以取 >= now 的下一个该时刻。
+        # 时钟只在这里读一次；排序一次都不读（见 accounts_by_availability）。
+        got = ca.parse_reset_time("or try again at 11:10 AM.", now=self.NOW)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 22, 11, 10), "同一天的晚些时候")
+        self.assertEqual(got[1], "11:10 AM")
+
+    def test_只有时刻_已经过了就算明天_跨月跨年也要对(self):
+        """「+1 天」不许自己拿 `day + 1` 拼——那在月末年末会造出 9 月 31 日。
+
+        实现用的是 `timedelta(days=1)`，日历进位归标准库。这三个 case 钉的就是
+        「进位没被自己实现一遍」：月末、年末各一条，删掉 timedelta 改成手拼当场红。
+        """
+        for name, now, want in (
+                ("同月内跨到明天", datetime.datetime(2026, 9, 22, 15, 0),
+                 datetime.datetime(2026, 9, 23, 11, 10)),
+                ("跨月", datetime.datetime(2026, 9, 30, 15, 0),
+                 datetime.datetime(2026, 10, 1, 11, 10)),
+                ("跨年", datetime.datetime(2026, 12, 31, 15, 0),
+                 datetime.datetime(2027, 1, 1, 11, 10))):
+            with self.subTest(情形=name):
+                got = ca.parse_reset_time("or try again at 11:10 AM.", now=now)
+                self.assertEqual(got[0], want)
+
+    def test_只有时刻_正好等于now就算今天(self):
+        # 边界：消息说 at 11:10，此刻正好 11:10，那就是现在，不是明天
+        now = datetime.datetime(2026, 9, 22, 11, 10)
+        self.assertEqual(ca.parse_reset_time("try again at 11:10 AM.", now=now)[0], now)
+
+    def test_只有时刻_从整行真实日志字节里也解析得出(self):
+        # 未经我手的那一份（见 ERR_USER_LAYER_REAL_NO_DATE），4:02 AM。
+        # now 取 9:00，所以答案是**明天**的 4:02。
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL_NO_DATE, now=self.NOW)[0],
+                         datetime.datetime(2026, 9, 23, 4, 2))
+
+    def test_带日期的那种不受now影响(self):
+        # 带日期的消息自带全部信息，不许被 now 改写
+        for now in (datetime.datetime(2020, 1, 1), datetime.datetime(2030, 1, 1)):
+            with self.subTest(now=now):
+                self.assertEqual(
+                    ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM", now=now)[0],
+                    datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_只有时刻那一支必须紧贴try_again_at_不许在全文里捡时刻(self):
+        """松开那个锚点，突变**存活**——所以这条是专门来杀它的。
+
+        承重在于：`cmd_run` 喂进来的是**整轮日志文本**（`round.text`），
+        不是单独一行。全文里随便哪儿的 `3:00 PM`（报告正文、brief 回显、
+        codex 读文件的回显）都会被捡走，变成一个凭空捏造的恢复时间落盘。
+        而带日期那一支只要格式稍有出入（少个序数后缀）就匹配不上，
+        于是「捡时刻」这条路真的会被走到。
+        """
+        for name, text in (
+                ("带日期但格式不对", "try again at Sep 25, 2026 5:04 PM"),
+                ("全文里的无关时刻", "报告：下午 3:00 PM 部署\n"
+                                     "ERROR: You’ve hit your usage limit.\n")):
+            with self.subTest(情形=name):
+                self.assertIsNone(ca.parse_reset_time(text, now=self.NOW))
+
+    def test_两种形态都要用现网真实字节验一次(self):
+        """有现网日志时多验一道；**没有就 skip，不是 fail**。
+
+        本模块头一句话就是「零依赖、零 codex token」，而这条要扫的是开发机
+        `~/.codex-subagent*/logs/` 下的几百份日志（本机 269 份、158MB）。
+        换台机器、日志轮转、或者干净 checkout，它就必红——**红的会是环境，
+        不是代码**，而那种红会训练人忽略红色。
+
+        skip 不是静默失效：输出里是 `s`、结尾是 `OK (skipped=1)`，看得见。
+        而且这条**不是唯一的真实字节防线**——两种形态在仓内各有一条逐字节
+        fixture（`ERR_USER_LAYER_REAL` / `ERR_USER_LAYER_REAL_NO_DATE`），
+        它们跟着仓库走，在任何机器上都跑。这条多验的是「**全量**都还解析得出」。
+        """
+        seen = set()
+        lines = 0
+        # 走 `Path.home()` 而不是写死 /home/xy：本类不是 _HomeSandbox 的子类，
+        # 沙箱 patch 在这里没生效，拿到的就是真实 HOME。只读，不写。
+        for f in pathlib.Path.home().glob(".codex-subagent*/logs/*.log"):
+            for line in ca.runtime_error_lines(f.read_text(errors="replace")):
+                if ca.USAGE_LIMIT_MARK not in line:
+                    continue
+                lines += 1
+                got = ca.parse_reset_time(line, now=self.NOW)
+                if got is not None:
+                    seen.add("带日期" if got[1][0].isalpha() else "只有时刻")
+        if not lines:
+            self.skipTest("这台机器上没有带额度错误的现网日志（仓内两条逐字节 "
+                          "fixture 仍然覆盖了同样的性质，见 ERR_USER_LAYER_REAL*）")
+        self.assertEqual(seen, {"带日期", "只有时刻"},
+                         "现网两种形态都必须解析得出；只覆盖一种说明判据还有一半是瞎的")
+
+    def test_四种序数后缀都要认(self):
+        for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (4, "th")):
+            with self.subTest(日=day):
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at Sep {day}{suffix}, 2026 5:04 PM",
+                                        now=self.NOW)[0].day, day)
+
+    def test_中午和午夜(self):
+        # 12 AM = 0 点、12 PM = 12 点。直接 +12 会把两者都算错。
+        for form in ("Sep 1st, 2026 12:30", "12:30"):
+            with self.subTest(形态=form):
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at {form} AM", now=self.NOW)[0].hour, 0)
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at {form} PM", now=self.NOW)[0].hour, 12)
+
+    def test_小时不在1到12的畸形消息返回None_不许静默编一个出来(self):
+        # `int("99") % 12 + 12 == 15`——取模会把一条畸形消息静默编造成一个
+        # 看起来完全合理的恢复时间，而这个值要落盘、要排序、要显示给人看。
+        # 两种形态各有一条路，**两条都要挡**。
+        for form in ("Sep 1st, 2026 99:04", "99:04"):
+            with self.subTest(形态=form):
+                self.assertIsNone(ca.parse_reset_time(f"try again at {form} PM", now=self.NOW))
+
+    def test_没这句话就返回None(self):
+        self.assertIsNone(ca.parse_reset_time("ERROR: something else entirely", now=self.NOW))
+
+    def test_月份名乱写返回None不崩(self):
+        # 正则的 [A-Z][a-z]{2} 会匹配 "Foo"，所以月份必须再查一次表。
+        # **不许退回「只有时刻」那一支**：这条消息自带日期，拿它的时刻当今天／明天
+        # 就是编一个假恢复时间出来，而 None 只是退化成「无记录＝照样会被试到」。
+        self.assertIsNone(ca.parse_reset_time("try again at Foo 1st, 2026 5:04 PM",
+                                              now=self.NOW))
+
+    def test_不存在的日期返回None不崩(self):
+        self.assertIsNone(ca.parse_reset_time("try again at Feb 31st, 2026 5:04 PM",
+                                              now=self.NOW))
+
+    def test_返回朴素时间_不编造时区(self):
+        # 消息里没有时区，实测也推不出来。编一个出来就是撒谎；
+        # 这个值只当排序键，朴素时间足够。
+        for text in ("try again at Sep 25th, 2026 5:04 PM", "try again at 5:04 PM"):
+            with self.subTest(形态=text):
+                self.assertIsNone(ca.parse_reset_time(text, now=self.NOW)[0].tzinfo)
+
+    def test_now必填_不许有隐式的当前时钟(self):
+        # 仓库规范第 6 条：不要缺省值。这是本功能唯一读时钟的地方，
+        # 给了缺省就会有人不传，于是「今天还是明天」随调用时刻飘而没人看得见。
+        with self.assertRaises(TypeError):
+            ca.parse_reset_time("try again at 11:10 AM")
+
+
+class TestUsageLimitReset(unittest.TestCase):
+    """恢复时间**只从已分类且命中额度字样的那些行**里取。
+
+    这条和 `hit_usage_limit` 是同一条规矩的两半：判「撞没撞上」看已分类的错误行，
+    判「几点恢复」也必须看同一批行。只守前一半是没用的——2026-09-22 实测，
+    污染行排在真错误**前面**时，对整轮文本 `search()` 取到的是污染那一条。
+    """
+
+    NOW = datetime.datetime(2026, 9, 22, 9, 0)
+    # 污染样本抄自真实现场：plan 审查任务里 codex 带行号 cat 出了测试 fixture。
+    POISON = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
+
+    def test_只认命中额度字样的那一行_不认整轮文本(self):
+        # **污染行排在前面**——这是承重的排列：`search()` 取全文第一个匹配。
+        lines = ca.runtime_error_lines(self.POISON + "\n" + ERR_USER_LAYER_REAL + "\n")
+        self.assertNotIn(self.POISON, lines, "前提不成立：污染行被分类成了错误行")
+        got = ca.usage_limit_reset(lines, now=self.NOW)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 25, 17, 4),
+                         "取到了 2099 就是从整轮文本里捡的，不是从错误行里取的")
+        self.assertEqual(got[1], "Sep 25th, 2026 5:04 PM", "raw 也要是真那条，它是审计线索")
+
+    def test_没有命中额度字样的行就返回None(self):
+        self.assertIsNone(ca.usage_limit_reset(["Error: 别的毛病"], now=self.NOW))
+        self.assertIsNone(ca.usage_limit_reset([], now=self.NOW))
+
+    def test_命中了但那一行没有时间_返回None(self):
+        # 命中了额度字样但那一行没有时间。这个形状现网见得到（2 行），但那 2 行
+        # 是**污染不是形态**——出自本项目自己的日志，codex 把报告正文引了进来；
+        # OpenAI 的两种真消息都带时间。来源不影响这里该怎么做：
+        # **不许退回去扫别的行**，那就又是「从别处捡一个时间」。
+        lines = ["ERROR: You’ve hit your usage limit",
+                 "Error: 顺便提一句 try again at Dec 31st, 2099 11:59 PM"]
+        self.assertIsNone(ca.usage_limit_reset(lines, now=self.NOW))
+
+    def test_多行命中时取第一条解析得出的(self):
+        lines = ["ERROR: You’ve hit your usage limit",          # 命中但没时间
+                 ERR_USER_LAYER_REAL]                            # 命中且有时间
+        self.assertEqual(ca.usage_limit_reset(lines, now=self.NOW)[0],
+                         datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_和hit_usage_limit收同一种东西(self):
+        """两个谓词的**输入类型必须一样**，否则下一个人会给其中一个喂整轮文本。
+
+        这不是形式主义：C1 那个 bug 的形状就是「判撞没撞上用错误行，
+        判几点恢复用整轮文本」。
+        """
+        lines = ca.runtime_error_lines(ERR_USER_LAYER_REAL + "\n")
+        self.assertTrue(ca.hit_usage_limit(lines))
+        self.assertIsNotNone(ca.usage_limit_reset(lines, now=self.NOW))
+
+
+class TestUsageLimitFile(unittest.TestCase):
+    def setUp(self):
+        # 纯文件操作，不碰 HOME——`_HomeSandbox` 的 docstring 说了「纯函数测试不要它」
+        self.home = pathlib.Path(tempfile.mkdtemp())
+
+    def test_写了能读回来(self):
+        when = datetime.datetime(2026, 9, 25, 17, 4)
+        ca.write_usage_limit(self.home, when, "Sep 25th, 2026 5:04 PM")
+        self.assertEqual(ca.read_usage_limit(self.home), when)
+
+    def test_键只有两个(self):
+        # seen_at 之类没有消费者的字段一旦加进去就再也删不掉了
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertEqual(set(json.loads(ca.usage_limit_path(self.home).read_text())),
+                         {"reset_at", "raw"})
+
+    def test_raw原样保留(self):
+        # raw 是审计线索：解析错了要能一眼看出错在哪，所以不许加工
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4),
+                             "Sep 25th, 2026 5:04 PM")
+        self.assertEqual(json.loads(ca.usage_limit_path(self.home).read_text())["raw"],
+                         "Sep 25th, 2026 5:04 PM")
+
+    def test_读不出一条有效记录时一律退化成无记录(self):
+        # 读不出来就当「没有记录」＝排最前＝照样会被试到，那是安全的一边。
+        # 反过来（读不出来就认定还在限流）会把可用账号锁死且调用方看不出原因。
+        # 有效的形状只有一种：两个键都在、reset_at 是朴素 ISO 串、raw 是字符串。
+        # 剩下全部无效——**包括「像是对的」那几种**，那几种才是会咬人的。
+        q = ca.usage_limit_path(self.home)
+        for name, content in (("文件不存在", None),
+                              ("坏 json", "{不是 json"),
+                              ("整个不是对象", '"就一个字符串"'),
+                              ("缺 reset_at", '{"raw": "x"}'),
+                              ("缺 raw", '{"reset_at": "2026-09-25T17:04:00"}'),
+                              ("raw 类型不对", '{"reset_at": "2026-09-25T17:04:00", "raw": 5}'),
+                              ("reset_at 类型不对", '{"reset_at": 20260925, "raw": "x"}'),
+                              ("时间串坏了", '{"reset_at": "昨天", "raw": "x"}'),
+                              ("带时区", '{"reset_at": "2026-09-25T17:04:00+08:00", "raw": "x"}')):
+            with self.subTest(情形=name):
+                if content is None:
+                    q.unlink(missing_ok=True)
+                else:
+                    q.write_text(content)
+                self.assertIsNone(ca.read_usage_limit(self.home))
+
+    def test_带时区的记录不许放行_否则排序当场炸(self):
+        """上一条只说「带时区＝无效」，这条说**为什么**。
+
+        `reset_at` 存的是**朴素**本地时间（`parse_reset_time` 刻意不编造时区）。
+        放行一个 aware 值，排序里 `read_usage_limit(home) or datetime.min`
+        就会拿 aware 和 naive 比——实测
+        `TypeError: can't compare offset-naive and offset-aware datetimes`，
+        一个手写坏的状态文件把整条 auto 命令打死。而按设计，状态文件最坏
+        只该让顺序排差。
+        """
+        ca.usage_limit_path(self.home).write_text(
+            '{"reset_at": "2026-09-25T17:04:00+08:00", "raw": "x"}')
+        got = ca.read_usage_limit(self.home)
+        # 这一行就是排序里那个表达式。放行 aware 值时它 TypeError，不是 assert 失败。
+        self.assertLess(got or datetime.datetime.min, datetime.datetime(2026, 1, 1))
+
+    def test_写盘失败不许把调用方打断_但也不许静默(self):
+        """记录是优化，不是前提：写不进去最多让下次排序少一条依据，
+        **绝不能把本轮的收尾打断**——判结论、印报告/日志路径、返回退出码都排在
+        它后面，抛出去的话调用方连「这一轮到底怎么了」都拿不到。
+        （v1~v3 这里写的是「不能把正在进行的重试打断」。v4 没有轮内重试了，
+        但这条约束原样成立，只是被保护的对象从「下一次尝试」变成了「本轮的收尾」。）
+
+        约束做在函数自己身上，不是做在调用方的记性上。调用方每多一个就要记得
+        包一层 try，而「必须记得」正是这个工具存在的理由本身（铁律 2）。
+        吞掉但**出声**：静默失效是这个仓库反复在修的那类病。
+        """
+        gone = self.home / "这个目录不存在"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            成了 = ca.write_usage_limit(gone, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertFalse(成了, "写失败必须**告诉调用方**，不能只印一行就算完")
+        self.assertIn(str(ca.usage_limit_path(gone)), out.getvalue(),
+                      "出声要点名是哪个文件写不进去，不然人不知道去看哪儿")
+        self.assertIsNone(ca.read_usage_limit(gone))
+
+    def test_写成功要返回True_否则调用方没法说真话(self):
+        # **返回值就是那道约束。** 不返回的话，调用方只能假定「写进去了」，
+        # 于是写失败时同一屏会出现两句矛盾的话（实测过：write_usage_limit 印
+        # 「写不进…」，紧接着 cmd_run 印「恢复时间 09-25 17:04 已记下」）。
+        成了 = ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertTrue(成了)
+        self.assertIsNotNone(ca.read_usage_limit(self.home), "返回 True 就必须真的读得回来")
+
+    def test_临时文件名带pid_两个并发写者不会互相污染(self):
+        # **这条钉的是本文件和 write_meta 的关键区别。** usage_limit.json 是账号级的，
+        # 同一账号上的两个任务可能同时撞上限。固定临时名会让两个写者把同一个临时
+        # 文件写成混合内容，再原子替换进去。
+        a = ca._usage_limit_tmp(self.home, 111)
+        b = ca._usage_limit_tmp(self.home, 222)
+        self.assertNotEqual(a, b, "两个进程必须拿到不同的临时文件名")
+        self.assertTrue(a.name.endswith(".tmp"))
+
+    def test_原子替换_替换前目标仍是完整旧内容(self):
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "旧")
+        seen = []
+        real_replace = os.replace
+        def spy(src, dst):
+            seen.append(json.loads(pathlib.Path(dst).read_text())["raw"])
+            return real_replace(src, dst)
+        # patch 模块自己的 os，别 patch 全局的——全局的会波及 unittest 内部
+        with mock.patch.object(ca.os, "replace", spy):
+            ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 26, 17, 47), "新")
+        self.assertEqual(seen, ["旧"], "替换发生前目标文件必须还是完整的旧内容")
+
+
+class TestAccountChoicesGuards(_HomeSandbox):
+    def test_保留名目录要拒跑并点名(self):
+        # default：现有代码会返回两个 'default'，两次指向同一个 home，
+        #          find_meta 会对同一份元数据数出两份，当场误拒。
+        # auto   ：它是 --account 的模式词，真账号同名就再也没法被明确指定。
+        for name in ("default", "auto"):
+            with self.subTest(保留名=name):
+                d = self.home / ".codex-accounts" / name
+                d.mkdir(parents=True)
+                with self.assertRaises(ca.Rejected) as got:
+                    ca.account_choices()
+                self.assertIn(name, got.exception.message)
+                self.assertIn(str(d), got.exception.message, "要点名是哪个目录")
+                # **迁移办法要给全的那一半。** 拒绝半径是整个 CLI
+                # （account_choices 挂在 build_parser 的 choices= 上），所以用户
+                # 只能照着这段话做。光改账号目录名不够：住在
+                # .codex-subagent-auto 里的任务之后再也扫不到，status 看不见、
+                # stop 停不掉——正是本函数上方注释反复要避免的静默失效。
+                self.assertIn(str(ca.isolation_home(name)), got.exception.message,
+                              "没告诉用户隔离目录也要一起改名，照做之后任务会从 status 消失")
+                d.rmdir()
+
+    def test_候选各自指向不同的隔离目录(self):
+        # 重名只是表象，**真正咬人的是两个候选指向同一个 home**：
+        # find_meta 会把同一份元数据数成两份，当场拒绝「任务名在多个隔离目录里都有」。
+        for name in ("acct2", "acct3"):
+            (self.home / ".codex-accounts" / name).mkdir(parents=True)
+        got = ca.account_choices()
+        self.assertEqual(len(got), len(set(got)))
+        homes = [ca.isolation_home(a) for a in got]
+        self.assertEqual(len(homes), len(set(homes)))
+
+
+class TestAccountOrder(_HomeSandbox):
+    """排序只影响**先试谁**，不影响**试不试**。所以这里每条断言都是关于顺序的，
+    只有最后一条是关于「一个都不少」——那是本设计的核心约束。
+    """
+
+    def setUp(self):
+        super().setUp()      # HOME 沙箱：Path.home() 和 $HOME 两条都 patch 掉
+        for name in ("acct2", "acct3"):
+            d = self.home / ".codex-accounts" / name
+            d.mkdir(parents=True)
+            (d / "auth.json").write_text("{}")     # 有登录态才进候选
+        for account in ("default", "acct2", "acct3"):
+            (ca.isolation_home(account) / "tasks").mkdir(parents=True)
+
+    def _limit(self, account, when):
+        ca.write_usage_limit(ca.isolation_home(account), when, "测试写的")
+
+    def test_没记录的排在有记录的前面(self):
+        self._limit("default", datetime.datetime(2099, 1, 1))
+        self._limit("acct3", datetime.datetime(2098, 1, 1))
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2")
+
+    def test_有记录的按恢复时间升序(self):
+        self._limit("default", datetime.datetime(2099, 1, 2))
+        self._limit("acct2", datetime.datetime(2099, 1, 1))
+        self._limit("acct3", datetime.datetime(2099, 1, 3))
+        self.assertEqual(ca.accounts_by_availability(), ["acct2", "default", "acct3"])
+
+    def test_全都没记录时按账号名_顺序必须确定(self):
+        # 不写第二键的话，顺序跟着 account_choices 的扫描顺序漂，
+        # 同一个输入在两台机器上给出两种结果。
+        self.assertEqual(ca.accounts_by_availability(), ["acct2", "acct3", "default"])
+
+    def test_任务住在哪不影响顺序_否则限流的那个家会变成死循环(self):
+        """**这条钉的是一个被删掉的排序键。**
+
+        v3 有过「这个任务已经住在哪」这个第一键（住着的排最前，沿用它的家），
+        那是为**轮内重试**服务的：先试旧家，撞上限再搬走。v4 去掉重试之后
+        它变成陷阱——任务住的那个账号限流了也照样被选中，于是每次重跑都选它、
+        每次都撞上限，**永远换不掉**，而 auto 的全部意义就是换掉它。
+
+        skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
+        传 [] 当场 ValueError。
+        """
+        ca.write_meta(ca.isolation_home("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "high", ()))
+        self._limit("acct3", datetime.datetime(2099, 12, 31))
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2",
+                         "任务住在 acct3 且 acct3 限流到 2099——它不许排第一")
+
+    def test_过期记录排在无记录之后_但语义仍然正确(self):
+        # **这条钉的是一个曾经写错的理由。** 排序不读当前时间，所以过期记录
+        # 不会「自动变成无记录」——它排进「恢复得早的那一批」，批内按先后排。
+        # 机制是对的，第一版 spec 说的「时间一过自然排到最前面」是错的。
+        self._limit("default", datetime.datetime(2000, 1, 1))   # 早就过期了
+        self._limit("acct3", datetime.datetime(2099, 1, 1))
+        got = ca.accounts_by_availability()
+        self.assertEqual(got, ["acct2", "default", "acct3"],
+                         "无记录的 acct2 仍排第一，过期的 default 排第二")
+
+    def test_没有登录态的账号不进候选(self):
+        # ensure_isolation 会因为缺登录态直接 reject 退出 2。不过滤的话，
+        # 一个账号缺登录态就会把整条 auto 命令打死，哪怕别的账号完全可用。
+        (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
+        self.assertNotIn("acct3", ca.accounts_by_availability())
+
+    def test_有登录态的一个都不少(self):
+        # **本设计的核心约束。** 额度记录只排顺序，绝不把账号排除出候选。
+        for account in ("default", "acct2", "acct3"):
+            self._limit(account, datetime.datetime(2099, 1, 1))
+        self.assertEqual(sorted(ca.accounts_by_availability()),
+                         sorted(ca.account_choices()))
+
+
 class TestIsolation(_HomeSandbox):
     def setUp(self):
         super().setUp()
@@ -881,6 +1471,21 @@ class TestIsolation(_HomeSandbox):
 
     def test_账号可选项来自实际目录扫描(self):
         self.assertEqual(ca.account_choices(), ["default", "acct2"])
+
+    def test_隔离目录顶层多出一个文件_ensure_isolation不许拒(self):
+        """`usage_limit.json` 就住在这里（见 `usage_limit_path`），这条是它的地基。
+
+        不变量只有四条：五个子目录在、共享扫描根为空、config.toml 不是软链、
+        auth.json 软链到该账号。**顶层文件既不枚举也不拒绝。** 哪天有人往
+        `ensure_isolation` 里加一条「顶层只许有这几样」，限流记录会当场
+        把每一次 run 打死——这条测试要在那之前红。
+        """
+        home = ca.ensure_isolation("acct2")
+        ca.write_usage_limit(home, datetime.datetime(2026, 9, 25, 17, 4), "Sep 25th, 2026 5:04 PM")
+        (home / "某个谁也没料到的文件").write_text("x")
+        self.assertEqual(ca.ensure_isolation("acct2"), home)
+        self.assertEqual(ca.read_usage_limit(home), datetime.datetime(2026, 9, 25, 17, 4),
+                         "再跑一次不许把限流记录冲掉")
 
     def test_账号目录名含空白或控制字符就拒跑_并点名是哪个目录(self):
         # 这个名字会进 status 的第二列，而那一列是按空白切分的边界之一。
@@ -1164,7 +1769,7 @@ class TestMeta(_HomeSandbox):
         self.assertIn("缺字段", cm.exception.message)
 
     def test_同名任务出现在两个隔离目录就拒绝_不许猜(self):
-        # 这条路很好走：撞额度上限 → 换账号重跑同名任务
+        # 这条路很好走：auto 挑中另一个账号 → 同一个任务名在两个隔离目录里各一份
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
         for account in ("default", "acct2"):
@@ -1752,6 +2357,9 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         r"session id|session_id": "extract_session_id / 元数据",
         r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
         r"不得使用任何 skill": "build_skill_guard（兜底句由 --skill/--no-skill 每轮派生）",
+        # 「撞没撞上限、几点恢复、记在哪」整条链路都归代码：文档只说
+        # auto 会挑一个没在限流的、撞上限会记下来，不说它存在哪个文件里。
+        r"usage_limit\.json": "hit_usage_limit / parse_reset_time / write_usage_limit",
     }
 
     def test_没有一条代码级约束泄漏进文档(self):
@@ -1761,6 +2369,32 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         self.assertEqual(leaked, {},
                          "这些约束已经由代码保证，文档里不该再说一遍："
                          + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
+
+    def test_参数说明不许承诺失败时的行为(self):
+        """`--help` 是子代理唯一会读的那份说明，也是最容易和代码悄悄脱节的那份。
+
+        2026-09-22 实测：轮内重试删掉之后，`--account` 的 help 还写着
+        「撞上额度上限就换下一个」——SKILL.md 和 README 都改对了，只有它没有，
+        而它恰恰是机器读的那一份。**没有任何东西守着它**，所以它漂了整整一版。
+
+        规则不是「别写错」，是**别在这里写**：参数说明的职责是「这个参数选什么」；
+        「失败了会怎样」归判据，以及判据当场打印的那句话。少说一件事，
+        就少一个会漂的家——这和 OWNED_BY_CODE 守的是同一条原则，只是方向相反。
+        """
+        promise_words = ("重试", "重跑", "换下一个", "自动换号", "会换成", "会先试")
+        parser = ca.build_parser()
+        subs = {name: sub for action in parser._subparsers._group_actions
+                for name, sub in getattr(action, "choices", {}).items()}
+        self.assertTrue(subs, "没取到子命令，这条测试什么都没验")
+        leaked = {}
+        for name, sub in subs.items():
+            for action in sub._actions:
+                for word in promise_words:
+                    if action.help and word in action.help:
+                        leaked[f"{name} {'/'.join(action.option_strings) or action.dest}"] = word
+        self.assertEqual(leaked, {},
+                         "参数说明里不该承诺失败时的行为（它会和代码脱节，而机器只读它）："
+                         + "；".join(f"{k} 说了「{v}」" for k, v in leaked.items()))
 
     def test_文档仍然保留代码替不了的那部分(self):
         """反向守一道：别为了让上面那条变绿，把该留的也删了。
@@ -1810,6 +2444,20 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         self.assertRegex(skill, r"前四列.*任务名.*账号.*状态.*退出码",
                          "前四列是哪四列、什么顺序——这条没了，调用方就得自己猜")
         self.assertRegex(skill, r"缩进的行是明细", "「缩进的行不是任务」这条没了")
+        # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
+        # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
+        # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
+        self.assertRegex(skill, r"--account auto`[^\n]*默认就写这个",
+                         "「auto 是默认写法」这条没了")
+        self.assertRegex(skill, r"撞上额度上限\*\*不会自动重跑\*\*",
+                         "「撞上限不自动重跑」这条没了——调用方会以为树是干净的")
+        self.assertRegex(skill, r"重跑这条命令就会自动换号",
+                         "「重跑就换号」这条没了，调用方不知道下一步该干什么")
+        self.assertRegex(skill, r"写它的名字[^\n]*\*\*不换号\*\*",
+                         "「写死账号名就不换号」这条没了——两种模式的差别没人守")
+        self.assertRegex(skill, r"\*\*`auto` 不是调度器\*\*",
+                         "「auto 不分散负载」这条没了——旁边那句「一个账号可以同时开多个"
+                         "子代理」会让人以为并发的 auto 会挑到不同账号")
 
 
 class TestTaskName(unittest.TestCase):
@@ -2236,11 +2884,25 @@ class TestRunGuards(_HomeSandbox):
         self.assertIn("brief", cm.exception.message)
 
     def test_同名任务还在跑就拒绝(self):
+        """**断言要钉入口那道闸自己的措辞，不能只钉「还在跑」三个字。**
+
+        2026-09-22 实测：把入口那条整个换成 `if False:`，**全套 316 条照样全绿**，
+        只是套件从 11 秒变 70 秒。原因是没了入口闸之后走到了 run_codex 里的
+        `_wait_previous_round_ends`，它等满 60 秒再 reject，而**那句话里也有
+        「codex 本身还在跑」**——两条不同的闸共用了同一个子串。
+
+        所以这里钉两件事：① 入口闸独有的那句下一步建议；
+        ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
+        """
         ca.write_meta(ca.ensure_isolation("default"), "t", _full_meta("t"))
         with mock.patch.object(ca, "find_codex_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
-        self.assertIn("还在跑", cm.exception.message)
+        message = cm.exception.message
+        self.assertIn("还在跑", message)
+        self.assertIn("换个名字或先", message, "入口那道闸独有的下一步建议没了")
+        self.assertNotIn("等了", message,
+                         "拒绝来自 run_codex 里等满超时那条路，不是入口这道闸")
 
     def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
@@ -2347,6 +3009,407 @@ class TestRunGuards(_HomeSandbox):
         text = (d / "logs" / "t.log").read_text()
         self.assertIn("上一轮的日志", text)
         self.assertIn(ca.ROUND_MARK, text)
+
+
+@contextlib.contextmanager
+def _capture_stdout():
+    """接住 stdout，**连 `.buffer` 一起**，把文本回填进 yield 出去的那个 dict。
+
+    不能用 `redirect_stdout(io.StringIO())`：`_tee_until_exit` 走
+    `sys.stdout.buffer.write(bytes)`，而 StringIO 没有 `.buffer`，当场
+    AttributeError。用真文件接，文本层和字节层就都在；`buffering=1` 让两层的
+    先后顺序不至于被块缓冲搅乱。
+    """
+    got = {}
+    q = pathlib.Path(tempfile.mkdtemp()) / "stdout"
+    with open(q, "w", encoding="utf-8", buffering=1) as sink, \
+         contextlib.redirect_stdout(sink):
+        yield got
+    got["text"] = q.read_text(encoding="utf-8")
+
+
+class TestAutoAccountPick(_HomeSandbox):
+    """`--account auto`：挑一个没在限流的账号，**只跑一轮**。
+
+    **mock 的是 `Popen`，不是 `run_codex`。** 清报告、写分隔符、轮次边界、
+    等上一轮全住在 `run_codex` 里，把它整个换掉，要验的行为就一起没了
+    （同一条理由见 `_no_codex`）。
+
+    参数走**真 parser**，不手搭 Namespace：`--account auto` 能不能被收下本身
+    就是这次改动的一部分，手搭 Namespace 会把 `choices=` 那一行整个绕过去，
+    parser 里漏掉 AUTO 也照样全绿。
+
+    **没有轮内重试。** v3 有过，理由是「撞上限的那一轮 codex 从未拿到响应，
+    零工作量，重跑无副作用」——269 份现网日志、56 条真·额度错误行实测推翻了它：
+    距本轮开头中位 101 行、最小 41 行，**0 条在轮首 12 行以内**。额度永远是在
+    任务跑到一半用完的，而重跑用的是同一个 --dir、同一份 brief、
+    danger-full-access，落在一棵已经被改过的树上。
+    「重试」因此从工具的一个循环，变成了调用方的一次重发。
+    """
+
+    LIMIT_LINE = ("ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
+                  "settings/usage to purchase more credits or try again at "
+                  "Sep 25th, 2026 5:04 PM.\n")
+    # 命中额度字样却没有时间的一行。现网见得到（2 行 / 1 份），但**那是污染不是
+    # 形态**——出自本项目自己的日志，codex 把报告正文引了进来；OpenAI 的两种真消息
+    # 都带时间。来源不改变这里该怎么做：解析不出就不落盘（见 usage_limit_reset）。
+    NO_TIME = "ERROR: You’ve hit your usage limit\n"
+    BROKEN = "Error: 代码写错了\n"
+    FINE = "一切正常\n"
+    RESET_AT = datetime.datetime(2026, 9, 25, 17, 4)
+
+    def setUp(self):
+        super().setUp()      # 基类已建好 ~/.codex/auth.json（default 的登录态）
+        for name in ("acct2", "acct3"):
+            d = self.home / ".codex-accounts" / name
+            d.mkdir(parents=True)
+            (d / "auth.json").write_text("{}")
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "b.md"
+        self.brief.write_text("干活\n")
+        self.spawned = []        # 真的 spawn 了哪个账号（不止一个就是回归）
+        # 反查表，不写 `home.name.replace(...)`：那是 isolation_home 的逆运算，
+        # 抄一份就会和它漂移，而漂了之后这里只会 KeyError，不会给出线索。
+        self.account_of = {str(ca.isolation_home(a)): a
+                           for a in ("default", "acct2", "acct3")}
+
+    def _limit(self, account, when):
+        ca.ensure_isolation(account)
+        ca.write_usage_limit(ca.isolation_home(account), when, "测试写的")
+
+    def _args(self, account, task="t"):
+        return ca.build_parser().parse_args(
+            ["run", "--task", task, "--dir", str(self.workdir), "--brief", str(self.brief),
+             "--effort", "low", "--account", account, "--no-skill"])
+
+    def _spawn_says(self, popen, text):
+        """让这一轮吐 `text`，然后 EOF。
+
+        报告写到 **argv 里 `-o` 指的那个路径**，和真的 codex 一样——
+        `run_codex` 在 spawn 之前才刚把它删掉，写在这里才验得到清报告那一步。
+        **文本里有错误行就不写报告**：`cmd_run` 只在 `failed` 那一支上才去记
+        限流，而「有报告 + 有错误行」判的是 suspect，走不到那里。
+        """
+        def one(argv, *a, **kwargs):
+            self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
+            if not ca.runtime_error_lines(text):
+                pathlib.Path(argv[argv.index("-o") + 1]).write_text("干完了\n")
+            proc = mock.MagicMock()
+            proc.stdout.read1.side_effect = [text.encode(), b""]
+            proc.wait.return_value = 1
+            return proc
+        popen.side_effect = one
+
+    def _run(self, account, text, **kw):
+        with _capture_stdout() as printed, _no_codex() as popen:
+            self._spawn_says(popen, text)
+            code = ca.cmd_run(self._args(account, **kw))
+        self.printed = printed["text"]
+        return code
+
+    # ── 挑号 ────────────────────────────────────────────────────────────
+
+    def test_auto挑恢复时间最早的那个_并且只启动一次codex(self):
+        # 「只启动一次」是 v4 的形状本身：没有循环，撞上限也不再换号重跑。
+        self._limit("acct2", datetime.datetime(2099, 1, 1))
+        self._limit("acct3", datetime.datetime(2098, 1, 1))
+        code = self._run(ca.AUTO, self.FINE)
+        self.assertEqual(self.spawned, ["default"], "无记录的 default 该排最前")
+        self.assertEqual(code, ca.EXIT["success"])
+
+    def test_所有账号都没登录态_拒跑并逐个点名(self):
+        for q in self.home.glob(".codex-accounts/*/auth.json"):
+            q.unlink()
+        (self.home / ".codex" / "auth.json").unlink()
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args(ca.AUTO))
+        for account in ("default", "acct2", "acct3"):
+            with self.subTest(账号=account):
+                self.assertIn(account, got.exception.message)
+
+    # ── 撞上限：记一笔，然后停 ───────────────────────────────────────────
+
+    def test_撞上限要把恢复时间记下来(self):
+        code = self._run(ca.AUTO, self.LIMIT_LINE)
+        self.assertEqual(self.spawned, ["acct2"])
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct2")), self.RESET_AT)
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct3")),
+                          "没跑过的账号不许被记一笔")
+
+    def _撞上限后重排(self, 预先限流=None):
+        """跑一轮撞上限的，返回「记完这一笔之后谁排第一」。"""
+        if 预先限流 is not None:
+            self._limit(*预先限流)
+        code = self._run(ca.AUTO, self.LIMIT_LINE)
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertEqual(self.spawned, ["acct2"], "前提不成立：跑的不是 acct2")
+        return ca.accounts_by_availability()[0]
+
+    def test_失败信息要点名下次auto会先试谁(self):
+        # **这是「重试从循环变成一次重发」之后，调用方唯一的下一步线索。**
+        下一个 = self._撞上限后重排()
+        self.assertEqual(下一个, "acct3", "前提不成立：记了限流之后 acct2 还排第一")
+        self.assertRegex(self.printed, rf"下次[^\n]*{ca.AUTO}[^\n]*{下一个}",
+                         "失败信息里没有「下次 auto 会先试谁」")
+        self.assertIn("09-25 17:04", self.printed, "记下的恢复时间要报出来")
+
+    def test_下次试谁是真的算出来的_不是写死的(self):
+        # **换一个初始状态，答案必须跟着变。** 只测上面那一个情形的话，
+        # 把名字写死成 "acct3" 也能全绿——实测这条突变存活过。
+        下一个 = self._撞上限后重排(("acct3", datetime.datetime(2099, 1, 1)))
+        self.assertEqual(下一个, "default", "前提不成立：换了初始状态答案却没变")
+        self.assertRegex(self.printed, rf"下次[^\n]*{ca.AUTO}[^\n]*{下一个}",
+                         "账号名是写死的，没有真的按新顺序算")
+
+    def test_没有别的账号可换时_不许假装下次会换一个(self):
+        """只有一个账号有登录态时，「下次 auto 会先试 X」里的 X 就是刚撞上限的
+        那一个，读起来像是在让人原地重试。
+
+        钉的条件是 **`下一个 == 当前`**，不是「只剩一个候选」——后者只是它的
+        一个实例。多账号但别的账号恢复得更晚时，第一个仍可能是它自己，
+        那句话同样是在骗人。
+        """
+        for q in self.home.glob(".codex-accounts/*/auth.json"):
+            q.unlink()                        # 只剩 default 有登录态
+        code = self._run(ca.AUTO, self.LIMIT_LINE)
+        self.assertEqual(self.spawned, ["default"])
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertEqual(ca.accounts_by_availability(), ["default"],
+                         "前提不成立：还有别的候选，这条测的就不是这件事")
+        self.assertRegex(self.printed, r"没有恢复得更早的账号",
+                         "没有别的账号可换时要说出来，不许含糊过去")
+        self.assertNotRegex(self.printed, r"会先试 default",
+                            "不许把「仍是它自己」印成一个像是换了号的句子")
+
+    def test_只是提到额度字样_不许记限流(self):
+        """**cmd_run 侧的同一条地基，同样一条测试都没有过。**
+
+        实测突变：把闸门改回 `USAGE_LIMIT_MARK in this_round.text`，
+        全套 313 条照样全绿。后果是给一个**健康账号**记上限流记录，
+        而「不做过期清理 + 纯按 reset_at 排序」会让它从此排到最后。
+        """
+        污染 = ("    47  fixture = 'You’ve hit your usage limit … "
+                "try again at Dec 31st, 2099 11:59 PM'")
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行")
+        # 这一轮**因为别的原因失败**，而日志里恰好回显了那句话——2026-09-22 的
+        # 真实现场就是这个形状（任务内容涉及额度处理，于是 brief 和源码都被回显）。
+        # 用 failed 而不是 success：闸门的前半是 `state == "failed"`，
+        # 成功的那一轮压根走不到额度判据，测不出这件事。
+        code = self._run(ca.AUTO, 污染 + "\n" + self.BROKEN)
+        self.assertEqual(code, ca.EXIT["failed"], "前提不成立：这一轮没有失败")
+        self.assertNotIn("额度", self.printed.split("报告 ")[0].split("t: failed")[-1],
+                         "failed 的理由不该是额度问题")
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "只是被回显进日志的一句话，不许变成这个账号的限流记录")
+        self.assertNotIn("撞上额度上限", self.printed,
+                         "闸门在拿整轮裸文本做子串匹配")
+
+    def test_日志里的污染行不许变成恢复时间(self):
+        """**C1 回归锁。** 2026-09-22 实测：`cmd_run` 拿整轮文本解析恢复时间，
+        而整轮文本正是被污染的那个东西——上一行刚用已分类的错误行判「撞没撞上」，
+        下一行就把这条规矩丢了，`search()` 取的是全文**第一个**匹配。
+
+        这条是 Critical 而不是「顺序差一格」：配上「不做过期清理」和「纯按
+        reset_at 排序」，一条 2099 年的假记录会让那个健康账号**永远排最后**，
+        auto 再也不会先试它。落盘的 `raw` 也会是那行 fixture，审计线索一起失效。
+        """
+        污染 = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
+        code = self._run(ca.AUTO, 污染 + "\n" + self.LIMIT_LINE)
+        self.assertEqual(code, ca.EXIT["failed"])
+        记录 = ca.read_usage_limit(ca.isolation_home("acct2"))
+        self.assertEqual(记录, self.RESET_AT,
+                         "记下的是污染行里那个 2099——恢复时间没有从已分类的错误行里取")
+        落盘 = json.loads(ca.usage_limit_path(ca.isolation_home("acct2")).read_text())
+        self.assertEqual(落盘["raw"], "Sep 25th, 2026 5:04 PM",
+                         "raw 是审计线索，存了污染行就等于线索也一起坏了")
+        # 只看**工具自己写的那一行**。整屏里当然有 2099——tee 会把 codex 的原始
+        # 输出逐字回显到屏幕上，那是它该做的事；要钉的是工具自己的结论。
+        结论行 = [l for l in self.printed.splitlines() if "撞上额度上限" in l]
+        self.assertEqual(len(结论行), 1, "前提不成立：没有（或不止一条）结论行")
+        self.assertIn("09-25 17:04", 结论行[0], "印给人看的那个时间也不许是编的")
+        self.assertNotIn("2099", 结论行[0])
+
+    def test_解析不出恢复时间_不落盘但要说清楚(self):
+        # 命中了额度字样、那一行却没有时间。写一个假时间进去比不写坏得多：
+        # 排序永不过期，一个编出来的未来时间会让这个账号从此排到最后。
+        code = self._run(ca.AUTO, self.NO_TIME)
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "解析不出来就不许落盘——写进去的会是编的")
+        self.assertIn("没有恢复时间", self.printed)
+
+    def test_撞上限之后status仍然列得出这个任务(self):
+        # **不许删元数据。** 删了的话任务凭空消失：status 列表为空、
+        # status <任务名> 说「没有这个任务」，而这一轮的日志还在盘上。
+        # 调 cmd_status 而不是只调 find_meta：要钉的是调用方看得见的那一面。
+        self._run(ca.AUTO, self.LIMIT_LINE)
+        with _capture_stdout() as printed:
+            ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+        self.assertIn("t", printed["text"])
+        with _capture_stdout() as printed:
+            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+        self.assertNotIn("还没有任何任务", printed["text"])
+
+    def test_限流记录写不进去_不影响本轮结论_而且不许说已记下(self):
+        """记录是优化不是前提，但**不许假装记下了**。
+
+        原来这条断言的是 `assertIn("codex-sub-agent", printed)`——而本工具
+        **每一行输出都以它开头**，所以那是一条空测试（模块头总纲那条）。
+        它放过的正是这个 bug：`write_usage_limit` 印「写不进…」，
+        `cmd_run` 紧接着印「恢复时间 09-25 17:04 已记下」，同一屏两句矛盾。
+
+        **让真的写入失败**（目标位置被一个目录占住），不 mock write_usage_limit
+        ——那样测的是 mock 的行为，不是代码的。
+        """
+        ca.ensure_isolation("acct2")
+        ca.usage_limit_path(ca.isolation_home("acct2")).mkdir()
+        code = self._run(ca.AUTO, self.LIMIT_LINE)
+        self.assertEqual(code, ca.EXIT["failed"], "写盘失败不许改写本轮结论")
+        self.assertIn("写不进", self.printed, "写不进去要出声，不许静默失效")
+        结论行 = [l for l in self.printed.splitlines() if "撞上额度上限" in l]
+        self.assertEqual(len(结论行), 1, "前提不成立：没有结论行")
+        self.assertNotIn("已记下", 结论行[0], "没记下就不许说已记下")
+        self.assertIn("没能记下", 结论行[0], "要如实说这次没记下")
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "前提不成立：其实写进去了，这条测的就不是写失败")
+
+    def test_brief里有额度字样又真被打断_退130且不写限流记录(self):
+        # 打断标记是本工具自己写的，不可伪造（见 judge 里「打断排最前」）。
+        # 顺序反了的代价：一个「resume 就行」的任务被记成账号限流，
+        # 那个健康账号从此被排到后面。
+        self.brief.write_text(self.LIMIT_LINE)
+        code = self._run(ca.AUTO, self.LIMIT_LINE + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(code, ca.EXIT["interrupted"])
+        self.assertEqual(code, 130)
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "被打断的轮次不许被记成撞上限")
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists(),
+                        "被打断的任务元数据必须留着——下一步是 resume")
+
+    def test_不是额度问题_不记限流也不删元数据(self):
+        code = self._run(ca.AUTO, self.BROKEN)
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "普通失败不许被记成账号限流")
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct2"), "t").exists())
+        self.assertNotIn("额度", self.printed)
+
+    # ── 强制指定账号 ────────────────────────────────────────────────────
+
+    def test_强制指定账号撞上限_照样记录(self):
+        # 强制模式踩到的坑要让 auto 模式变聪明。
+        code = self._run("acct3", self.LIMIT_LINE)
+        self.assertEqual(self.spawned, ["acct3"], "强制模式只跑指定的那个")
+        self.assertEqual(code, ca.EXIT["failed"])
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct3")), self.RESET_AT)
+
+    def test_强制模式下同名任务属于别的账号_仍然拒跑(self):
+        # 这道护栏在强制模式下**原样保留**：同一个名字出现在两个隔离目录里时，
+        # find_meta 数出两份并拒绝，另一份成了再也够不着的孤儿元数据。
+        ca.write_meta(ca.ensure_isolation("acct2"), "t",
+                      ca.new_meta("t", "acct2", "/tmp", "low", ()))
+        with self.assertRaises(ca.Rejected) as got:
+            ca.cmd_run(self._args("acct3"))
+        self.assertIn("acct2", got.exception.message)
+
+    # ── 迁移 ────────────────────────────────────────────────────────────
+
+    def test_任务原本在别的账号_auto显式迁移_元数据只剩一份(self):
+        ca.write_meta(ca.ensure_isolation("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home("acct3"),
+                         "前提不成立：任务没住进 acct3")
+        code = self._run(ca.AUTO, self.FINE)
+        self.assertEqual(self.spawned, ["acct2"], "auto 按恢复时间挑，不沿用旧家")
+        self.assertEqual(code, ca.EXIT["success"])
+        self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
+        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home("acct2"))
+        self.assertIn("acct3", self.printed, "要点名从哪个账号搬过来的")
+
+    def test_迁移提示不许声称旧账号的报告被删掉_因为它没被删(self):
+        """**这条钉的是一句曾经的假话。**
+
+        原来那句「任务名 t 复用，上一轮的报告会被删掉、日志会被追加」在同一个
+        账号里是真的；跨账号时全是假的——`clear_report` 只动**这一轮要写的那个**
+        报告（新 home 的），旧 home 的 `reports/` 和 `logs/` 一个字节都没碰。
+        v3 的跨账号护栏注释里就写过「那句提示在跨账号时还是假话」，
+        v4 把护栏在 auto 模式下拆了，就不能把那句假话留下。
+        """
+        旧 = ca.ensure_isolation("acct3")
+        ca.write_meta(旧, "t", ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        (旧 / "reports" / "t.md").write_text("上一轮的报告\n")
+        (旧 / "logs" / "t.log").write_text("上一轮的日志\n")
+
+        self._run(ca.AUTO, self.FINE)
+
+        self.assertEqual((旧 / "reports" / "t.md").read_text(), "上一轮的报告\n",
+                         "旧账号的报告必须原样留着")
+        self.assertEqual((旧 / "logs" / "t.log").read_text(), "上一轮的日志\n",
+                         "旧账号的日志必须原样留着")
+        迁移行 = [l for l in self.printed.splitlines() if "acct3" in l]
+        self.assertTrue(迁移行, "前提不成立：根本没打印迁移提示")
+        for line in 迁移行:
+            self.assertNotIn("报告会被删掉", line, "这句在跨账号时是假话")
+        self.assertRegex("\n".join(迁移行), r"留在|原处|不动",
+                         "要说清旧账号的产物留在原处，否则调用方以为它们没了")
+
+    def test_选中的账号上还有活着的codex_要在删旧元数据之前就拒(self):
+        """**I6 回归锁：迁移的 unlink 不许排在一个可能失败的步骤前面。**
+
+        `run_codex` 的注释写着「这一等排在 write_meta / clear_report 之前，
+        所以超时**不留半个状态**……别把它挪到后面去」。迁移路径从**外面**破了它：
+        旧元数据已经删掉、新的还没写，而 `_wait_previous_round_ends` 等满 60 秒
+        之后 `reject` ——任务从 status / stop / resume 三条路上整个消失。
+
+        入口那道闸原本只查 `old_home`，查不到选中的那个 home 上的 codex。
+        为什么查 `find_codex_pid` 就够（而不必把整个 `_wait_previous_round_ends`
+        搬出来）：能走到迁移，说明 `find_meta` 只数出**一份**元数据（两份它当场拒），
+        于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
+        `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
+        就只剩 `find_codex_pid` 这一条。
+        """
+        ca.write_meta(ca.ensure_isolation("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        选中的报告 = ca._report_path(ca.ensure_isolation("acct2"), "t")
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2",
+                         "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
+
+        def 只有acct2上有活的(report_path):
+            return 4242 if report_path == 选中的报告 else None
+
+        with mock.patch.object(ca, "find_codex_pid", 只有acct2上有活的):
+            with self.assertRaises(ca.Rejected) as got:
+                ca.cmd_run(self._args(ca.AUTO))
+        self.assertIn("还在跑", got.exception.message)
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct3"), "t").exists(),
+                        "拒绝发生在删旧元数据之后——任务在半路上消失了")
+        self.assertEqual(len(ca.all_metas()), 1, "元数据既不许没有，也不许有两份")
+
+    def test_任务住的那个账号掉了登录态_也能迁移走(self):
+        """**这条是 v2 的一个反例，上一轮实测到的，留着当回归锁。**
+
+        v2 写过「auto 不需要跨账号同名护栏：任务已有的那个家排在最前，
+        第一轮就对上」。登录态过滤会把该账号整个剔出候选
+        （`accounts_by_availability`），于是「排在最前」根本轮不上：
+        第一轮就写到别的 home，旧的那份还在，`find_meta` 当场数出两份并拒绝
+        ——`status t` / `stop t` 从此全退 2，任务既停不掉也查不了。
+        codex 的 access_token 只活十天，这条路很好走。
+
+        v4 里「排在最前」这个键已经整个删掉了，但迁移这一步必须留着，
+        而且要对**掉了登录态**这种够不着旧账号的情形照样成立。
+        """
+        ca.write_meta(ca.ensure_isolation("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
+        self.assertNotIn("acct3", ca.accounts_by_availability(),
+                         "前提不成立：掉了登录态的账号仍在候选里")
+        code = self._run(ca.AUTO, self.FINE)
+        self.assertEqual(code, ca.EXIT["success"])
+        self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
+        self.assertIn("acct3", self.printed, "要点名是哪个账号够不着了")
 
 
 class TestResumeGuards(_HomeSandbox):

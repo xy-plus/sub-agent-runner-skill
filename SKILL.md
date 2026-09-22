@@ -16,7 +16,7 @@ claude 只编排。同时开两边等于白烧 claude 的 token，那正是这�
 ## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
 
 ```bash
-codex-sub-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <档位> --account default --no-skill
+codex-sub-agent run --task <任务名> --dir /abs/repo --brief brief.md --effort <档位> --account auto --no-skill
 ```
 
 五个带值参数**全必填**，外加 `--skill`/`--no-skill` 二选一，没有默认值。
@@ -65,7 +65,7 @@ codex-sub-agent stop <任务名>          # 上下文保留，之后还能 resum
 |---|---|
 | 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的 codex 错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
 | brief | 只收**文件路径**，不收内联字符串。**skill 禁令那句话归工具所有，不要自己写进 brief**——写了当场拒跑 |
-| 账号 | `--account` 在 `default` / `acct2` / `acct3` 之间选（可选项由 `~/.codex-accounts/` 扫出来，加一个账号就自动认）。**撞上额度上限时换一个**——判据会直接告诉你是额度问题。每个账号有各自独立的隔离目录，互不干扰 |
+| 账号 | `--account auto` —— **默认就写这个**：工具自己挑一个没在限流的。撞上额度上限**不会自动重跑**——实测额度永远是在任务跑到一半用完的，那一轮多半已经改过文件了，重跑会落在一棵改了一半的树上。它会记下恢复时间并失败，**重跑这条命令就会自动换号**。**一个账号可以同时开多个子代理**，不用排队等前一个跑完——但 **`auto` 不是调度器**：同时起的两条 `auto` 看到的排序一模一样，会挑到同一个账号然后一起撞上限，要分散就各自写死账号名。要盯住某一个账号就写它的名字（`default` / `acct2` / `acct3`，由 `~/.codex-accounts/` 扫出来，加一个账号就自动认），那样撞上限只记录、**不换号** |
 | 给它 skill | `--skill <SKILL.md 的绝对路径>`，可重复；一个都不给就 `--no-skill`。**路径写错当场拒跑**，不会再静默跑出一个「零工作量的成功」。它给的是**许可**——工具会叫 codex 动手前先读一遍，但**什么时候按它办事仍要 brief 自己说**。不要往共享目录里放东西 |
 
 codex 不靠谱 → 换 claude 子代理。
