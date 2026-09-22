@@ -505,6 +505,60 @@ def parse_reset_time(text):
         return None
 
 
+USAGE_LIMIT_FILE = "usage_limit.json"
+
+
+def usage_limit_path(home):
+    """限流记录放隔离目录根部。
+
+    限流是**账号**的属性，而账号已经有一个家，不必为它新开一个状态目录。
+    `ensure_isolation` 的不变量是「五个子目录存在、共享扫描根为空、config.toml
+    不是软链、auth.json 软链到该账号」——**它不枚举也不拒绝顶层多余文件**
+    （2026-09-22 实测：放一个文件进去再跑一次，不拒且文件保留）。
+    """
+    return home / USAGE_LIMIT_FILE
+
+
+def _usage_limit_tmp(home, pid):
+    """写限流记录用的临时文件名。**带 pid，不能用固定名。**
+
+    和 `write_meta` 的关键区别：那份是**任务级**的，一个任务只可能有一个写者
+    （`cmd_run`/`cmd_resume` 都先拒绝「还在跑」的同名任务），所以固定名安全。
+    这份是**账号级、跨任务共享**的——同一个账号上的两个任务可以同时撞上限、
+    同时写。固定名会让两个写者把同一个临时文件写成混合内容，
+    然后原子替换把这份混合内容装进去，`read_usage_limit` 读出 `None`。
+    """
+    q = usage_limit_path(home)
+    return q.with_name(f"{q.name}.{pid}.tmp")
+
+
+def write_usage_limit(home, reset_at, raw):
+    """记下这个账号什么时候恢复。**只在 `parse_reset_time` 成功时调用。**
+
+    `raw` 是审计线索：解析错了（时区、OpenAI 改文案）一眼看得出，不用翻日志。
+    **没有 `seen_at`**——唯一的读者是排序，排序只看 `reset_at`；
+    没有消费者的字段一旦加进去就再也删不掉了。
+    """
+    tmp = _usage_limit_tmp(home, os.getpid())
+    tmp.write_text(json.dumps({"reset_at": reset_at.isoformat(), "raw": raw},
+                              ensure_ascii=False, indent=2))
+    os.replace(tmp, usage_limit_path(home))
+
+
+def read_usage_limit(home):
+    """这个账号预计什么时候恢复；没记录或记录坏了都返回 `None`。
+
+    **坏了返回 `None` 是刻意的**：调用方把 `None` 当成「无记录＝排最前＝照样会被
+    试到」，那是安全的一边。反过来（读不出来就认定它还在限流）会把一个可用账号
+    锁死，而调用方看不出原因——那正是本工具反复在修的那类谎。
+    """
+    try:
+        got = json.loads(usage_limit_path(home).read_text())
+        return datetime.datetime.fromisoformat(got["reset_at"])
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
 def extract_session_id(log_text):
     m = _SESSION_ID.search(strip_ansi(log_text))
     return m.group(1) if m else None

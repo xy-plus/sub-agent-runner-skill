@@ -1006,6 +1006,66 @@ class TestParseResetTime(unittest.TestCase):
         self.assertIsNone(ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM")[0].tzinfo)
 
 
+class TestUsageLimitFile(unittest.TestCase):
+    def setUp(self):
+        # 纯文件操作，不碰 HOME——`_HomeSandbox` 的 docstring 说了「纯函数测试不要它」
+        self.home = pathlib.Path(tempfile.mkdtemp())
+
+    def test_写了能读回来(self):
+        when = datetime.datetime(2026, 9, 25, 17, 4)
+        ca.write_usage_limit(self.home, when, "Sep 25th, 2026 5:04 PM")
+        self.assertEqual(ca.read_usage_limit(self.home), when)
+
+    def test_键只有两个(self):
+        # seen_at 之类没有消费者的字段一旦加进去就再也删不掉了
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertEqual(set(json.loads(ca.usage_limit_path(self.home).read_text())),
+                         {"reset_at", "raw"})
+
+    def test_raw原样保留(self):
+        # raw 是审计线索：解析错了要能一眼看出错在哪，所以不许加工
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4),
+                             "Sep 25th, 2026 5:04 PM")
+        self.assertEqual(json.loads(ca.usage_limit_path(self.home).read_text())["raw"],
+                         "Sep 25th, 2026 5:04 PM")
+
+    def test_四种读失败都退化成无记录(self):
+        # 读不出来就当「没有记录」＝排最前＝照样会被试到，那是安全的一边。
+        # 反过来（读不出来就认定还在限流）会把可用账号锁死且调用方看不出原因。
+        q = ca.usage_limit_path(self.home)
+        for name, content in (("文件不存在", None),
+                              ("坏 json", "{不是 json"),
+                              ("缺键", '{"raw": "x"}'),
+                              ("时间串坏了", '{"reset_at": "昨天", "raw": "x"}')):
+            with self.subTest(情形=name):
+                if content is None:
+                    q.unlink(missing_ok=True)
+                else:
+                    q.write_text(content)
+                self.assertIsNone(ca.read_usage_limit(self.home))
+
+    def test_临时文件名带pid_两个并发写者不会互相污染(self):
+        # **这条钉的是本文件和 write_meta 的关键区别。** usage_limit.json 是账号级的，
+        # 同一账号上的两个任务可能同时撞上限。固定临时名会让两个写者把同一个临时
+        # 文件写成混合内容，再原子替换进去。
+        a = ca._usage_limit_tmp(self.home, 111)
+        b = ca._usage_limit_tmp(self.home, 222)
+        self.assertNotEqual(a, b, "两个进程必须拿到不同的临时文件名")
+        self.assertTrue(a.name.endswith(".tmp"))
+
+    def test_原子替换_替换前目标仍是完整旧内容(self):
+        ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "旧")
+        seen = []
+        real_replace = os.replace
+        def spy(src, dst):
+            seen.append(json.loads(pathlib.Path(dst).read_text())["raw"])
+            return real_replace(src, dst)
+        # patch 模块自己的 os，别 patch 全局的——全局的会波及 unittest 内部
+        with mock.patch.object(ca.os, "replace", spy):
+            ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 26, 17, 47), "新")
+        self.assertEqual(seen, ["旧"], "替换发生前目标文件必须还是完整的旧内容")
+
+
 class TestIsolation(_HomeSandbox):
     def setUp(self):
         super().setUp()
@@ -1014,6 +1074,21 @@ class TestIsolation(_HomeSandbox):
 
     def test_账号可选项来自实际目录扫描(self):
         self.assertEqual(ca.account_choices(), ["default", "acct2"])
+
+    def test_隔离目录顶层多出一个文件_ensure_isolation不许拒(self):
+        """`usage_limit.json` 就住在这里（见 `usage_limit_path`），这条是它的地基。
+
+        不变量只有四条：五个子目录在、共享扫描根为空、config.toml 不是软链、
+        auth.json 软链到该账号。**顶层文件既不枚举也不拒绝。** 哪天有人往
+        `ensure_isolation` 里加一条「顶层只许有这几样」，限流记录会当场
+        把每一次 run 打死——这条测试要在那之前红。
+        """
+        home = ca.ensure_isolation("acct2")
+        ca.write_usage_limit(home, datetime.datetime(2026, 9, 25, 17, 4), "Sep 25th, 2026 5:04 PM")
+        (home / "某个谁也没料到的文件").write_text("x")
+        self.assertEqual(ca.ensure_isolation("acct2"), home)
+        self.assertEqual(ca.read_usage_limit(home), datetime.datetime(2026, 9, 25, 17, 4),
+                         "再跑一次不许把限流记录冲掉")
 
     def test_账号目录名含空白或控制字符就拒跑_并点名是哪个目录(self):
         # 这个名字会进 status 的第二列，而那一列是按空白切分的边界之一。
