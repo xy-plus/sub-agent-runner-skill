@@ -2204,6 +2204,32 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "这些约束已经由代码保证，文档里不该再说一遍："
                          + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
 
+    def test_参数说明不许承诺失败时的行为(self):
+        """`--help` 是子代理唯一会读的那份说明，也是最容易和代码悄悄脱节的那份。
+
+        2026-09-22 实测：轮内重试删掉之后，`--account` 的 help 还写着
+        「撞上额度上限就换下一个」——SKILL.md 和 README 都改对了，只有它没有，
+        而它恰恰是机器读的那一份。**没有任何东西守着它**，所以它漂了整整一版。
+
+        规则不是「别写错」，是**别在这里写**：参数说明的职责是「这个参数选什么」；
+        「失败了会怎样」归判据，以及判据当场打印的那句话。少说一件事，
+        就少一个会漂的家——这和 OWNED_BY_CODE 守的是同一条原则，只是方向相反。
+        """
+        promise_words = ("重试", "重跑", "换下一个", "自动换号", "会换成", "会先试")
+        parser = ca.build_parser()
+        subs = {name: sub for action in parser._subparsers._group_actions
+                for name, sub in getattr(action, "choices", {}).items()}
+        self.assertTrue(subs, "没取到子命令，这条测试什么都没验")
+        leaked = {}
+        for name, sub in subs.items():
+            for action in sub._actions:
+                for word in promise_words:
+                    if action.help and word in action.help:
+                        leaked[f"{name} {'/'.join(action.option_strings) or action.dest}"] = word
+        self.assertEqual(leaked, {},
+                         "参数说明里不该承诺失败时的行为（它会和代码脱节，而机器只读它）："
+                         + "；".join(f"{k} 说了「{v}」" for k, v in leaked.items()))
+
     def test_文档仍然保留代码替不了的那部分(self):
         """反向守一道：别为了让上面那条变绿，把该留的也删了。
 

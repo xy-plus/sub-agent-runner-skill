@@ -2121,7 +2121,11 @@ def build_parser():
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
     # `--account` **仍然必填**：没有任何隐式选中的值。取值只是多了一个 AUTO。
     r.add_argument("--account", required=True, choices=account_choices() + [AUTO],
-                   help=f"codex 账号；{AUTO} = 自动挑一个没在限流的，撞上额度上限就换下一个")
+                   help=f"codex 账号；{AUTO} = 按记录的恢复时间自动挑一个")
+    # help 只说「这个参数选什么」。**撞上限之后会怎样，一个字都不在这里说**——
+    # 轮内重试删掉那一版，SKILL.md 和 README 都改对了，只有这句 help 还写着
+    # 「撞上额度上限就换下一个」，而它恰恰是子代理唯一会读的那份说明。
+    # 失败时的行为归判据，以及判据当场打印的那句话（见 cmd_run 尾部）。
     _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 
