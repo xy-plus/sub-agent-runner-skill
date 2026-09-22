@@ -869,9 +869,16 @@ _BAD_IN_ACCOUNT = re.compile(r"[\s\x00-\x1f\x7f]")
 
 
 AUTO = "auto"
+# 主账号的固定名。**提成常量是为了和 `AUTO` 对称**：下一行那个元组原本写作
+# `("default", AUTO)`，一半是常量一半是字面量——读的人会以为两者性质不同，
+# 而它们恰恰是同一种东西（两个都不许被 `~/.codex-accounts/` 下的目录占用）。
+# 它对应的不是一个账号目录，而是主目录 `~/.codex` 本身，所以
+# `isolation_home` / `auth_source` 都要为它分叉——三处分叉共用一个名字，
+# 改名时不会漏掉其中一处。
+DEFAULT_ACCOUNT = "default"
 # `default` 是主账号的固定名（不对应 ~/.codex-accounts 下的目录），
 # `auto` 是 `--account` 的模式词。两个都不许被真账号目录占用。
-RESERVED_ACCOUNT_NAMES = ("default", AUTO)
+RESERVED_ACCOUNT_NAMES = (DEFAULT_ACCOUNT, AUTO)
 
 
 def account_choices():
@@ -906,7 +913,7 @@ def account_choices():
                    f"以及它的隔离目录 {isolation_home(name)}。\n"
                    f"只改前一个的话，住在后一个里的任务之后再也扫不到"
                    f"——status 看不见、stop 停不掉，而且没有任何报错。")
-    return ["default"] + extra
+    return [DEFAULT_ACCOUNT] + extra
 
 
 def isolation_home(account):
@@ -921,12 +928,12 @@ def isolation_home(account):
     软约定拦不住，换成结构上够不着才拦得住。
     """
     base = pathlib.Path.home()
-    return base / ".codex-subagent" if account == "default" else base / f".codex-subagent-{account}"
+    return base / ".codex-subagent" if account == DEFAULT_ACCOUNT else base / f".codex-subagent-{account}"
 
 
 def auth_source(account):
     base = pathlib.Path.home()
-    return base / ".codex" / "auth.json" if account == "default" else base / ".codex-accounts" / account / "auth.json"
+    return base / ".codex" / "auth.json" if account == DEFAULT_ACCOUNT else base / ".codex-accounts" / account / "auth.json"
 
 
 def shared_skill_root():
