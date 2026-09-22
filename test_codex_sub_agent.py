@@ -839,9 +839,22 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
 
-    def test_撞额度上限比被打断更该被说出来(self):
-        # 两个都命中时，「换账号」比「可以 resume」更接近真正的处置
-        self.assertIn("额度", self._judge(ERR_USER_LAYER + "\n" + ca.INTERRUPT_MARK + "\n").reason)
+    def test_打断标记优先于额度字样(self):
+        # 打断标记是本工具自己写的，是关于「我们做了什么」的不可伪造证据；
+        # 额度字样可以来自 brief 回显、codex 读文件的回显、子进程输出。
+        # 两者同时出现，打断必须赢——否则一轮「被我们打断、上下文还在、resume 就行」
+        # 的任务，会被判成额度问题，进而（在 cmd_run 里）删元数据、换账号重跑。
+        v = self._judge(ERR_USER_LAYER_REAL + "\n" + ca.INTERRUPT_MARK + "\n")
+        self.assertEqual(v.state, "interrupted")
+        self.assertIn("resume", v.reason)
+
+    def test_没有打断标记时_额度字样要点名(self):
+        # 原来这条叫「撞额度上限比被打断更该被说出来」，钉的是相反的优先级。
+        # 那是额度判据还只是「给人看的解释」时写的；现在它要决定删不删元数据、
+        # 换不换账号，而打断标记是不可伪造的那一个。见 test_打断标记优先于额度字样。
+        v = self._judge(ERR_USER_LAYER_REAL + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("额度", v.reason)
 
     def test_非UTF8的报告不许把判据打崩(self):
         # codex 被 SIGINT 打断时可能只写出半截字节
@@ -898,7 +911,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
 
-    def test_额度上限和写锁仍然是failed_它们resume救不回来(self):
+    def test_没有打断标记时_额度上限和写锁仍然是failed(self):
         """这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉。
 
         **喂的是成形的错误行，不是裸标记串。** 2026-09-22 把额度判据搬到
@@ -906,18 +919,25 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         (ca.USAGE_LIMIT_MARK, ...)`，直接把标记本身当成一整轮日志）当场变红。
         那不是回归——是旧 fixture 连同「裸文本里提到就算数」这个错误假设一起
         断言了进去，正是模块头第 8 种空测试形态。
+
+        **前提里刻意不带打断标记。** 这条原先叫「额度上限和写锁仍然是 failed
+        _它们 resume 救不回来」，喂的是「证据行 + 打断标记」，钉的是「额度／写锁
+        压过打断」。那个优先级已被推翻（见 `judge` 里「打断排最前」那段注释与
+        `TestJudge.test_打断标记优先于额度字样`）：标记是本工具自己写的、不可伪造，
+        而这两条靠的是会被 brief 原文和 codex 读文件回显污染的字面串。
+        本条要钉的那件事——第五态不许顺手吃掉这两种处置——在没有标记时原样成立。
         """
-        for name, evidence in (("额度上限", ERR_USER_LAYER_REAL), ("写锁", ERR_FATAL)):
+        for name, evidence, 处置 in (("额度上限", ERR_USER_LAYER_REAL, "换账号"),
+                                     ("写锁", ERR_FATAL, "新起一个任务")):
             with self.subTest(情形=name):
-                # 前提：**光有打断标记时结论是 interrupted**。不钉这一条的话，
-                # 换个不带证据的 fixture 也能让下面两行绿，这条测试就悄悄
-                # 变成「打断标记 → failed」的反面版本，什么都不挡。
-                self.assertEqual(
-                    ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n")).state,
-                    "interrupted", "前提不成立：不加证据行时本来就不是 interrupted")
-                v = ca.judge(ca.Round(self.report, evidence + "\n" + ca.INTERRUPT_MARK + "\n"))
+                v = ca.judge(ca.Round(self.report, evidence + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
+                # reason 必须钉住：`failed` 这个状态还有一条「报告缺失」的兜底，
+                # 它对任何输入都成立。只断言状态的话，换一行毫无关系的垃圾
+                # 也能让这条绿——那就又是一条什么都不挡的空测试。
+                self.assertIn(处置, v.reason,
+                              "命中的是「报告缺失」那条兜底，不是这一支特判")
 
     def test_打断与错误行共存时状态取interrupted_错误行照常进detail(self):
         """被 INT 打断几乎必然留下

@@ -653,21 +653,29 @@ def judge(round):
     # 前提是每轮开跑前把上一轮的报告删掉（见 clear_report），否则旧报告会被
     # 当成本轮的产物，一次失败的运行会被判成 success。
     if not report_text.strip():
-        # 两种特判只改 reason、不新增状态：补救手段不同（换账号／新起任务），
-        # 但都属于「没正常收尾」这一种事实，状态机不该为此变复杂。
+        # 三种特判只改 reason、不新增状态（打断那条除外，它本来就是第五态）：
+        # 补救手段不同（接着 resume／换账号／新起任务），但都属于「没正常收尾」
+        # 这一种事实，状态机不该为此变复杂。
+        #
+        # **打断排最前。** 这个标记是本工具自己写的（interrupt_codex 发完 INT 才写），
+        # 是关于「我们做了什么」的**不可伪造**证据；下面两条靠的是日志里的字面串，
+        # 而日志里混着 brief 原文、codex 读文件的回显、子进程输出——2026-09-22 实测：
+        # 一个完全正常的账号，因为任务内容涉及额度处理，日志里就出现了
+        # `ERROR: …hit your usage limit`。
+        # 「两者都真」几乎不可能：codex 撞上限会自己退出，那时没有进程可以被 INT。
+        # 顺序反了的代价是不对称的：把「被打断、resume 就行」判成额度问题，
+        # cmd_run 会删掉元数据、换账号把整个任务重跑一遍。
+        # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
+        # 留下 failed to record rollout items），那些照常进 detail，不改状态。
+        if has_interrupt_mark(round_text):
+            return Verdict("interrupted",
+                           "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         if hit_usage_limit(errors):
             return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
         if THREAD_LOCK_MARK in round_text:
             return Verdict("failed",
                            "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
                            errors)
-        # 排在额度上限和写锁之后：那两条意味着 resume 也救不回来（换账号／新起
-        # 任务），而这一条恰恰是「resume 就行」，不能把更坏的消息盖掉。
-        # 日志里同时有 codex_core::session 的错误行是常态（被 INT 打断几乎必然
-        # 留下 failed to record rollout items），那些照常进 detail，不改状态。
-        if has_interrupt_mark(round_text):
-            return Verdict("interrupted",
-                           "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
