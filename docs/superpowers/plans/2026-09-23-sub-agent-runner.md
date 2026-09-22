@@ -424,13 +424,59 @@ ANTHROPIC_MODEL=claude-opus-5 ./sub_agent_runner.py run --task smoke-deepseek \
 → 模型变量核对：设了 ANTHROPIC_MODEL=claude-opus-5 也没被 claude-deepseek 退 2
 ```
 
-**留给协调者在主 checkout 上做的两件事**（worktree 里做不了）：
+**留给协调者在主 checkout 上做的三件事**（worktree 里做不了），**顺序不能反**：
 
 1. `mv ~/.claude/skills/codex-sub-agent ~/.claude/skills/sub-agent-runner`
 2. `ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-agent-runner`
    并删掉旧的 `~/.local/bin/codex-sub-agent`（现指向
    `/home/xy/.claude/skills/codex-sub-agent/codex_sub_agent.py`，合并后就是死链）
+3. **把迁移再跑一遍**（下面那段脚本），然后核对 `status` 列得出全部任务
+
+### 第 3 步不是保险，是必须的——Task 1 的「一次操作」有个计划和 spec 都没看见的前提
+
+迁移只有在**没有第二份代码还在写元数据**时才是一次性的。而旧命令
+（`~/.local/bin/codex-sub-agent` → 主 checkout 的 `codex_sub_agent.py`）**一直是活的**：
+它不认识 `runner` 字段，每写一份新元数据就重新开一个洞。
+
+**这不是假想，本次执行期间真的发生了**：05:38 迁移完 260 份，06:38 协调者用旧命令
+起了两个 spec 审查任务（`spec-review-schema`、`spec-review-schema-a2`），
+它们的元数据**没有 `runner`**。合并之后的后果是立刻可见的：
+
+```
+$ sub-agent-runner status
+Rejected: …/tasks/spec-review-schema-a2.json 缺字段 ['runner']，元数据坏了——删掉它重新 run
+```
+
+**爆炸半径是整个列表**（`_load_meta` 上方那段注释早写过）：一份坏元数据让不带任务名的
+`status` **一个任务都列不出来**，263 个一起陪葬；而工具给的唯一建议是「删掉它重新 run」
+——那等于丢掉那个会话。
+
+所以补迁移必须排在第 2 步**之后**（那一刻旧命令才真正死掉，不会再有新的一份）：
+
+```bash
+python3 -c "
+import sys; sys.path.insert(0, '$HOME/.claude/skills/sub-agent-runner')
+import json, pathlib, sub_agent_runner as ca
+done = 0
+for home in [pathlib.Path.home() / n for n in
+             ('.codex-subagent', '.codex-subagent-acct2', '.codex-subagent-acct3', '.claude-subagent')]:
+    d = home / 'tasks'
+    if not d.is_dir(): continue
+    for q in sorted(d.glob('*.json')):
+        m = json.loads(q.read_text())
+        if 'runner' in m: continue
+        m['runner'] = 'codex'; ca.write_meta(home, m['task'], m); done += 1
+metas = ca.all_metas()
+print('补上', done, '| 总数', len(metas), '| 仍缺',
+      sum(1 for _, m in metas if 'runner' not in m))
+"
+sub-agent-runner status | grep -c '^[a-zA-Z0-9]'   # 应与上面的总数一致
+```
+
+**合并前如果还要用这个工具派任务，就用 worktree 里的 `./sub_agent_runner.py`**
+（它认 `runner`），别用旧命令——每用一次就多一份要补的元数据。
 
 **顺带产生的一条真实盘上状态**：冒烟留下了任务 `smoke-deepseek`（在
-`~/.claude-subagent`），所以 `all_metas()` 现在是 **261** 而不是 260。
+`~/.claude-subagent`），加上协调者 06:38 用旧命令起的两个 spec 审查任务，
+`all_metas()` 现在是 **263**（260 + 1 + 2，后三份都已补上 `runner`）。
 要清掉就删 `~/.claude-subagent/{tasks,reports,logs}/smoke-deepseek.*`。

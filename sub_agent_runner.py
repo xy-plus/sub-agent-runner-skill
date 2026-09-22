@@ -5,7 +5,11 @@
 （`--runner deepseek`）。**两侧共用同一套任务名、判据、报告和打断／续跑协议**——
 `judge` 只有一个，runner 的职责是把本轮的产物摆成它认识的形状
 （报告文件 + 本轮日志文本）。真正按 runner 分叉的点有七个，都在 `run_codex`
-和它派生的那几个函数里，五个 `cmd_*` 里一个 `if runner ==` 都没有。
+和它派生的那几个函数里；五个 `cmd_*` 里只有 `cmd_run` 有两处
+（选 argv builder、以及「撞额度上限」那一支限 codex），因为那两件事本来就只属于
+调用入口——builder 要用刚铸好的 session id，而账号／限流记录是 codex 独有的概念。
+`status`／`resume`／`stop`／`interrupt-and-resume` 里一处都没有：它们从元数据取
+runner，再交给 `find_task_agent_pid` 和 `_resume_round`。
 
 调用方只给任务信息（派给谁／干什么／在哪干／多难），命令组装、隔离、存活判定、
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
@@ -221,14 +225,14 @@ def round_separator(kind, task, when_iso):
 # isoformat(timespec="seconds") 也没有空格。
 #
 # **整行匹配自带一条新前提：这两行必须落在行首。** 它由**写者**保证，不是读者猜
-# ——两个写入点（interrupt_codex 留痕、run_codex 写分隔符）各自在前面补换行。
+# ——两个写入点（interrupt_agent 留痕、run_codex 写分隔符）各自在前面补换行。
 # 前提不成立是常态而非边角：日志末尾由 _tee_until_exit 的 log.write(chunk) 留下，
 # 而 read1(1024) 的边界是任意的，codex 流式输出被 INT 截在半行很常见。
 # 这条前提要是塌了，judge 会从 interrupted(130) 退回 failed(1)——
 # 正是这整轮改动要消灭的那个 bug 从第三层绕回来。
 _ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
 
-# 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_codex 的 cause。
+# 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_agent 的 cause。
 _MARK_LINE = re.compile(r"^" + re.escape(INTERRUPT_MARK) + r"(\s\[.*\])?$", re.M)
 
 
@@ -237,8 +241,13 @@ def has_interrupt_mark(text):
     return _MARK_LINE.search(text) is not None
 
 
-def interrupt_codex(pid, log_path, cause):
+def interrupt_agent(pid, log_path, cause):
     """发 SIGINT 并在日志留痕。这两件事必须一起发生，所以焊在同一个函数里。
+
+    名字从 `interrupt_codex` 改过来：它现在也给 `comm=claude` 的进程发 INT
+    （`find_agent_pid` 那次改名漏了这个）。两个 runner 的打断协议**完全一样**
+    ——发 SIGINT、在日志里留同一个 `INTERRUPT_MARK`——所以本函数不按 runner 分叉，
+    原来只是名字在说谎。
 
     `cause` ∈ {"stop", "interrupt-and-resume", "外部信号转发"}，**必填**，
     追在痕迹行尾。三条路的含义完全不同：前两条是有人**故意**停它；第三条在
@@ -811,7 +820,7 @@ def judge(round):
         # 补救手段不同（接着 resume／换账号／新起任务），但都属于「没正常收尾」
         # 这一种事实，状态机不该为此变复杂。
         #
-        # **打断排最前。** 这个标记是本工具自己写的（interrupt_codex 发完 INT 才写），
+        # **打断排最前。** 这个标记是本工具自己写的（interrupt_agent 发完 INT 才写），
         # 是关于「我们做了什么」的**不可伪造**证据；下面两条靠的是日志里的字面串，
         # 而日志里混着 brief 原文、codex 读文件的回显、子进程输出——2026-09-22 实测：
         # 一个完全正常的账号，因为任务内容涉及额度处理，日志里就出现了
@@ -841,7 +850,12 @@ def judge(round):
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
-        return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的 codex 错误", errors)
+        # 说「子代理」不说「codex」：deepseek 走到这一支时它就是假话。
+        # **「`judge` 一行不改」挡的是「在 judge 里按 runner 分支」，不是禁止修
+        # 一个说错了的词。** 这里改的是措辞，逻辑、分支、状态机一个字没动——
+        # runner 在本函数里仍然不可见，也不该可见。
+        return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的子代理错误",
+                       errors)
 
     # 报告内容由 brief 决定（要 commit 还是要别的），属于任务层不属于工具层。
     # 只预览前几行，让调用方自己核对 brief 要的东西在不在——不解析 JSON：实测
@@ -1416,7 +1430,18 @@ def finish_deepseek_round(round_text, report_path, log_path):
     lines = deepseek_log_lines(round_text)
     if lines:
         with open(log_path, "ab") as log:
-            log.write(("\n".join(lines) + "\n").encode())
+            # **无条件前置换行**，和 `interrupt_agent`、轮次分隔符逐字同一条理由：
+            # 补的行必须落在**行首**，否则 `runtime_error_lines` 的 `^ERROR:`
+            # 一条都匹配不上。这里的半行不是假想——`_tee_lines` 在 EOF 后把没收齐的
+            # 残片**原样写出、不带尾换行**（那是刻意的，残片是「被杀在半路」的
+            # 现场证据），而 `_last_result_event` 的注释写着「进程被 SIGINT 杀掉时
+            # 最后一行必然是残的」，**SIGINT 正是 stop / interrupt-and-resume 的
+            # 正常路径**。粘住之后的后果是这个工具立项要杀的那一类：一轮所有工具
+            # 调用都被拒、报告里明写「我写不进去」，判据报 success 退 0——
+            # 而补错误行正是「零工作量的成功」两道防线里的第二道。
+            # **不判断「末尾在不在行首」**：那没有可靠的现场判据（另一个进程可能
+            # 正在追加），而多一个空行的代价是零、判断错的代价是整条判据失明。
+            log.write(("\n" + "\n".join(lines) + "\n").encode())
 
 
 def agent_comm(runner):
@@ -2004,7 +2029,8 @@ def run_codex(kind, home, task, meta, make_argv):
         next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
                      "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
                      if kind == "interrupt-and-resume" else
-                     f"等上一轮收尾完再来；codex 也还活着的话先 `sub-agent-runner stop {task}`"
+                     f"等上一轮收尾完再来；{meta['runner']} 也还活着的话先 "
+                     f"`sub-agent-runner stop {task}`"
                      f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
                + "；".join(busy) + "。\n" + next_step)
@@ -2022,7 +2048,7 @@ def run_codex(kind, home, task, meta, make_argv):
     # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
     with open(_log_path(home, task), "ab") as log:
-        # 分隔符也必须落在行首，理由同 interrupt_codex 的前置换行：上一轮的
+        # 分隔符也必须落在行首，理由同 interrupt_agent 的前置换行：上一轮的
         # 尾巴可能被 INT 截在半行，分隔符接上去就不在行首，_ROUND_LINE 认不出，
         # read_last_round 于是把两轮连成一轮，上一轮的错误算到这一轮头上。
         # 文件刚以 "ab" 打开，tell() 就是文件长度——**非空才补**，
@@ -2033,11 +2059,11 @@ def run_codex(kind, home, task, meta, make_argv):
         # 读另外四个函数才能确认这里没问题，而「读者根据别处的事实推断」正是
         # 本轮修掉的那三层 bug 的共同形状：
         #   1. cmd_run 撞见同名任务还在跑就拒绝，所以不会有两个 run 共写一份日志
-        #   2. interrupt_codex 只在 os.kill **成功之后**才写，而能被 kill 的 codex
+        #   2. interrupt_agent 只在 os.kill **成功之后**才写，而能被 kill 的 codex
         #      必然已经有过一轮分隔符 → 日志非空
         #   3. cmd_stop / cmd_interrupt_and_resume 都先 find_meta，查不到就拒绝；
         #      查得到就说明至少跑过一轮 → 日志非空
-        #   4. interrupt_codex 的写入恒以 \n 结尾，所以它留下的末尾永远在行首，
+        #   4. interrupt_agent 的写入恒以 \n 结尾，所以它留下的末尾永远在行首，
         #      不会让后来的 tell() 看到一个「非空但不在行首」的状态
         # 仓内不可达。哪天加了新的写者（比如并发的同名任务），先回来看这四条。
         if log.tell() > 0:
@@ -2066,12 +2092,21 @@ def run_codex(kind, home, task, meta, make_argv):
         # "Reading additional input from stdin" + 进程 0% CPU）。
         # 不设 timeout：会误杀正当的长任务。
         #
-        # `cwd` **两侧都传**，少一个分支：codex 本来就有 `--cd`，多传无害；
-        # 而 `claude -p` **没有 `--cd` 等价物**（实测），不传它就在包装器的 cwd 里
-        # 干活——而元数据里写的是 `--dir`，元数据当场说谎。
+        # `cwd` **只给 deepseek 传**。`claude -p` 没有 `--cd` 等价物（实测），
+        # 不传它就在包装器的 cwd 里干活——而元数据里写的是 `--dir`，元数据当场说谎。
         # 传 `meta["dir"]` 而不是另收一个参数：那个字段就是这个任务的工作目录，
         # 两条 resume 路上也是它（`check_can_resume` 已经验过它还在）。
-        proc = subprocess.Popen(argv, env=env, cwd=meta["dir"], stdin=subprocess.DEVNULL,
+        #
+        # **codex 那一支刻意不传**，即使「两侧都传」能少一个分支：
+        #   1. 旧代码没传，而 `_no_codex` 把 `Popen` 整个 mock 掉了——**这是一整个
+        #      测试照不到的行为面**。「codex 侧行为一字未变」这条约束保护的正是
+        #      318 条既有测试看不见的那部分，约束和一个 `if` 的简化冲突时约束赢。
+        #   2. 更实在的一条：传了 cwd 之后 `--cd` 就**不再承重**了——漏传 `--cd`
+        #      的实现照样能跑对，而那正是 `build_run_argv` 第一行注释在防的事
+        #      （「--cd 必须绝对路径：相对路径启动即崩」）。少一个分支换来一条
+        #      静默的冗余，不划算。
+        cwd = meta["dir"] if runner == DEEPSEEK else None
+        proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
 
@@ -2082,7 +2117,7 @@ def run_codex(kind, home, task, meta, make_argv):
             # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
             # 来源写「外部信号转发」：在 run_in_background 下这条路根本不该
             # 走到——它出现在日志里，就是前台误跑被超时杀掉的诊断。
-            interrupt_codex(proc.pid, _log_path(home, task), "外部信号转发")
+            interrupt_agent(proc.pid, _log_path(home, task), "外部信号转发")
 
         # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
         # 而不还原，等于把本函数的副作用留给了整个进程的余生。
@@ -2189,8 +2224,10 @@ def _write_both(log, data):
 #
 # **刻意不换格式。** 初稿的制表符方案被实测否掉：按 tabstop=8 量四行真实输出
 # 的各列屏幕起始列，[0,16,24,32,40,80] / [0,16,24,32,40,88] / [0,8,16,24,32,40]
-# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]
-# （那是**换列序之前**的四列格式量出来的；定宽的稳定性与列数无关，结论照样成立）。
+# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的：
+# 本格式实测 [0,25,42,51]（第五段 dir 在 56），与内容无关恒定。
+# （那次量的是**换列序之前**的四列格式 [0,25,34,43]；定宽的稳定性与列数无关，
+# 所以第二列从 8 宽的账号换成 16 宽的 `runner[:account]` 之后结论照样成立。）
 #
 # 退出码单独成列：它和 state 是同一份事实的两种编码，但**同源派生**（都来自
 # EXIT[state]），不存在漂移风险。人读词，机器读码。
@@ -2353,10 +2390,11 @@ def cmd_run(args):
     # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
     # writer 和 codex 排干了没有」，每轮都必须做。
     #
-    # **deepseek 的 needle 只住在元数据里**，所以「选中的家」那一格对它答不出来
-    # （新铸的 uuid 查不到上一轮）。上面那条跨 runner 拒绝保证了：能走到这里的
-    # deepseek 任务，`old_home` 要么是 None、要么就是这个家——而后者带着元数据，
-    # `find_task_agent_pid` 读得到上一轮的 uuid。
+    # **deepseek 的 needle 只住在元数据里**，所以它靠的是「元数据在不在」，
+    # 而不是像 codex 那样由 (home, task) 算得出——元数据不在时它老实答 None。
+    # 这一格对它仍然是有效的：上面那条跨 runner 拒绝保证了，能走到这里的 deepseek
+    # 任务 `old_home` 要么是 None（那就真没有上一轮）、要么就是这个家（那就带着
+    # 元数据，`find_task_agent_pid` 从磁盘读得到上一轮的 uuid）。
     home = isolation_home(args.runner, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
         if find_task_agent_pid(args.runner, candidate_home, args.task) is not None:
@@ -2647,7 +2685,7 @@ def cmd_interrupt_and_resume(args):
             print(f"[sub-agent-runner] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
-            interrupt_codex(pid, log, "interrupt-and-resume")
+            interrupt_agent(pid, log, "interrupt-and-resume")
             print(f"[sub-agent-runner] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
@@ -2664,10 +2702,10 @@ def cmd_stop(args):
     if pid is None:
         print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]
-    # 发 INT 与留痕焊在 interrupt_codex 里，这条路不可能只做一半。
+    # 发 INT 与留痕焊在 interrupt_agent 里，这条路不可能只做一半。
     # 上面 `pid is None` 那一支正是「调用之前判它在不在跑」的地方，
-    # 所以 interrupt_codex 不需要回一个 bool 让这里再判一遍。
-    interrupt_codex(pid, _log_path(home, args.task), "stop")
+    # 所以 interrupt_agent 不需要回一个 bool 让这里再判一遍。
+    interrupt_agent(pid, _log_path(home, args.task), "stop")
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
@@ -2716,7 +2754,7 @@ def _add_prompt_round_args(sub):
     # 序列化不受影响：json.dumps(()) 就是 []，元数据的形状一个字没变。
     g = sub.add_mutually_exclusive_group(required=True)
     g.add_argument("--skill", action=_AppendSkillPath, dest="skills", type=skill_path,
-                   metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
+                   metavar="SKILL_MD", help="允许子代理读的 SKILL.md 绝对路径，可重复")
     g.add_argument("--no-skill", action="store_const", const=(), dest="skills",
                    help="本轮一个 skill 都不给")
 
@@ -2741,7 +2779,8 @@ def build_parser():
     r = sub.add_parser("run", help="起一个新任务")
     r.add_argument("--task", required=True, type=task_name,
                    help="任务名，全局唯一（PID 反查和产物命名都靠它）")
-    r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
+    r.add_argument("--dir", required=True, type=work_dir,
+                   help="子代理的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
     # `--runner` **必填，没有缺省**：这不是「换个模型」，而是换隔离机制、换工作
@@ -2806,7 +2845,7 @@ def main():
     能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
     包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
     仍可 resume，日志里还留下一行带来源的打断标记（`[外部信号转发]`，见
-    interrupt_codex）告诉下一个人该 resume 而不是重跑。于是误用的代价从
+    interrupt_agent）告诉下一个人该 resume 而不是重跑。于是误用的代价从
     「会话永久锁死、上下文全丢」降到「这一轮没拿到完成通知」——可恢复。
 
     **这条路上别指望退出码。** 链路是「harness 超时 → TERM 打进程组 → codex
