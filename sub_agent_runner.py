@@ -1,9 +1,30 @@
 #!/usr/bin/env python3
-"""codex-sub-agent —— 把 `codex exec` 的实测约束编译成硬约束的包装器。
+"""sub-agent-runner —— 把子代理的实测约束编译成硬约束的包装器。
 
-调用方只给任务信息（干什么／在哪干／多难），命令组装、隔离、存活判定、
+两个 runner：`codex exec`（`--runner codex`）和 `claude-deepseek -p`
+（`--runner deepseek`）。**两侧共用同一套任务名、判据、报告和打断／续跑协议**——
+`judge` 只有一个，runner 的职责是把本轮的产物摆成它认识的形状
+（报告文件 + 本轮日志文本）。真正按 runner 分叉的点有七个（枚举见下面 deepseek
+那一段的开头）：大部分在 `run_codex` 和它派生出来的那几个函数里，另三个是
+`isolation_home`／`ensure_isolation`／`find_task_agent_pid`——它们不问「怎么跑」，
+只按 runner 取事实。
+**命令入口里只有 `cmd_run` 带 runner 分支**：选 argv builder、「撞额度上限」那一支
+限 codex（那两件事本来就只属于调用入口——builder 要用刚铸好的 session id，而
+账号／限流记录是 codex 独有的概念），外加它第一行调的那三条硬拒绝
+（`_reject_bad_runner_combo`——三条各自只对某一个 runner 成立）。
+`status`／`resume`／`stop`／`interrupt-and-resume` 里一处都没有：它们从元数据取
+runner，再交给 `find_task_agent_pid` 和 `_resume_round`。
+
+调用方只给任务信息（派给谁／干什么／在哪干／多难），命令组装、隔离、存活判定、
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
+
+**工具改名了（`codex-sub-agent` → `sub-agent-runner`），盘上的东西一个没改：**
+隔离目录名 `~/.codex-subagent*`、`ROUND_MARK`、`INTERRUPT_MARK` 的文本。
+它们写在每一份现存日志和 260 份现存元数据里，被整行正则匹配——
+一次全局 sed 会让所有旧日志的轮次边界和打断痕迹当场认不出来。
+不对称是刻意的：**用户敲的是命令名，盘上的东西谁都不该动。**
+有测试钉着（`TestOnDiskContract`）。
 """
 import argparse
 import datetime
@@ -15,6 +36,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from typing import NamedTuple
 
 # 护栏拒绝走独立退出码。裸 `raise SystemExit("人话")` 的退出码是 1，和
@@ -45,7 +67,7 @@ def reject(message):
 # 而那是**正则**，`.` 和 `|` 都是元字符。2026-09-19 实测任务名 `a` 的
 # `…/reports/a.md` 命中了任务 `aXmd` 的进程（`a`+任意字符+`md`），
 # `stop a` 会把 SIGINT 发到 aXmd 的 codex 上。
-# 那个理由现在没了——反查改成扫 /proc 做 argv 元素精确比对（见 find_codex_pid），
+# 那个理由现在没了——反查改成扫 /proc 做 argv 元素精确比对（见 find_agent_pid），
 # 正则语义一点都不引入。但上面两条（文件名）依然成立，所以限制保留。
 #
 # 放在 argparse 的 type= 上，四个子命令一个都绕不过去。
@@ -113,11 +135,11 @@ def skill_path(value):
     _reject_control_chars(
         "--skill", value,
         "它要逐行进兜底句的白名单，一个换行就把一条静默劈成两条，"
-        "codex 读到的是两个都不存在的路径（见 build_skill_guard）。")
+        "子代理读到的是两个都不存在的路径（见 build_skill_guard）。")
     q = pathlib.Path(value)
     if not q.is_absolute():
         raise argparse.ArgumentTypeError(
-            f"--skill {value} 不是绝对路径。codex 的 cwd 是 --dir，相对路径解释不出你的意思。")
+            f"--skill {value} 不是绝对路径。子代理的 cwd 是 --dir，相对路径解释不出你的意思。")
     if not q.is_file():
         raise argparse.ArgumentTypeError(
             f"--skill {value} 不是文件。要传的是 SKILL.md **文件本身**，不是 skill 目录。")
@@ -127,7 +149,7 @@ def skill_path(value):
     if not os.access(q, os.R_OK):
         raise argparse.ArgumentTypeError(
             f"--skill {value} 存在但当前用户读不了（权限 {oct(q.stat().st_mode)[-3:]}）。"
-            f"codex 的 cat 会退 1，而那个失败判据看不见。")
+            f"子代理读它会失败（codex 是 `cat` 退 1），而那个失败判据看不见。")
     # **刻意返回原样，不 resolve()**：这个串会逐字进 brief 的白名单行，而
     # 「codex 到底读没读」就是靠日志里那一行 `cat <这个串>` 看出来的
     # （见 _add_prompt_round_args 的可观测性论证）。规范化之后，命令行上写的、
@@ -153,6 +175,17 @@ REPORT_PREVIEW_LINES = 5
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
+# ── 下面这两个字面量是**盘上契约**：改名、重构、清理，都不许动它们一个字 ──
+# 它们写在每一份现存日志里，被下面两个整行正则匹配，所以动谁都会在**不报错**的
+# 情况下改变判据：
+#   动 ROUND_MARK     → 旧日志上找不到轮次起点，`read_last_round` 把整份日志当成
+#                       这一轮，前几轮的错误全算进来
+#   动 INTERRUPT_MARK → 盘上已有的打断痕迹认不出，`interrupted` 退回 `failed`
+#                       （那个 28k token 的坑），`cmd_interrupt_and_resume` 那道
+#                       「不发第二发 INT」的闸也一起失效
+# 工具从 `codex-sub-agent` 改名成 `sub-agent-runner` 时**刻意留下了它们**（见模块
+# docstring）：一次全局 `sed 's/codex-sub-agent/sub-agent-runner/g'` 会同时踩中
+# 两条，`TestOnDiskContract` 拿字面量钉着，那次 sed 当场变红。
 ROUND_MARK = "===== codex-sub-agent "   # 每轮开跑前写进日志的分隔符前缀
 
 # 本轮被信号打断时留在日志里的痕迹。刻意不以 ROUND_MARK 开头——不过这条现在
@@ -193,7 +226,7 @@ def round_separator(kind, task, when_iso):
 #
 # 子串搜索在这个仓库里是真会说谎的：模块 docstring 自己写着「日志里还混着
 # brief 原文和 codex 转述的子进程输出」，而这里的日常就是派 codex 来改
-# codex_sub_agent.py 自己。源码里那两行常量定义一旦被转述进日志，**两个方向都翻车**：
+# sub_agent_runner.py 自己。源码里那两行常量定义一旦被转述进日志，**两个方向都翻车**：
 #   日志里出现 `ROUND_MARK = "===== codex-sub-agent "` 这行源码
 #     → 本轮文本在那里被切断（实测切剩 'ROUND_MARK = "' 共 14 个字符）
 #     → 打断标记被甩到本轮之外 → judge 从 interrupted 翻成 **failed**
@@ -207,14 +240,14 @@ def round_separator(kind, task, when_iso):
 # isoformat(timespec="seconds") 也没有空格。
 #
 # **整行匹配自带一条新前提：这两行必须落在行首。** 它由**写者**保证，不是读者猜
-# ——两个写入点（interrupt_codex 留痕、run_codex 写分隔符）各自在前面补换行。
+# ——两个写入点（interrupt_agent 留痕、run_codex 写分隔符）各自在前面补换行。
 # 前提不成立是常态而非边角：日志末尾由 _tee_until_exit 的 log.write(chunk) 留下，
 # 而 read1(1024) 的边界是任意的，codex 流式输出被 INT 截在半行很常见。
 # 这条前提要是塌了，judge 会从 interrupted(130) 退回 failed(1)——
 # 正是这整轮改动要消灭的那个 bug 从第三层绕回来。
 _ROUND_LINE = re.compile(r"^" + re.escape(ROUND_MARK) + r"\S+ \S+ \S+ =====$", re.M)
 
-# 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_codex 的 cause。
+# 痕迹行尾可以跟一个 ` [来源]`，见 interrupt_agent 的 cause。
 _MARK_LINE = re.compile(r"^" + re.escape(INTERRUPT_MARK) + r"(\s\[.*\])?$", re.M)
 
 
@@ -223,8 +256,13 @@ def has_interrupt_mark(text):
     return _MARK_LINE.search(text) is not None
 
 
-def interrupt_codex(pid, log_path, cause):
+def interrupt_agent(pid, log_path, cause):
     """发 SIGINT 并在日志留痕。这两件事必须一起发生，所以焊在同一个函数里。
+
+    名字从 `interrupt_codex` 改过来：它现在也给 `comm=claude` 的进程发 INT
+    （`find_agent_pid` 那次改名漏了这个）。两个 runner 的打断协议**完全一样**
+    ——发 SIGINT、在日志里留同一个 `INTERRUPT_MARK`——所以本函数不按 runner 分叉，
+    原来只是名字在说谎。
 
     `cause` ∈ {"stop", "interrupt-and-resume", "外部信号转发"}，**必填**，
     追在痕迹行尾。三条路的含义完全不同：前两条是有人**故意**停它；第三条在
@@ -254,7 +292,7 @@ def interrupt_codex(pid, log_path, cause):
     以及「前台误跑也能活」那条缓解措施，全都架在它上面。换 codex 大版本时值得重验。
 
     **返回值刻意不给。**「它本来就没在跑」这件事由调用方在**调用之前**用
-    `find_codex_pid` 判，那才是判它的地方；给个 bool 出来只是多一个「谁检查」
+    `find_agent_pid` 判，那才是判它的地方；给个 bool 出来只是多一个「谁检查」
     的滥用面。这里的 ProcessLookupError 只是「刚好在这一瞬退出了」——
     信号没送出去就不该留下假痕迹，所以直接返回。
 
@@ -654,7 +692,7 @@ def write_usage_limit(home, reset_at, raw):
                                   ensure_ascii=False, indent=2))
         os.replace(tmp, usage_limit_path(home))
     except OSError as e:
-        print(f"[codex-sub-agent] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
+        print(f"[sub-agent-runner] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
               f"不影响本轮，只是下次排账号顺序时少一条依据。")
         return False
     return True
@@ -717,7 +755,7 @@ def accounts_by_availability():
     全部意义就是换掉它。搬家现在由 `cmd_run` 在入口处显式做一次。
     """
     def sort_key(account):
-        return (read_usage_limit(isolation_home(account)) or datetime.datetime.min,
+        return (read_usage_limit(isolation_home(CODEX, account)) or datetime.datetime.min,
                 account)
     return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
 
@@ -797,7 +835,7 @@ def judge(round):
         # 补救手段不同（接着 resume／换账号／新起任务），但都属于「没正常收尾」
         # 这一种事实，状态机不该为此变复杂。
         #
-        # **打断排最前。** 这个标记是本工具自己写的（interrupt_codex 发完 INT 才写），
+        # **打断排最前。** 这个标记是本工具自己写的（interrupt_agent 发完 INT 才写），
         # 是关于「我们做了什么」的**不可伪造**证据；下面两条靠的是日志里的字面串，
         # 而日志里混着 brief 原文、codex 读文件的回显、子进程输出——2026-09-22 实测：
         # 一个完全正常的账号，因为任务内容涉及额度处理，日志里就出现了
@@ -827,7 +865,12 @@ def judge(round):
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     if errors:
-        return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的 codex 错误", errors)
+        # 说「子代理」不说「codex」：deepseek 走到这一支时它就是假话。
+        # **「`judge` 一行不改」挡的是「在 judge 里按 runner 分支」，不是禁止修
+        # 一个说错了的词。** 这里改的是措辞，逻辑、分支、状态机一个字没动——
+        # runner 在本函数里仍然不可见，也不该可见。
+        return Verdict("suspect", f"报告在，但本轮日志有 {len(errors)} 条未分类的子代理错误",
+                       errors)
 
     # 报告内容由 brief 决定（要 commit 还是要别的），属于任务层不属于工具层。
     # 只预览前几行，让调用方自己核对 brief 要的东西在不在——不解析 JSON：实测
@@ -851,11 +894,11 @@ MODEL = "gpt-6-astra"
 # 这份初始内容**刻意只有注释**。model／effort／sandbox_mode／approval_policy
 # 由 CLI 每次显式传，写进 config 就是同一条事实有两个家，还是个会被静默覆盖的
 # 缺省值（现存两个隔离目录的 model/effort/service_tier 本来就互相打架）。
-CONFIG_NOTE = '''# codex-sub-agent 的隔离配置。
+CONFIG_NOTE = '''# sub-agent-runner 的隔离配置。
 # 这个文件必须是本目录自己的普通文件，不许软链 ~/.codex/config.toml——
 # 软链会把主配置的 MCP／plugins／hooks／memories 全带回来，隔离当场失效。
 # 刻意不写 model / model_reasoning_effort / sandbox_mode / approval_policy：
-# 那些由 codex-sub-agent 每次运行显式传参，写在这里只会变成一份会被静默覆盖的缺省值。
+# 那些由 sub-agent-runner 每次运行显式传参，写在这里只会变成一份会被静默覆盖的缺省值。
 # codex 自己会往下面追加 [projects.*] trust_level，那是它的状态，不要手动清。
 '''
 
@@ -879,6 +922,15 @@ DEFAULT_ACCOUNT = "default"
 # `default` 是主账号的固定名（不对应 ~/.codex-accounts 下的目录），
 # `auto` 是 `--account` 的模式词。两个都不许被真账号目录占用。
 RESERVED_ACCOUNT_NAMES = (DEFAULT_ACCOUNT, AUTO)
+
+
+# 派给谁跑。**runner 不是「模型」**：换 runner 连隔离机制（CODEX_HOME ↔
+# CLAUDE_CONFIG_DIR）、工作目录怎么传（argv 的 --cd ↔ Popen(cwd=)）、报告怎么拿
+# （-o 文件 ↔ result 事件）、有没有账号维度都不一样。所以参数叫 `--runner`
+# 不叫 `--model`——叫 model 会让人以为只是换个权重。
+CODEX = "codex"
+DEEPSEEK = "deepseek"
+RUNNERS = (CODEX, DEEPSEEK)
 
 
 def account_choices():
@@ -910,14 +962,26 @@ def account_choices():
                    f"两次指向同一个隔离目录，find_meta 会对同一份元数据数出两份并误拒；"
                    f"目录叫 {AUTO} 时这个账号再也没法被明确指定。\n"
                    f"改名要改**两个**：账号目录 {accounts_dir / name}，"
-                   f"以及它的隔离目录 {isolation_home(name)}。\n"
+                   f"以及它的隔离目录 {isolation_home(CODEX, name)}。\n"
                    f"只改前一个的话，住在后一个里的任务之后再也扫不到"
                    f"——status 看不见、stop 停不掉，而且没有任何报错。")
     return [DEFAULT_ACCOUNT] + extra
 
 
-def isolation_home(account):
-    """每个账号一个隔离目录，任务的全部产物都落在这里。
+def isolation_home(runner, account):
+    """这个任务住哪个隔离目录。**由 `(runner, account)` 一对值决定。**
+
+    拆成两个参数各传各的，正是「好 API 难被误用」要消掉的那种缝：
+    `account` 只有 codex 才有意义，deepseek 传任何非 `None` 都是调用方搞混了，
+    所以这里当场 `ValueError` 而不是把它拼进目录名
+    （拼进去就得到 `~/.codex-subagent-deepseek` 这个不存在的账号目录，
+    随后在 `ensure_isolation` 里因缺 auth 拒跑——报的错和真正的原因隔着两层）。
+
+    **目录名一个都不改。** `~/.codex-subagent*` 是 260 份现存元数据里的归属，
+    2026-09-23 迁移时实测三个目录共 260 份。命令名改成 `sub-agent-runner`、
+    目录名不动——**这条不对称是刻意的**：用户敲的是命令名，盘上的东西谁都不该动。
+
+    每个账号一个隔离目录，任务的全部产物都落在这里。
 
     **落点在 `$HOME` 下，不在被改的那个仓库里**，这是判据不是习惯：
     `tasks/`、`reports/`、`logs/` 全在仓库外，过程文件就进不了 git，
@@ -928,10 +992,39 @@ def isolation_home(account):
     软约定拦不住，换成结构上够不着才拦得住。
     """
     base = pathlib.Path.home()
+    if runner == DEEPSEEK:
+        # deepseek 没有账号维度：一个 DeepSeek token，而且它走环境变量不走配置目录。
+        if account is not None:
+            raise ValueError(f"runner={DEEPSEEK} 没有账号概念，account 必须是 None，收到 {account!r}")
+        return base / ".claude-subagent"
+    if runner != CODEX:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
     return base / ".codex-subagent" if account == DEFAULT_ACCOUNT else base / f".codex-subagent-{account}"
 
 
+def isolation_roots():
+    """所有可能住着任务的隔离目录。**`find_meta` 和 `all_metas` 都走这里。**
+
+    原来它们各自写 `for account in account_choices(): isolation_home(account)`，
+    而 deepseek 的家不对应任何账号——**不收进来，deepseek 任务对
+    `status`／`resume`／`stop` 整体不可见**，而那是静默的：任务跑着、报告在盘上，
+    工具却说没有这个任务。抽成一个函数而不是在两处各加一行，是因为
+    「哪些目录住着任务」必须只有一个家：漏掉其中一处的后果是
+    `status` 列得出、`resume` 却说没有这个任务。
+    """
+    return [isolation_home(CODEX, a) for a in account_choices()] + [isolation_home(DEEPSEEK, None)]
+
+
 def auth_source(account):
+    """某个 **codex** 账号的登录态文件。
+
+    **只对 codex 有意义**，所以 `None` 当场炸：deepseek 的 account 恒为 `None`，
+    拿它拼路径会静默得到 `~/.codex-accounts/None/auth.json`——一个谁都不会
+    注意到的假路径，随后报的错是「这个账号没有登录态」，和真正的原因隔着两层。
+    """
+    if account is None:
+        raise ValueError(f"auth_source 只对 codex 账号有意义，收到 None"
+                         f"（runner={DEEPSEEK} 的登录态走环境变量里的 token，不在配置目录里）")
     base = pathlib.Path.home()
     return base / ".codex" / "auth.json" if account == DEFAULT_ACCOUNT else base / ".codex-accounts" / account / "auth.json"
 
@@ -941,8 +1034,19 @@ def shared_skill_root():
     return pathlib.Path.home() / ".agents" / "skills"
 
 
-def ensure_isolation(account):
+def ensure_isolation(runner, account):
     """保证隔离目录满足全部不变量，不满足就拒跑（而不是“尽力而为”地继续）。
+
+    **不变量按 runner 分叉，因为它们各自的根据不同**：
+    下面那三条（共享扫描根为空、config.toml 不是软链、auth.json 软链到账号）
+    全部是 **codex 的**事实——`~/.agents/skills` 是 codex 的扫描根，claude 根本
+    不看它；`config.toml` 是 codex 的配置文件；而 deepseek 的登录态走环境变量里的
+    token，**配置目录里没有 auth.json**（2026-09-23 实测：`CLAUDE_CONFIG_DIR`
+    指向一个空目录照跑）。把 codex 的不变量套到 deepseek 上，就是把一条外部事实
+    当成了普遍规律，后果是 deepseek 一轮都跑不起来。
+
+    两侧**唯一共有**的是 `tasks`/`reports`/`logs` 三个子目录：少一个就是 tee
+    循环里的 `FileNotFoundError`，包装器中途死掉、子进程变孤儿（见下）。
 
     **它挡的是动机，不是能力**——这条必须写明白，否则下一个人会拿它去推错结论。
     2026-09-19 实测：`collaboration.spawn_agent` 等六个工具**恒在**，
@@ -959,12 +1063,18 @@ def ensure_isolation(account):
     那个口子打不开）。不软链的真理由在 _add_prompt_round_args 里：可观测性 +
     奥卡姆。留着一条错理由比没有理由更危险。
     """
-    d = isolation_home(account)
+    d = isolation_home(runner, account)
     # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
     # 写失败（log 末尾只留一行 Failed to write last message file），而判据是
     # “报告没出现＝没正常收尾”——一次成功的运行会被判成失败。2026-09-13 连踩两次。
-    for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+    # deepseek 侧同样要：`_tee_until_exit` 往 logs/ 里写，`finish_deepseek_round`
+    # 往 reports/ 里写，缺哪个都是同一个 `FileNotFoundError`。
+    # skills/plugins 只有 codex 用（CODEX_HOME 的布局），deepseek 不建。
+    for sub in (("skills", "plugins", "tasks", "reports", "logs") if runner == CODEX
+                else ("tasks", "reports", "logs")):
         (d / sub).mkdir(parents=True, exist_ok=True)
+    if runner == DEEPSEEK:
+        return d
 
     # 拒跑而不是打印警告：隔离的前提一旦被破坏，本工具的核心承诺就是空的，
     # 而警告会被淹没在几千行 codex 输出里没人看见。
@@ -1136,6 +1246,243 @@ def codex_env(home):
     return env
 
 
+# ────────────────────────── deepseek runner ──────────────────────────
+# 下面这一段是 `claude-deepseek -p` 那一侧的全部特殊性。**它们不是三件事而是七件**
+# （隔离目录、隔离不变量、环境+工作目录、起跑 argv、续跑 argv、tee 与收尾、
+# PID 反查的 needle），散开写就会在 `run_codex` 和五个 `cmd_*` 里长出一堆
+# `if runner ==`。接线点集中在 `run_codex` 一处，见那里。
+#
+# **定义了函数不等于接上了线。** 本段每个函数都必须有一个真实调用点，而且那个
+# 调用点要有**端到端**的落点——假 `Popen` 驱动真实 `run_codex`，断言日志里真有
+# 那行、报告真出现／真不出现，而不是只断言「这个函数被调用时返回什么」。
+# 这条是踩出来的：曾经的 plan 定义了五个新函数、31 条测试全绿，而照它搭出的参考
+# 实现里那五个**一个调用点都没有**——一个「永不写报告、永不滤日志、完全没有
+# 隔离」的 deepseek runner 照样全绿。守住它的是 `TestDeepseekWiring`，
+# 和本段那些纯函数测试缺一不可。
+
+DEEPSEEK_BIN = "claude-deepseek"
+# 用户的硬约束（原话：「如果是 DeepSeek 的话，它的 effort 必须要是 max」）。
+# 写成常量而不是散落字面量：`cmd_run` 的硬拒绝和错误信息都指向它。
+DEEPSEEK_EFFORT = "max"
+
+# `claude-deepseek` 开头会扫环境里所有匹配这个模式的变量，值不等于它自己那个
+# 模型就**退 2**（它的注释：「静默跑错模型变成大声退 2」）。
+# **用户的场景正是「我现在正在用原生的 Claude Code」**——那一刻 `ANTHROPIC_MODEL`
+# 就是 `claude-*`，原样透传 `os.environ` 会让整个功能一次都跑不起来。
+# 实测：`ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p "说一个字：好"` → 退 2。
+# 模式逐字抄自 wrapper（`^(ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$`）：
+# 两边宽窄必须一致，我们这边窄一格就漏掉一个变量、它那边照样退 2。
+_MODEL_ENV = re.compile(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$")
+
+
+def deepseek_env(home):
+    """deepseek 侧的隔离：`CLAUDE_CONFIG_DIR` + **清掉继承来的模型变量**。
+
+    2026-09-23 实测 `CLAUDE_CONFIG_DIR` 指向空目录照跑——auth 走环境变量里的 token，
+    不在配置目录里，所以空目录正是我们要的隔离：子代理一个 skill、一个 MCP、
+    一个 hook 都看不见。
+
+    删模型变量**不改变正确性**：`claude-deepseek` 自己 export 全套（11 个），
+    而且它显式传 `--model`，命令行优先级最高。这里删的只是「别处定的那一份」。
+    只删模型变量、不清空整个环境：子进程还要 `PATH`／`HOME`／代理设置。
+    """
+    env = {k: v for k, v in os.environ.items() if not _MODEL_ENV.match(k)}
+    env["CLAUDE_CONFIG_DIR"] = str(home)
+    return env
+
+
+def new_session_id():
+    """铸一个新的会话 id。**只有 deepseek 用得上**（`codex exec` 自己生成）。"""
+    return str(uuid.uuid4())
+
+
+def _deepseek_base_argv(effort):
+    # `--output-format stream-json` 实测**强制要 `--verbose`**（不带退 1）。
+    # 不用单块 json：它只在结束时吐一次，中途被打断日志里什么都不剩，
+    # 而「被打断的那一轮也要判得出来」是本工具的承诺之一。
+    # `--dangerously-skip-permissions` 对应 codex 侧的 `--sandbox danger-full-access`
+    # + `approval_policy="never"`。**不给的话子代理一个字都写不成，而这一轮仍报
+    # success**（实测 permission_denials 三条全拒、工作目录为空）——正是 `--skill`
+    # 那次立项要杀的「零工作量的成功」。第二道防线见 `deepseek_log_lines`。
+    # **工作目录不在 argv 里**：`claude -p` 没有 `--cd` 等价物，它走 `Popen(cwd=)`。
+    return [DEEPSEEK_BIN, "-p", "--effort", effort,
+            "--output-format", "stream-json", "--verbose",
+            "--dangerously-skip-permissions"]
+
+
+def build_deepseek_argv(effort, session_id, brief):
+    """第一轮。**session id 由我们铸，且必须是独立 argv 元素。**
+
+    `--session-id=<uuid>` 会并成一个元素，让 `find_agent_pid` 的 argv 元素精确
+    比对静默失配——于是 `status` 说不在跑、`stop` 不发信号、`run` 放行第二轮，
+    两个写者共写一份日志。
+
+    **签名里没有工作目录**，虽然 codex 那两个 builder 有。收一个不进 argv 的参数
+    是骗调用方（「传了就管用」），而工作目录只有一个家：`run_codex` 的 `Popen(cwd=)`。
+    """
+    return _deepseek_base_argv(effort) + ["--session-id", session_id, brief]
+
+
+def build_deepseek_resume_argv(effort, session_id, brief):
+    """续跑。**不再传 `--session-id`**——那会另起一个会话，上下文全丢。
+
+    实测：同一个 uuid 再用 `--session-id` 会得到
+    `Error: Session ID … is already in use.` 退 1。
+    """
+    return _deepseek_base_argv(effort) + ["--resume", session_id, brief]
+
+
+# 写在每一轮日志的分隔符之后。**读日志的人有权知道这份日志被动过。**
+# 不带工具名（那会跟着改名走，而这行是写进盘上日志的），也不以 ROUND_MARK 开头
+# （`_ROUND_LINE` 整行匹配 `===== codex-sub-agent <三段> =====`，这行匹配不上，
+# 所以它不会被误当成轮次边界）。
+DEEPSEEK_LOG_NOTE = ("===== 以下已滤掉 claude 的 thinking_tokens 进度事件"
+                     "（每 token 一条，实测约 58 KB/s）；其余事件一字未改 =====\n")
+
+
+def keep_deepseek_line(line):
+    """这一行要不要进日志。**只滤 `thinking_tokens`，别的一个不动。**
+
+    实测它每 token 一条：8 秒 2320 条、462 KB，约 **58 KB/s**；一次 spec 审查的
+    日志跑到了 12 MB。没有任何开关能关掉它，而判据要扫日志。
+    实测过滤比例：行数 99.8%、字节 92.4%（这种行短而密，两个口径差很多）。
+
+    **坏行要留着**（解析不出来就放行）：残行是「这一轮被杀在半路」的现场证据，
+    滤掉它等于把事实也抹掉。
+    """
+    text = line.strip()
+    if not text.startswith(b"{"):
+        return True
+    try:
+        event = json.loads(text)
+    except (ValueError, UnicodeDecodeError):
+        return True
+    return not (event.get("type") == "system" and event.get("subtype") == "thinking_tokens")
+
+
+def split_complete_lines(buffer):
+    """`(完整行的列表, 还没收齐的残片)`。两样都是 `bytes`。
+
+    **残片必须攒着**：丢掉它就是丢掉一个事件（`b"\n".join(...)` 再 `splitlines()`
+    那种写法正是这么静默丢的）；当成完整行则是把半个 JSON 交给解析器。
+
+    按 bytes 切而不是先 decode：一个多字节字符完全可能被切在两块之间，
+    逐块 `decode(errors="replace")` 会把它变成两个替换字符——日志里就多了
+    两个凭空出现的字节，而日志是判据的输入。
+    """
+    if b"\n" not in buffer:
+        return [], buffer
+    *lines, leftover = buffer.split(b"\n")
+    return lines, leftover
+
+
+def _last_result_event(round_text):
+    """本轮 JSONL 里**最后一条** `result` 事件；没有就 `None`。
+
+    **逐行 try/except，坏行跳过。** 实测进程被 SIGINT 杀掉时最后一行必然是残的，
+    `status` 读活日志时同样会撞到——一个残行让整条判据抛异常是不可接受的。
+
+    取最后一条而不是第一条：日志是追加的，本轮文本里可能混进上一轮的尾巴，
+    而「本轮的结论由本轮最后那次收尾决定」。
+    """
+    found = None
+    for line in round_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "result":
+            found = event
+    return found
+
+
+def deepseek_log_lines(round_text):
+    """要补进日志的错误行；一切正常就是空列表。
+
+    `judge` 的 `detail` 来自 `runtime_error_lines`，认的是 `^ERROR:` / tracing /
+    `^Error:`。JSONL 每行以 `{` 开头，**一条都不会命中**——不补的话 deepseek 失败时
+    `detail` 是空的，调用方拿不到任何线索。
+    补一行现有分类器原样认得的，比给 `judge` 加分支好：**判据还是一个家**。
+
+    两种要补：
+
+        非 success    → `failed`（报告没写）
+        工具调用被拒  → 报告在 + 有错误行 = `suspect`，退 3「干完了但要人看一眼」。
+                        **这是「零工作量的成功」的第二道防线**：第一道是
+                        `--dangerously-skip-permissions`，万一它失效，
+                        这里让那一轮变红而不是静默判成功。
+
+    **代价要写明：** 除这两种由本函数产生的行之外，deepseek 侧的 `errors` 恒为空，
+    所以「codex 中途已恢复的工具错误」那类 `suspect` 在 deepseek 侧**结构性不可达**。
+    """
+    event = _last_result_event(round_text)
+    if event is None:
+        return []
+    lines = []
+    if event.get("subtype") != "success":
+        head = (event.get("result") or "").strip().splitlines()
+        lines.append(f"ERROR: {event.get('subtype')}: {head[0] if head else '没有更多信息'}")
+    denied = event.get("permission_denials") or []
+    if denied:
+        names = "、".join(sorted({d.get("tool_name", "?") for d in denied}))
+        lines.append(f"ERROR: 本轮有 {len(denied)} 次工具调用被拒（{names}）"
+                     f"——子代理可能什么都没做成，报告不可尽信")
+    return lines
+
+
+def finish_deepseek_round(round_text, report_path, log_path):
+    """把本轮的产物摆成 `judge` 认识的形状。**这是 deepseek 侧唯一的收尾入口。**
+
+    两件事焊在一起，调用方没有「只写报告、忘了补错误行」这种写法：
+      ① **只在真 success 时**把 `result` 写进报告文件
+      ② 把 `deepseek_log_lines` 那几行追加进日志
+
+    ① 是 `judge` 一行不改的全部原因：现有那条「报告没出现＝没正常收尾」原样生效，
+    打断（`error_during_execution`）于是自动落到 `interrupted`／退 130，和 codex
+    侧逐字一致。把结构化信号用在这里、而不是给 `judge` 加分支，判据就仍然只有一个家。
+
+    ② 必须在 `run_codex` 回传 `Round` **之前**做完，否则补的行落在本轮边界之外，
+    `judge` 看不见——那就等于没补。
+    """
+    event = _last_result_event(round_text)
+    if event is not None and event.get("subtype") == "success":
+        report_path.write_text(event.get("result") or "")
+    lines = deepseek_log_lines(round_text)
+    if lines:
+        with open(log_path, "ab") as log:
+            # **无条件前置换行**，和 `interrupt_agent`、轮次分隔符逐字同一条理由：
+            # 补的行必须落在**行首**，否则 `runtime_error_lines` 的 `^ERROR:`
+            # 一条都匹配不上。这里的半行不是假想——`_tee_lines` 在 EOF 后把没收齐的
+            # 残片**原样写出、不带尾换行**（那是刻意的，残片是「被杀在半路」的
+            # 现场证据），而 `_last_result_event` 的注释写着「进程被 SIGINT 杀掉时
+            # 最后一行必然是残的」，**SIGINT 正是 stop / interrupt-and-resume 的
+            # 正常路径**。粘住之后的后果是这个工具立项要杀的那一类：一轮所有工具
+            # 调用都被拒、报告里明写「我写不进去」，判据报 success 退 0——
+            # 而补错误行正是「零工作量的成功」两道防线里的第二道。
+            # **不判断「末尾在不在行首」**：那没有可靠的现场判据（另一个进程可能
+            # 正在追加），而多一个空行的代价是零、判断错的代价是整条判据失明。
+            log.write(("\n" + "\n".join(lines) + "\n").encode())
+
+
+def agent_comm(runner):
+    """这个 runner 的进程在 `/proc/<pid>/comm` 里叫什么。
+
+    实测：`claude-deepseek` 是 `exec` 掉自己的 bash 包装，所以真实进程的 comm 是
+    **`claude`**，不是可执行文件名，也没有多一层——`Popen.pid` 就是它。
+
+    未知 runner 当场炸，**不给默认值**：静默默认会让「runner 写错了」变成
+    「去问错的那个进程名」，而那没有任何信号（和 `_require_enum` 同一条教条）。
+    """
+    if runner == CODEX:
+        return b"codex"
+    if runner == DEEPSEEK:
+        return b"claude"
+    raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+
+
 def meta_path(home, task):
     return home / "tasks" / f"{task}.json"
 
@@ -1225,13 +1572,13 @@ def _writer_identity():
     恒成立，一个还在排干的任务被**静默判死**——而 `_load_meta` 今天的设计注释
     明写「只校验键在不在」，为这两个字段开一道非对称的类型校验会把那条原则破掉。）
 
-    只有 writer 记身份，codex 那侧继续用 `find_codex_pid` 现场反查。分界线是
+    只有 writer 记身份，codex 那侧继续用 `find_agent_pid` 现场反查。分界线是
     **有没有现场特征**：codex 有（comm=codex、argv 里有报告路径），而「还有没有人
     往日志里写字」没有任何现场特征。现场事实不依赖「有人记得写下来」，而 writer
     正是这条链上唯一会死的那个进程——所以只有它必须自报。
 
     读不到自己就直接炸：`/proc` 读不到自己意味着本工具的全部存活判定
-    （`find_codex_pid` 也在内）都不成立，没有第二条路可走。
+    （`find_agent_pid` 也在内）都不成立，没有第二条路可走。
     """
     pid = str(os.getpid())
     fields = _read_stat_fields(pid)
@@ -1244,11 +1591,26 @@ def _now_iso():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
-def new_meta(task, account, workdir, effort, skills):
+def new_meta(task, runner, account, workdir, effort, skills):
     """元数据的**唯一**构造器。字段清单只在这里写一次。
 
-    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_codex_pid），
+    **`runner` 和 `account` 的合法组合由这里守。** 校验写在构造器里而不是各个
+    调用点，是因为 `REQUIRED_META_KEYS` 就是从本函数派生的——字段和它的合法值
+    共用同一个家，就不可能出现「加了字段忘了加校验」。
+    deepseek 的 `account` **必须是 `None`，不许记一个假名字**：它进 status 第二列，
+    而且 `_resume_round` 会拿它去 `ensure_isolation`——记 `"deepseek"` 会指向
+    `~/.codex-subagent-deepseek` 这个不存在的账号目录并因缺 auth 拒跑。
+
+    刻意没有 **codex 的** pid：它的存活必须每次现场反查（见 find_agent_pid），
     存下来的 PID 会过期、还会被系统复用，留着它只会诱导别人犯这个设计本来要防的错。
+
+    **deepseek 的 session id 在这里铸，不在 `cmd_run` 里。** 理由和 writer 身份
+    自取完全同一条：本函数产出的是「一份**此刻开始**的任务的完整记录」，而
+    「这一轮是哪个会话」就是这份记录的一部分。放在调用方那里等于给它开第二个家，
+    而且「**复用任务名 = 新一轮 = 新 uuid**」就从结构事实退回成一条要记住的软约定
+    ——沿用旧 uuid 会让 `run` 悄悄变成 `resume`（调用方看不出来），而实测再用一次
+    同一个 id 会直接 `Error: Session ID … is already in use.` 退 1。
+    codex 那侧仍是 `None`：`codex exec` 不收这个参数，它的 id 只能从日志里抠。
 
     **writer 的身份是另一回事，所以它有自己的名字。** 写日志的是包装器自己，
     而「它还在不在写」没有任何现场特征可查。身份是 **PID + 启动时刻**成对存
@@ -1269,11 +1631,16 @@ def new_meta(task, account, workdir, effort, skills):
     （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
     skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
+    if runner not in RUNNERS:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+    if runner == DEEPSEEK and account is not None:
+        raise ValueError(f"runner={DEEPSEEK} 没有账号概念，account 必须是 None，收到 {account!r}")
     _require_skill_paths(skills)
     writer_pid, writer_start = _writer_identity()
-    return {"task": task, "account": account, "dir": workdir, "effort": effort,
-            "skills": skills, "session_id": None, "started_at": _now_iso(),
-            "writer_pid": writer_pid, "writer_start": writer_start}
+    return {"task": task, "runner": runner, "account": account, "dir": workdir,
+            "effort": effort, "skills": skills,
+            "session_id": new_session_id() if runner == DEEPSEEK else None,
+            "started_at": _now_iso(), "writer_pid": writer_pid, "writer_start": writer_start}
 
 
 # 校验面由构造器派生，**不另写一份清单**。两份清单必然漂移，而漂移的后果是
@@ -1295,9 +1662,23 @@ def new_meta(task, account, workdir, effort, skills):
 # tasks/ 共 0 个 json（~/.codex-subagent 空，-acct2／-acct3 连 tasks/ 都没有），
 # 当前用户的 codex 进程无一属于本工具 → 本次爆炸半径为零。
 # 同上：**那是当时的事实，不是永久豁免**。
+#
+# 2026-09-23 加 `runner` 那次走的不是这条仪式，而是**一次操作，不是一段代码**：
+# 用 `write_meta` 原子替换，把 263 份现存元数据全部补上 `"runner"`，补完核对数量。
+# **代码里刻意没有任何「读不到 runner 就当 codex」的路径**：校验面是从 `new_meta`
+# 派生的，特判它等于破坏那个不变量，写缺省又撞铁律 6。
+#
+# **那次操作的隐藏前提比操作本身值钱：一次性迁移只在「没有第二份代码还在写这份
+# 元数据」时才成立。** 当时旧命令（`~/.local/bin/codex-sub-agent` → 主 checkout 的
+# 老脚本）**一直是活的**，它不认识 `runner`，每写一份新元数据就重新开一个洞——
+# 迁移之后真的又用它写出了两份缺 `runner` 的元数据，后果是整个 `status` 列表一起
+# 陪葬（见上面那段爆炸半径），所以旧命令真正死掉之后又补跑了一遍。
+# **加字段／搬目录／改命令名之前先问一句：还有没有别的东西在写这份格式。**
+# 核对的手段只有一个：`all_metas()` 的数量与 `status` 列出来的行数必须相等。
+#
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
-REQUIRED_META_KEYS = tuple(new_meta("", "", "", "", ()).keys())
+REQUIRED_META_KEYS = tuple(new_meta("", CODEX, "", "", "", ()).keys())
 
 
 def _load_meta(path):
@@ -1321,8 +1702,7 @@ def find_meta(task):
     建起来（旧的那份当场 unlink），这里是第二道。
     """
     found = []
-    for account in account_choices():
-        home = isolation_home(account)
+    for home in isolation_roots():
         p = meta_path(home, task)
         if p.exists():
             found.append((home, _load_meta(p)))
@@ -1335,8 +1715,7 @@ def find_meta(task):
 
 def all_metas():
     out = []
-    for account in account_choices():
-        home = isolation_home(account)
+    for home in isolation_roots():
         tasks_dir = home / "tasks"
         if not tasks_dir.is_dir():
             continue
@@ -1357,8 +1736,14 @@ def pid_alive(pid):
     return True
 
 
-def find_codex_pid(report_path):
+def find_agent_pid(runner, needle):
     """存活判定只有一个可靠判据：真实 PID。日志判不了，$! 给不出。
+
+    `comm` 按 runner 取（见 `agent_comm`），`needle` 是要在 argv 里**精确比对**
+    的那一个元素：codex 传报告路径（`-o` 的那一项），deepseek 传 session id
+    （`--session-id` / `--resume` 的那一项）。两侧都恰好是独立一项，
+    所以下面那条「元素相等、绝不用正则」对两侧同样成立。
+    **调用方一般不该直接调它**——用 `find_task_agent_pid`，needle 由它派生。
 
     回合用尽的 codex 留下的 log 和还在跑的长得一模一样（末尾都是正常输出、
     没有收尾标记），所以 tail 日志只能看它在干什么，判不了存活。
@@ -1380,11 +1765,13 @@ def find_codex_pid(report_path):
     顺带省掉每次 1+N 次子进程（一个 pgrep 加每个候选一个 ps）。
     """
     me = os.getuid()
-    # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点。
-    # 全模块只在这里从 Path 落到 str：别处一律传 Path（_wait_previous_round_ends
-    # 连报告路径都不收，自己从 (home, task) 派生）。同一个东西两种传法，
+    comm = agent_comm(runner)
+    # str() 一道：报告路径在本模块里一律以 pathlib.Path 传递，这里是唯一的落地点
+    # （deepseek 的 needle 本来就是 str，`str()` 对它是恒等）。
+    # 全模块只在这里从 Path 落到 str：别处一律传 Path（`find_task_agent_pid`
+    # 连 needle 都不收，自己从 (runner, home, task) 派生）。同一个东西两种传法，
     # 正是「好 API 难被误用」要消掉的那种缝。
-    needle = str(report_path).encode()
+    needle = str(needle).encode()
     for entry in pathlib.Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -1392,7 +1779,7 @@ def find_codex_pid(report_path):
             # 进程随时可能退出，每一步都可能 ENOENT——一律跳过，不让它打断扫描
             if entry.stat().st_uid != me:
                 continue
-            if (entry / "comm").read_bytes().strip() != b"codex":
+            if (entry / "comm").read_bytes().strip() != comm:
                 continue
             if needle not in (entry / "cmdline").read_bytes().split(b"\0"):
                 continue
@@ -1402,6 +1789,37 @@ def find_codex_pid(report_path):
         if pid_alive(pid):
             return pid
     return None
+
+
+def find_task_agent_pid(runner, home, task):
+    """这个任务此刻有没有活着的 agent 进程；没有返回 `None`。
+
+    **needle 一律从磁盘派生，不收调用方手里那份 meta。** 两侧的派生方式不同，
+    而这条不对称是**外部约束造成的**，不是设计选择：
+
+        codex     报告路径由 (home, task) 算得出，**元数据不在也查得到**。
+                  这条不能丢——元数据被手删、而上一轮的 codex 还占着会话时，
+                  「没元数据就放行」会让新一轮当场撞上它的写锁
+                  （`_wait_previous_round_ends` 那段注释写的就是这件事）。
+        deepseek  session id 只住在元数据里，算不出来。而 `run` 的每一轮都铸
+                  新 uuid，**拿本轮那个去找上一轮的进程恒为 None**——所以这里
+                  必须现读磁盘。传进来的 meta 在 `run_codex` 里正是「刚造好的
+                  那一份」，用它等待就变成了空操作，两个写者共写一份日志。
+                  没有元数据就老实答「查不到」，不瞎猜。
+
+    收 `(runner, home, task)` 三个而不是 `(home, meta)`：六个调用点里有五个手里
+    是 `(home, meta)`，但 `_wait_previous_round_ends` 那一个**必须**问磁盘而不是
+    问手里那份——收 meta 就给了它一个传错的写法，而传错是静默算对的。
+    """
+    if runner == CODEX:
+        return find_agent_pid(CODEX, _report_path(home, task))
+    if runner != DEEPSEEK:
+        raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
+    q = meta_path(home, task)
+    if not q.exists():
+        return None
+    session_id = _load_meta(q)["session_id"]
+    return find_agent_pid(DEEPSEEK, session_id) if session_id else None
 
 
 def _previous_writer_alive(home, task):
@@ -1475,7 +1893,7 @@ EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # 严重度不能直接拿退出码比：suspect 的码(3)比 failed(1)大，按码取 max 会让一个
 # 真失败被一个 suspect 盖过去；码值与顺序无关。
 # 退出码取值一律 EXIT[state]，不写 .get(state, 默认值)：有默认值的话 running 会
-# 悄悄落成 0，`codex-sub-agent status t && deploy` 就会在任务还在跑的时候部署。
+# 悄悄落成 0，`sub-agent-runner status t && deploy` 就会在任务还在跑的时候部署。
 # 2 永久留给参数错误与护栏拒绝（见 USAGE_ERROR），不进这张表。
 #
 # interrupted 用 **130** 而不是自编一个数：128+SIGINT(2) 是 POSIX/Bash 的既成
@@ -1530,15 +1948,21 @@ ROUND_END_TIMEOUT = 60
 ROUND_END_POLL_INTERVAL = 0.2
 
 
-def _wait_previous_round_ends(home, task, timeout, poll_interval):
-    """等到**上一轮的 writer 停了**、而且**codex 也停了**。返回是否等到。
+def _wait_previous_round_ends(runner, home, task, timeout, poll_interval):
+    """等到**上一轮的 writer 停了**、而且**上一轮的 agent 也停了**。返回是否等到。
 
     两个条件问的是两件事，缺一不可：
 
         还有人写日志吗   _previous_writer_alive   包装器，身份记在元数据里
-        会话还被占着吗   find_codex_pid           现场反查
+        会话还被占着吗   find_task_agent_pid      现场反查
 
-    只看 codex 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
+    **两个谓词都从磁盘取事实，绝不用传进来的 meta。** codex 那半是本来就没有
+    可传的东西（needle 由 (home, task) 派生）；deepseek 那半则是**承重的**——
+    `run` 的每一轮都铸新 uuid，传进来那份记的是本轮，拿它去找上一轮的进程
+    恒为 None，等待整个变成空操作，上一轮还在写、这一轮已经开跑，
+    两个写者共写一份日志。详见 `find_task_agent_pid`。
+
+    只看 agent 会在它**变僵尸那一刻**（实测 0.027s）就放行——僵尸的 cmdline 为空，
     argv 精确比对天然拒绝它——而那时日志还要再长好几秒。只看包装器会撞上
     **孤儿 codex**：SIGKILL 掉包装器之后 codex 存活并跑完（实测），续跑撞上它的写锁。
 
@@ -1550,26 +1974,28 @@ def _wait_previous_round_ends(home, task, timeout, poll_interval):
     **只等，不发任何信号。** 超时的正确处置是让调用方稍后再来，不是加大火力：
     升级到 SIGTERM 会让会话永久锁死，而那一步不可逆。
 
-    报告路径**自己从 (home, task) 派生**，不收参数：收参数就能传错（把日志路径传
-    进来的话 find_codex_pid 永远找不到，等待整个变成空操作），而这里只有一个调用点。
+    needle **自己从 (runner, home, task) 派生**，不收参数：收参数就能传错（把日志
+    路径传进来的话反查永远找不到，等待整个变成空操作），而这里只有一个调用点。
 
     **没有「元数据不在就直接放行」这条捷径。** 那条早返回既多余（`_previous_writer_alive`
-    自己第一件事就是查文件在不在），又**开洞**：它连 codex 那一半都跳过了——
+    自己第一件事就是查文件在不在），又**开洞**：它连 agent 那一半都跳过了——
     元数据被手删、而上一轮的 codex 还占着会话时当场放行，新一轮撞上它的写锁。
     两个条件一个都不能少。
+    （deepseek 那侧「元数据不在就查不到」是另一回事：那是 needle 真的算不出来，
+    不是为了省事早返回。）
     """
-    report = _report_path(home, task)
     deadline = time.monotonic() + timeout
     said = False
     while True:
-        if not _previous_writer_alive(home, task) and find_codex_pid(report) is None:
+        if (not _previous_writer_alive(home, task)
+                and find_task_agent_pid(runner, home, task) is None):
             return True
         if not said:
             # **只在真要等的时候说，而且只进屏幕不进日志。** 等待排在分隔符之前，
             # 日志里此刻还没有本轮的边界，写进去就落在上一轮里，把上一轮的判据弄脏。
             # 不说的话 run 会多出一个全新的**静默挂起**。它当场读得到，靠的是
             # main() 里那行 sys.stdout.reconfigure(line_buffering=True)。
-            print(f"[codex-sub-agent] {task} 上一轮还在收尾，最多等 {timeout} 秒…")
+            print(f"[sub-agent-runner] {task} 上一轮还在收尾，最多等 {timeout} 秒…")
             said = True
         if time.monotonic() >= deadline:
             return False
@@ -1598,9 +2024,14 @@ def run_codex(kind, home, task, meta, make_argv):
     # 校验排在 write_meta／clear_report／spawn **全部之前**：任何一件先发生，
     # 失败就会留下半个状态（元数据落了盘、上一轮报告被删掉，而 codex 没起来）。
     _require_enum(kind, _KINDS, "kind")
+    runner = meta["runner"]
     report = _report_path(home, task)
     argv = make_argv(str(report))
-    env = codex_env(home)
+    # **隔离在这里接上，别处没有第二个入口。** 漏接的后果不对称：codex 那侧
+    # 没有 CODEX_HOME 只是用错配置目录，deepseek 那侧没有 CLAUDE_CONFIG_DIR
+    # 就是**完全没有隔离**——子代理看得见整台机器上所有的 skill/MCP/hook，
+    # 本工具的核心承诺当场是空的。
+    env = codex_env(home) if runner == CODEX else deepseek_env(home)
 
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
     # 不会留下一个没人管的孤儿进程。
@@ -1619,22 +2050,24 @@ def run_codex(kind, home, task, meta, make_argv):
     # 从前只有 interrupt-and-resume 会等，而 cmd_resume 同样只看 codex——
     # 上一轮被打断、codex 已没、writer 还在排干时它当场放行，老 writer 的输出
     # 会落在新分隔符之后，judge 把上一轮的尾巴算成这一轮。同一类 bug 换个入口。
-    if not _wait_previous_round_ends(home, task, ROUND_END_TIMEOUT, ROUND_END_POLL_INTERVAL):
+    if not _wait_previous_round_ends(meta["runner"], home, task,
+                                     ROUND_END_TIMEOUT, ROUND_END_POLL_INTERVAL):
         # 超时之后**再问一次两个谓词**：两种停不下来的现场不同，而这行 stderr
         # 是调用方唯一的线索。不让等待函数回一个成因枚举——那会多出一个实体，
         # 而「谁还没停」本来就是这两个谓词各问一次的事。
         busy = []
         if _previous_writer_alive(home, task):
-            busy.append("包装器还在读 codex 的输出（codex 起的后台进程继承了同一个 "
+            busy.append("包装器还在读子代理的输出（子代理起的后台进程继承了同一个 "
                         "stdout，它不退管道就不 EOF）")
-        if find_codex_pid(report) is not None:
-            busy.append("codex 本身还在跑")
+        if find_task_agent_pid(meta["runner"], home, task) is not None:
+            busy.append(f"{meta['runner']} 本身还在跑")
         if not busy:
             busy.append("刚刚才安静下来——超时和它停下撞在了一起")
         next_step = ("稍后重跑这条命令即可——它不会再发第二发 INT（现有的闸会挡），"
                      "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
                      if kind == "interrupt-and-resume" else
-                     f"等上一轮收尾完再来；codex 也还活着的话先 `codex-sub-agent stop {task}`"
+                     f"等上一轮收尾完再来；{meta['runner']} 也还活着的话先 "
+                     f"`sub-agent-runner stop {task}`"
                      f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
                + "；".join(busy) + "。\n" + next_step)
@@ -1652,7 +2085,7 @@ def run_codex(kind, home, task, meta, make_argv):
     # 日志追加不覆盖，先写一行本轮分隔符——判据只扫它之后的内容。
     # 分隔符由本函数自己写，调用方不可能忘；忘了判据就会把上一轮的错误算到这一轮头上。
     with open(_log_path(home, task), "ab") as log:
-        # 分隔符也必须落在行首，理由同 interrupt_codex 的前置换行：上一轮的
+        # 分隔符也必须落在行首，理由同 interrupt_agent 的前置换行：上一轮的
         # 尾巴可能被 INT 截在半行，分隔符接上去就不在行首，_ROUND_LINE 认不出，
         # read_last_round 于是把两轮连成一轮，上一轮的错误算到这一轮头上。
         # 文件刚以 "ab" 打开，tell() 就是文件长度——**非空才补**，
@@ -1663,18 +2096,24 @@ def run_codex(kind, home, task, meta, make_argv):
         # 读另外四个函数才能确认这里没问题，而「读者根据别处的事实推断」正是
         # 本轮修掉的那三层 bug 的共同形状：
         #   1. cmd_run 撞见同名任务还在跑就拒绝，所以不会有两个 run 共写一份日志
-        #   2. interrupt_codex 只在 os.kill **成功之后**才写，而能被 kill 的 codex
+        #   2. interrupt_agent 只在 os.kill **成功之后**才写，而能被 kill 的 codex
         #      必然已经有过一轮分隔符 → 日志非空
         #   3. cmd_stop / cmd_interrupt_and_resume 都先 find_meta，查不到就拒绝；
         #      查得到就说明至少跑过一轮 → 日志非空
-        #   4. interrupt_codex 的写入恒以 \n 结尾，所以它留下的末尾永远在行首，
+        #   4. interrupt_agent 的写入恒以 \n 结尾，所以它留下的末尾永远在行首，
         #      不会让后来的 tell() 看到一个「非空但不在行首」的状态
         # 仓内不可达。哪天加了新的写者（比如并发的同名任务），先回来看这四条。
         if log.tell() > 0:
             log.write(b"\n")
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
+        if runner == DEEPSEEK:
+            # **读日志的人有权知道这份日志被动过。** 过滤是承重的（不滤 30 分钟
+            # 的任务约 104 MB，而判据要扫日志），但「少了东西」必须看得见。
+            # 写在 start_offset **之前**：它是关于这份日志的话，不是本轮的产物，
+            # 不该进 judge 看的那段文本。
+            log.write(DEEPSEEK_LOG_NOTE.encode())
         log.flush()
-        # 本轮的起点：分隔符之后的第一个字节。
+        # 本轮的起点：分隔符（deepseek 还有那行滤除说明）之后的第一个字节。
         # O_APPEND 下每次 write 都是「原子地跳到末尾再写」，所以即使别的进程
         # 正往同一个日志追加（留痕、另一轮的分隔符），这个位置依然精确指向
         # **我们自己刚写的那行之后**——拥有者的边界由此成为事实而非推测。
@@ -1689,7 +2128,22 @@ def run_codex(kind, home, task, meta, make_argv):
         # stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
         # "Reading additional input from stdin" + 进程 0% CPU）。
         # 不设 timeout：会误杀正当的长任务。
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+        #
+        # `cwd` **只给 deepseek 传**。`claude -p` 没有 `--cd` 等价物（实测），
+        # 不传它就在包装器的 cwd 里干活——而元数据里写的是 `--dir`，元数据当场说谎。
+        # 传 `meta["dir"]` 而不是另收一个参数：那个字段就是这个任务的工作目录，
+        # 两条 resume 路上也是它（`check_can_resume` 已经验过它还在）。
+        #
+        # **codex 那一支刻意不传**，即使「两侧都传」能少一个分支：
+        #   1. 旧代码没传，而 `_no_codex` 把 `Popen` 整个 mock 掉了——**这是一整个
+        #      测试照不到的行为面**。「codex 侧行为一字未变」这条约束保护的正是
+        #      318 条既有测试看不见的那部分，约束和一个 `if` 的简化冲突时约束赢。
+        #   2. 更实在的一条：传了 cwd 之后 `--cd` 就**不再承重**了——漏传 `--cd`
+        #      的实现照样能跑对，而那正是 `build_run_argv` 第一行注释在防的事
+        #      （「--cd 必须绝对路径：相对路径启动即崩」）。少一个分支换来一条
+        #      静默的冗余，不划算。
+        cwd = meta["dir"] if runner == DEEPSEEK else None
+        proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
 
@@ -1700,7 +2154,7 @@ def run_codex(kind, home, task, meta, make_argv):
             # 刻意不在这里退出：让 tee 循环自然跑完，判据照样出、完成通知照样带结论。
             # 来源写「外部信号转发」：在 run_in_background 下这条路根本不该
             # 走到——它出现在日志里，就是前台误跑被超时杀掉的诊断。
-            interrupt_codex(proc.pid, _log_path(home, task), "外部信号转发")
+            interrupt_agent(proc.pid, _log_path(home, task), "外部信号转发")
 
         # 转发只在 codex 活着的这段时间里生效，出去时原样还回去——改全局信号处置
         # 而不还原，等于把本函数的副作用留给了整个进程的余生。
@@ -1712,6 +2166,15 @@ def run_codex(kind, home, task, meta, make_argv):
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
+    # deepseek 的收尾：把本轮产物摆成 judge 认识的形状。
+    # **必须在回传 Round 之前**——补的 ERROR: 行要落在本轮边界之内，
+    # 否则 judge 看不见，等于没补。
+    # codex 那侧没有对应的一步：报告由 codex 自己写（`-o`），错误行本来就在它的
+    # 输出里。这条不对称是两个 agent 的输出形态造成的，不是设计选择。
+    if runner == DEEPSEEK:
+        finish_deepseek_round(read_round(_log_path(home, task), start_offset),
+                              report, _log_path(home, task))
+
     # 回传**报告路径 + 本轮日志文本**这一对，而不是偏移。
     # 偏移是可以被悄悄丢掉的：调用方忘了接，唯一还能拿到本轮文本的路就是
     # read_last_round——正好是这次要修的那个 bug。文本丢不掉，它就是 judge 的参数。
@@ -1722,6 +2185,14 @@ def run_codex(kind, home, task, meta, make_argv):
 
 
 def _tee_until_exit(proc, log, home, task, meta):
+    if meta["runner"] == DEEPSEEK:
+        # deepseek 走行模式：要按行滤掉 thinking_tokens（实测每 token 一条、
+        # 约 58 KB/s，一次审查的日志 12 MB），而分块读切不出行边界。
+        # session id 不用从输出里抠——它是我们自己铸的（见 new_meta），
+        # **绝不从输出里读回来核对**：那会把一个已知事实变成待验证的推测。
+        _tee_lines(proc, log)
+        return
+    # ↓↓↓ 以下是 codex 那一支，一个字节未改 ↓↓↓
     head, session_id = b"", None
     # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
@@ -1733,7 +2204,7 @@ def _tee_until_exit(proc, log, home, task, meta):
     # 开跑前要等的是**本进程**，不是 codex。本进程的身份就落在元数据的
     # writer_pid／writer_start 里（见 run_codex 里盖章那一行），
     # _wait_previous_round_ends 等的也正是它。
-    # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_codex_pid 就判 None
+    # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_agent_pid 就判 None
     # （僵尸的 cmdline 为空，argv 比对拒绝它），日志还要再长好几秒。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
         sys.stdout.buffer.write(chunk)
@@ -1749,19 +2220,51 @@ def _tee_until_exit(proc, log, home, task, meta):
     proc.wait()
 
 
+def _tee_lines(proc, log):
+    """行模式 tee：滤掉 `thinking_tokens`，其余一字节不改地转发到屏幕和日志。
+
+    **只有 deepseek 走这里。** codex 那一支必须是分块读——它的 banner 只有
+    ~170 字节，之后可能思考几十分钟，按行读会把 session id 卡在缓冲里，
+    包装进程此时被杀这一轮就再也 resume 不回来。
+
+    残片（`buffer` 里还没收齐的那一段）在 EOF 后**原样写出**：进程被 SIGINT
+    杀掉时最后一行必然是残的（实测），那一片是「这一轮被杀在半路」的现场证据。
+    """
+    buffer = b""
+    for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+        buffer += chunk
+        lines, buffer = split_complete_lines(buffer)
+        for line in lines:
+            if keep_deepseek_line(line):
+                _write_both(log, line + b"\n")
+    if buffer:
+        _write_both(log, buffer)
+    proc.wait()
+
+
+def _write_both(log, data):
+    """同时写屏幕和日志，各自 flush。两个写者共用一条 fd 的规矩见 `main()`。"""
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    log.write(data)
+    log.flush()
+
+
 # status 数据行的列序是**机器切分的契约**：前四列无空白，所以
 # `line.split(maxsplit=4)` 精确切出它们，第五段是「工作目录 + reason」。
 # **7 个 Verdict 构造点里有 4 个的 reason 含空格**（「本轮被 INT 打断，上下文
 # 保留——接着 resume 即可，不用重跑」、「报告在，但本轮日志有 N 条未分类的
-# codex 错误」、「会话被写锁占住（……曾被 SIGTERM 杀过），只能新起一个任务」、
+# 子代理错误」、「会话被写锁占住（……曾被 SIGTERM 杀过），只能新起一个任务」、
 # 「pid=N 存活」），所以 reason 必须排在最后——这就是这次换列序的全部理由。
 # dir 与 reason 因此不可分，可以接受：dir 早就在 tasks/<task>.json 里，
 # 调用方真正要的是 state 和退出码。
 #
 # **刻意不换格式。** 初稿的制表符方案被实测否掉：按 tabstop=8 量四行真实输出
 # 的各列屏幕起始列，[0,16,24,32,40,80] / [0,16,24,32,40,88] / [0,8,16,24,32,40]
-# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的 [0,25,34,43]
-# （那是**换列序之前**的四列格式量出来的；定宽的稳定性与列数无关，结论照样成立）。
+# / [0,32,40,56,64,80]——四行没有一列对齐；而空格定宽是稳定的：
+# 本格式实测 [0,25,42,51]（第五段 dir 在 56），与内容无关恒定。
+# （那次量的是**换列序之前**的四列格式 [0,25,34,43]；定宽的稳定性与列数无关，
+# 所以第二列从 8 宽的账号换成 16 宽的 `runner[:account]` 之后结论照样成立。）
 #
 # 退出码单独成列：它和 state 是同一份事实的两种编码，但**同源派生**（都来自
 # EXIT[state]），不存在漂移风险。人读词，机器读码。
@@ -1799,25 +2302,65 @@ def status_row(meta, verdict):
     # 先过枚举：退出码那一列是 EXIT[state]，裸下标对写错的状态只给一个 KeyError，
     # 调用方看不出是什么坏了。和 kind／cause 同一条做法。
     _require_enum(verdict.state, tuple(EXIT), "state")
-    task, account, workdir = meta["task"], meta["account"], meta["dir"]
-    for label, field in (("任务名", task), ("账号", account)):
+    task, workdir = meta["task"], meta["dir"]
+    # 第二列是「派给谁跑」：codex 要连账号一起说（`codex:acct2`），deepseek 没有
+    # 账号维度，就只有 runner 名。**复用这一列而不是加第五列**：前四列无空白 +
+    # `split(maxsplit=4)` 是机器切分的契约，加一列会把每个解析它的调用方打断。
+    # 顺带消掉一个真 bug：deepseek 的 account 是 `None`，原来那句 `f"{account:<8}"`
+    # 会当场 TypeError——status 一个任务都列不出来。
+    who = meta["runner"] if meta["account"] is None else f"{meta['runner']}:{meta['account']}"
+    for label, field in (("任务名", task), ("runner 与账号", who)):
         if _WHITESPACE.search(field):
             reject(f"{label} {field!r} 含空白字符——status 的前四列就切不开了，"
                    f"调用方再也取不出 state。")
     for label, field in (("工作目录", workdir), ("reason", verdict.reason)):
         if _CONTROL_CHARS.search(field):
             reject(f"{label} {field!r} 含控制字符——「一行一任务」就不成立了。")
-    return (f"{task:<24} {account:<8} {verdict.state:<8} {EXIT[verdict.state]:<4} "
+    return (f"{task:<24} {who:<16} {verdict.state:<8} {EXIT[verdict.state]:<4} "
             f"{workdir}  {verdict.reason}")
 
 
 def _print_verdict(task, verdict):
-    print(f"\n[codex-sub-agent] {task}: {verdict.state} —— {verdict.reason}")
+    print(f"\n[sub-agent-runner] {task}: {verdict.state} —— {verdict.reason}")
     for line in verdict.detail:
         print(f"  {line}")
 
 
+def _reject_bad_runner_combo(args):
+    """`--runner` 与 `--account`／`--effort` 的三条硬拒绝。**必须排在 `cmd_run`
+    任何状态变更之前**，所以它被抽成一个函数、由 `cmd_run` 第一行调用。
+
+    argparse 表达不了「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范
+    第 5 条要消灭的东西——所以这三条必须是代码。
+
+    **一律退 2 并说清为什么，不静默改正。** `claude-deepseek` 自己就是这么干的
+    （它的注释：「静默跑错模型变成大声退 2」，理由是 DeepSeek 的 API 对不存在的
+    模型名静默返回 200——静默纠正会让调用方以为自己传的那个生效了）。
+
+    「排在任何状态变更之前」这条的检验方式**不是**「排在那段删旧元数据的迁移分支
+    之前」——那半句不可达：迁移分支的门是 `--account auto`，而这三条与 auto 互斥
+    （deepseek 给任何 account 都拒，codex 不给 account 也拒）。真正可检验的
+    判据是**盘上什么都没多出来**：`ensure_isolation` 是第一个落盘的动作。
+    """
+    if args.runner == DEEPSEEK:
+        if args.account is not None:
+            reject(f"--runner {DEEPSEEK} 没有账号概念（一个 DeepSeek token），"
+                   f"不要传 --account（收到 {args.account!r}）。\n"
+                   f"账号只属于 codex：它的登录态是每账号一份 auth.json，"
+                   f"而 DeepSeek 的 token 走环境变量。")
+        if args.effort != DEEPSEEK_EFFORT:
+            reject(f"--runner {DEEPSEEK} 只接受 --effort {DEEPSEEK_EFFORT}"
+                   f"（收到 {args.effort!r}）。\n"
+                   f"不替你改成 {DEEPSEEK_EFFORT}：静默改正会让你以为自己传的那档生效了。")
+    elif args.account is None:
+        reject(f"--runner {CODEX} 必须给 --account（{'／'.join(account_choices())}／{AUTO}）。\n"
+               f"没有隐式选中的账号——选错账号要花钱才发现。")
+
+
 def cmd_run(args):
+    # **第一行就拒。** 排在 find_meta / ensure_isolation / new_meta 全部之前，
+    # 所以被拒的调用在盘上一个字节都不留。
+    _reject_bad_runner_combo(args)
     workdir = pathlib.Path(args.dir).expanduser().resolve()
     # 入口那道（work_dir）守的是**命令行上那个原始串**，而落进元数据、随后进
     # status 数据行的是 resolve() 之后的真身——软链一跨就绕过去了。实测：
@@ -1837,6 +2380,15 @@ def cmd_run(args):
 
     old_home, old_meta = find_meta(args.task)
 
+    # **跨 runner 同名任务当场拒。** 跨账号还有 `--account auto` 那条迁移路，
+    # 跨 runner 一条都没有（auto 只在 codex 的账号之间搬），而放任不管的后果是
+    # 同一个名字出现在两个隔离目录里——`find_meta` 此后一律拒绝，
+    # `status`／`resume`／`stop` 对这个任务全退 2，两份元数据谁也够不着。
+    # 排在这里：`find_meta` 是纯读，还没有任何状态变更。
+    if old_meta is not None and old_meta["runner"] != args.runner:
+        reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
+               f"跨 runner 没有迁移路径（会话、报告、日志都在那边），换个任务名。")
+
     if args.account == AUTO:
         candidates = accounts_by_availability()
         if not candidates:
@@ -1850,7 +2402,8 @@ def cmd_run(args):
         # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
         # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
         # 挑中别的账号时在下面**显式**把旧的那份搬过来。
-        if old_meta is not None and old_home != isolation_home(account):
+        # deepseek 走不到这一支的拒绝：它只有一个家，`old_home` 相等，条件不成立。
+        if old_meta is not None and old_home != isolation_home(args.runner, account):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
@@ -1864,7 +2417,7 @@ def cmd_run(args):
     # 整个消失。run_codex 的注释写着「这一等排在 write_meta 之前，所以超时不留
     # 半个状态」，而迁移是从**外面**把那条不变量破掉的。
     #
-    # **为什么查 `find_codex_pid` 就够**（不必把整个 `_wait_previous_round_ends`
+    # **为什么查 `find_agent_pid` 就够**（不必把整个 `_wait_previous_round_ends`
     # 搬出来重跑一遍）：能走到迁移，说明 `find_meta` 只数出一份元数据（两份它当场
     # 拒），于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
     # `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的就只剩
@@ -1873,16 +2426,22 @@ def cmd_run(args):
     #
     # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
     # writer 和 codex 排干了没有」，每轮都必须做。
-    home = isolation_home(account)
+    #
+    # **deepseek 的 needle 只住在元数据里**，所以它靠的是「元数据在不在」，
+    # 而不是像 codex 那样由 (home, task) 算得出——元数据不在时它老实答 None。
+    # 这一格对它仍然是有效的：上面那条跨 runner 拒绝保证了，能走到这里的 deepseek
+    # 任务 `old_home` 要么是 None（那就真没有上一轮）、要么就是这个家（那就带着
+    # 元数据，`find_task_agent_pid` 从磁盘读得到上一轮的 uuid）。
+    home = isolation_home(args.runner, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
-        if find_codex_pid(_report_path(candidate_home, args.task)) is not None:
+        if find_task_agent_pid(args.runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
-                   f"换个名字或先 `codex-sub-agent stop {args.task}`")
+                   f"换个名字或先 `sub-agent-runner stop {args.task}`")
 
-    home = ensure_isolation(account)
+    home = ensure_isolation(args.runner, account)
     if old_meta is not None:
         if old_home == home:
-            print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，"
+            print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
                   f"上一轮的报告会被删掉、日志会被追加")
         else:
             # 只有 auto 走得到这里（强制模式上面那道护栏已经拒了）。
@@ -1891,7 +2450,7 @@ def cmd_run(args):
             # （新 home 的），旧 home 的 reports/ 和 logs/ 一个字节都没碰。
             # 搬的只有元数据——不搬的话同一个名字出现在两个隔离目录里，
             # find_meta 当场数出两份，status/stop 从此全退 2。
-            print(f"[codex-sub-agent] 任务 {args.task} 原本在账号 {old_meta['account']}，"
+            print(f"[sub-agent-runner] 任务 {args.task} 原本在账号 {old_meta['account']}，"
                   f"本次改用 {account}：元数据搬过来，"
                   f"旧账号的报告和日志留在 {old_home} 原处不动。")
             meta_path(old_home, args.task).unlink(missing_ok=True)
@@ -1901,9 +2460,14 @@ def cmd_run(args):
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
     # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
     # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    this_round = run_codex("run", home, args.task,
-                           new_meta(args.task, account, str(workdir), args.effort, args.skills),
-                           lambda r: build_run_argv(str(workdir), args.effort, r, brief))
+    # meta 先落成局部变量：deepseek 的 argv 要用它铸好的 session id，
+    # **argv 里那个和元数据里那个必须是同一个**——两处各算各的话，PID 反查按
+    # 元数据里那个去找，而真跑的是 argv 里那个，于是 status 说不在跑、stop 不发信号。
+    meta = new_meta(args.task, args.runner, account, str(workdir), args.effort, args.skills)
+    make_argv = (
+        (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if args.runner == CODEX
+        else (lambda r: build_deepseek_argv(args.effort, meta["session_id"], brief)))
+    this_round = run_codex("run", home, args.task, meta, make_argv)
     verdict = judge(this_round)
 
     # **撞上限只记一笔，不重跑。** v1~v3 在这里换账号重跑，安全论证是「撞上限的
@@ -1932,7 +2496,10 @@ def cmd_run(args):
     # 一旦看的不是同一批，就是 2026-09-22 那个 bug 的形状——污染行排在真错误前面时，
     # 对整轮文本 search() 取到的是污染那一条，于是一个健康账号被记上 2099 年的
     # 恢复时间，从此永远排最后。
-    if verdict.state == "failed" and hit_usage_limit(verdict.detail):
+    # **只对 codex。** 账号、限流记录、auto 排序全是 codex 的概念；deepseek 走进来
+    # 会往 `~/.claude-subagent` 写一条谁也不读的限流记录（`accounts_by_availability`
+    # 只扫 codex 的家），还会印一句「下次 auto 会先试 X」——而 deepseek 根本没有 auto。
+    if args.runner == CODEX and verdict.state == "failed" and hit_usage_limit(verdict.detail):
         # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
         # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
         reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
@@ -1956,7 +2523,7 @@ def cmd_run(args):
         whats_next = (f"下次 --account {AUTO} 会先试 {next_account}"
                       if next_account != account else
                       f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它")
-        print(f"[codex-sub-agent] {account} 撞上额度上限，{record_note}。{whats_next}。")
+        print(f"[sub-agent-runner] {account} 撞上额度上限，{record_note}。{whats_next}。")
 
     _print_verdict(args.task, verdict)
     print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
@@ -1977,7 +2544,7 @@ def cmd_status(args):
     worst = "success"
     for home, meta in rows:
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
-        pid = find_codex_pid(report)
+        pid = find_task_agent_pid(meta["runner"], home, meta["task"])
         # 还在跑就**不读日志**：判据在这一支根本用不到它，而 status 是轮询用的
         # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
         # 列全部任务还要乘任务数。
@@ -1998,9 +2565,14 @@ def check_can_resume(task, meta, brief_path):
 
     抽成独立函数，是因为 `interrupt-and-resume` 必须把**全部**拒绝跑在发信号
     之前：INT 发出去就收不回来，先打断、再发现没 session id，那一轮白毁**且拿
-    不回来**（没 session id 就没法 resume）。这个窗口真实可达——session_id 要等
-    codex 第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起
-    那几秒正是最可能被打断的时候（刚发现 brief 写错）。
+    不回来**（没 session id 就没法 resume）。
+
+    **「没 session id」这个窗口只在 codex 那侧真实可达**：它的 id 要等 codex
+    第一块输出才被正则抠出来写进元数据，实测父进程 4.06 秒才看到 banner，
+    而任务刚起那几秒正是最可能被打断的时候（刚发现 brief 写错）。
+    deepseek 那侧的 id 是 `new_meta` 那一刻就铸好落盘的，所以这道闸对它
+    **结构上不可达**——但它留着：一份被手改坏的元数据照样该被挡下，
+    而闸的代价是一次字典取值。
 
     `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
@@ -2026,7 +2598,8 @@ def check_can_resume(task, meta, brief_path):
     workdir = pathlib.Path(meta["dir"])
     if not workdir.is_dir():
         reject(f"任务 {task} 的工作目录 {workdir} 不在了（worktree 被删？）。"
-               f"codex 会以 os error 2 当场崩，所以这里直接拒。")
+               f"codex 会以 os error 2 当场崩，deepseek 的 Popen(cwd=) 也直接失败，"
+               f"所以这里直接拒。")
     brief_file = pathlib.Path(brief_path).expanduser()
     if not brief_file.is_file():
         reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
@@ -2053,16 +2626,21 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
     `skills` 是本轮的白名单，和 effort 一样每轮重给——白名单是每一轮的事。
     """
     check_can_resume(task, meta, brief_path)
-    ensure_isolation(meta["account"])
+    ensure_isolation(meta["runner"], meta["account"])
     brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
     # 元数据描述的是**最后一次调用**：effort、白名单、开跑时间一起刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
     meta["skills"] = skills
     meta["started_at"] = _now_iso()
-    verdict = judge(run_codex(kind, home, task, meta,
-                              lambda r: build_resume_argv(meta["dir"], meta["session_id"],
-                                                          effort, r, brief)))
+    # **session_id 不刷新**：续跑接的就是那一个会话。deepseek 侧再传一次
+    # `--session-id` 会另起一个会话（实测：同一个 id 第二次用报
+    # `Error: Session ID … is already in use.` 退 1），所以续跑走 `--resume`。
+    make_argv = (
+        (lambda r: build_resume_argv(meta["dir"], meta["session_id"], effort, r, brief))
+        if meta["runner"] == CODEX
+        else (lambda r: build_deepseek_resume_argv(effort, meta["session_id"], brief)))
+    verdict = judge(run_codex(kind, home, task, meta, make_argv))
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 
@@ -2084,9 +2662,9 @@ def cmd_resume(args):
     # 相反，是**刻意的**：「拒绝必须在动手之前」约束的是**副作用**，而这条路一个
     # 副作用都没有，闸序只决定人先看到哪句话——「还在跑」是这里最可操作的那句。
     # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
-    if find_codex_pid(_report_path(home, args.task)) is not None:
+    if find_task_agent_pid(meta["runner"], home, args.task) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
-               f"等它结束，或用 `codex-sub-agent interrupt-and-resume {args.task}`。")
+               f"等它结束，或用 `sub-agent-runner interrupt-and-resume {args.task}`。")
     return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
                          args.skills)
 
@@ -2128,12 +2706,12 @@ def cmd_interrupt_and_resume(args):
     # 的那一轮会在收尾时写元数据），但无损：差异字段只有 session_id（为空早被
     # 上面的闸拒了）、effort／started_at（本来就要刷新），以及 writer_pid／
     # writer_start——后两个由 run_codex 临落盘前现盖，这里拿的是哪一份都不影响。
-    report, log = _report_path(home, args.task), _log_path(home, args.task)
-    pid = find_codex_pid(report)
+    log = _log_path(home, args.task)
+    pid = find_task_agent_pid(meta["runner"], home, args.task)
     if pid is None:
         # 两种入场都要吃：调用方无法可靠知道自己在哪一种——查完到动手之间，
         # 任务可能刚好跑完。所以两条都走通，并如实说走了哪条。
-        print(f"[codex-sub-agent] {args.task} 本来就没在跑，直接续跑")
+        print(f"[sub-agent-runner] {args.task} 本来就没在跑，直接续跑")
     else:
         # 超时的处置是「稍后重试」，而重试就是再跑一遍这条命令——不加这道判断，
         # 重试就会发出**第二发 INT**。很多 CLI 把第二发 Ctrl-C 当强退，codex
@@ -2142,11 +2720,11 @@ def cmd_interrupt_and_resume(args):
         # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
         # 恰好就是最后一轮的事。
         if has_interrupt_mark(read_last_round(log)):
-            print(f"[codex-sub-agent] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
+            print(f"[sub-agent-runner] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
-            interrupt_codex(pid, log, "interrupt-and-resume")
-            print(f"[codex-sub-agent] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
+            interrupt_agent(pid, log, "interrupt-and-resume")
+            print(f"[sub-agent-runner] {args.task} 还在跑（pid={pid}），已发 SIGINT 并在日志留痕")
     # **本命令的退出码＝续跑那一轮的判据结论**（0/1/3/130），不是「打断成功没」。
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
@@ -2158,14 +2736,14 @@ def cmd_stop(args):
     home, meta = find_meta(args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
-    pid = find_codex_pid(_report_path(home, args.task))
+    pid = find_task_agent_pid(meta["runner"], home, args.task)
     if pid is None:
         print(f"任务 {args.task} 已经不在跑了")
         return EXIT["success"]
-    # 发 INT 与留痕焊在 interrupt_codex 里，这条路不可能只做一半。
+    # 发 INT 与留痕焊在 interrupt_agent 里，这条路不可能只做一半。
     # 上面 `pid is None` 那一支正是「调用之前判它在不在跑」的地方，
-    # 所以 interrupt_codex 不需要回一个 bool 让这里再判一遍。
-    interrupt_codex(pid, _log_path(home, args.task), "stop")
+    # 所以 interrupt_agent 不需要回一个 bool 让这里再判一遍。
+    interrupt_agent(pid, _log_path(home, args.task), "stop")
     print(f"已向 {args.task} (pid={pid}) 发 SIGINT，上下文保留，可 resume")
     return EXIT["success"]
 
@@ -2214,7 +2792,7 @@ def _add_prompt_round_args(sub):
     # 序列化不受影响：json.dumps(()) 就是 []，元数据的形状一个字没变。
     g = sub.add_mutually_exclusive_group(required=True)
     g.add_argument("--skill", action=_AppendSkillPath, dest="skills", type=skill_path,
-                   metavar="SKILL_MD", help="允许 codex 读的 SKILL.md 绝对路径，可重复")
+                   metavar="SKILL_MD", help="允许子代理读的 SKILL.md 绝对路径，可重复")
     g.add_argument("--no-skill", action="store_const", const=(), dest="skills",
                    help="本轮一个 skill 都不给")
 
@@ -2229,8 +2807,9 @@ def build_parser():
     另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
     """
     p = argparse.ArgumentParser(
-        prog="codex-sub-agent",
-        description="把执行类任务派给 codex 后台跑。用 Bash(run_in_background: true) 启动 run。")
+        prog="sub-agent-runner",
+        description="把执行类任务派给 codex 或 DeepSeek 子代理后台跑。"
+                    "用 Bash(run_in_background: true) 启动 run。")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     # 五个带值参数全必填，外加 --skill/--no-skill 二选一：不设默认值，因为隐式
@@ -2238,12 +2817,21 @@ def build_parser():
     r = sub.add_parser("run", help="起一个新任务")
     r.add_argument("--task", required=True, type=task_name,
                    help="任务名，全局唯一（PID 反查和产物命名都靠它）")
-    r.add_argument("--dir", required=True, type=work_dir, help="codex 的工作目录，自动转绝对路径")
+    r.add_argument("--dir", required=True, type=work_dir,
+                   help="子代理的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
     r.add_argument("--effort", required=True, choices=EFFORTS, help="难度分档")
-    # `--account` **仍然必填**：没有任何隐式选中的值。取值只是多了一个 AUTO。
-    r.add_argument("--account", required=True, choices=account_choices() + [AUTO],
-                   help=f"codex 账号；{AUTO} = 按记录的恢复时间自动挑一个")
+    # `--runner` **必填，没有缺省**：这不是「换个模型」，而是换隔离机制、换工作
+    # 目录的传法、换报告怎么拿、换有没有账号——给缺省值就是替调用方选了这一整套。
+    r.add_argument("--runner", required=True, choices=list(RUNNERS),
+                   help=f"派给哪个 agent 跑；{DEEPSEEK} 的 --effort 只能是 {DEEPSEEK_EFFORT}"
+                        f"、且不收 --account")
+    # `--account` 从必填改成可选，**不是放松**：它现在由 `_reject_bad_runner_combo`
+    # 守着——codex 不给就拒、deepseek 给了也拒。argparse 表达不了
+    # 「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范第 5 条要消灭的东西。
+    r.add_argument("--account", choices=account_choices() + [AUTO],
+                   help=f"codex 账号（{CODEX} 必填，{DEEPSEEK} 不收）；"
+                        f"{AUTO} = 按记录的恢复时间自动挑一个")
     # help 只说「这个参数选什么」。**撞上限之后会怎样，一个字都不在这里说**——
     # 轮内重试删掉那一版，SKILL.md 和 README 都改对了，只有这句 help 还写着
     # 「撞上额度上限就换下一个」，而它恰恰是子代理唯一会读的那份说明。
@@ -2295,7 +2883,7 @@ def main():
     能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
     包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
     仍可 resume，日志里还留下一行带来源的打断标记（`[外部信号转发]`，见
-    interrupt_codex）告诉下一个人该 resume 而不是重跑。于是误用的代价从
+    interrupt_agent）告诉下一个人该 resume 而不是重跑。于是误用的代价从
     「会话永久锁死、上下文全丢」降到「这一轮没拿到完成通知」——可恢复。
 
     **这条路上别指望退出码。** 链路是「harness 超时 → TERM 打进程组 → codex
