@@ -1793,11 +1793,6 @@ def cmd_run(args):
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
     old_home, old_meta = find_meta(args.task)
-    if old_meta is not None and find_codex_pid(_report_path(old_home, args.task)) is not None:
-        # 「还在跑」只查一次，**在挑账号之前**：它问的是「这个任务名此刻有没有
-        # 活着的 codex」，和最后跑哪个账号无关。**这不替代 run_codex 内部每次
-        # spawn 前的等待**——那一条问的是「上一轮的 writer 和 codex 排干了没有」。
-        reject(f"任务名 {args.task} 还在跑，换个名字或先 `codex-sub-agent stop {args.task}`")
 
     if args.account == AUTO:
         candidates = accounts_by_availability()
@@ -1816,6 +1811,30 @@ def cmd_run(args):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
+
+    # 「这个任务名此刻有没有活着的 codex」——查一次，**在动任何状态之前**，
+    # 而且**旧的家和选中的家都要查**。
+    #
+    # 只查旧家是不够的：迁移那一支会先把旧元数据 unlink 掉再进 run_codex，而
+    # run_codex 里的 `_wait_previous_round_ends` 等满 60 秒之后会 `reject`——
+    # 那一刻旧的已经删了、新的还没写，任务从 status / stop / resume 三条路上
+    # 整个消失。run_codex 的注释写着「这一等排在 write_meta 之前，所以超时不留
+    # 半个状态」，而迁移是从**外面**把那条不变量破掉的。
+    #
+    # **为什么查 `find_codex_pid` 就够**（不必把整个 `_wait_previous_round_ends`
+    # 搬出来重跑一遍）：能走到迁移，说明 `find_meta` 只数出一份元数据（两份它当场
+    # 拒），于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
+    # `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的就只剩
+    # codex 这一条。把等待搬出来还会引入第二个调用点，而它之所以住在 run_codex
+    # 里，正是为了让调用方不必记得任何事。
+    #
+    # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
+    # writer 和 codex 排干了没有」，每轮都必须做。
+    home = isolation_home(account)
+    for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
+        if find_codex_pid(_report_path(candidate_home, args.task)) is not None:
+            reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
+                   f"换个名字或先 `codex-sub-agent stop {args.task}`")
 
     home = ensure_isolation(account)
     if old_meta is not None:

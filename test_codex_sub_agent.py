@@ -3289,6 +3289,38 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertRegex("\n".join(迁移行), r"留在|原处|不动",
                          "要说清旧账号的产物留在原处，否则调用方以为它们没了")
 
+    def test_选中的账号上还有活着的codex_要在删旧元数据之前就拒(self):
+        """**I6 回归锁：迁移的 unlink 不许排在一个可能失败的步骤前面。**
+
+        `run_codex` 的注释写着「这一等排在 write_meta / clear_report 之前，
+        所以超时**不留半个状态**……别把它挪到后面去」。迁移路径从**外面**破了它：
+        旧元数据已经删掉、新的还没写，而 `_wait_previous_round_ends` 等满 60 秒
+        之后 `reject` ——任务从 status / stop / resume 三条路上整个消失。
+
+        入口那道闸原本只查 `old_home`，查不到选中的那个 home 上的 codex。
+        为什么查 `find_codex_pid` 就够（而不必把整个 `_wait_previous_round_ends`
+        搬出来）：能走到迁移，说明 `find_meta` 只数出**一份**元数据（两份它当场拒），
+        于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
+        `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
+        就只剩 `find_codex_pid` 这一条。
+        """
+        ca.write_meta(ca.ensure_isolation("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "low", ()))
+        选中的报告 = ca._report_path(ca.ensure_isolation("acct2"), "t")
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2",
+                         "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
+
+        def 只有acct2上有活的(report_path):
+            return 4242 if report_path == 选中的报告 else None
+
+        with mock.patch.object(ca, "find_codex_pid", 只有acct2上有活的):
+            with self.assertRaises(ca.Rejected) as got:
+                ca.cmd_run(self._args(ca.AUTO))
+        self.assertIn("还在跑", got.exception.message)
+        self.assertTrue(ca.meta_path(ca.isolation_home("acct3"), "t").exists(),
+                        "拒绝发生在删旧元数据之后——任务在半路上消失了")
+        self.assertEqual(len(ca.all_metas()), 1, "元数据既不许没有，也不许有两份")
+
     def test_任务住的那个账号掉了登录态_也能迁移走(self):
         """**这条是 v2 的一个反例，上一轮实测到的，留着当回归锁。**
 
