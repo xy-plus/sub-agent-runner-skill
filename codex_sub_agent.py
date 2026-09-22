@@ -450,6 +450,61 @@ def hit_usage_limit(error_lines):
     return any(USAGE_LIMIT_MARK in line for line in error_lines)
 
 
+# 分组全部具名，不用位置号：`raw` 这一组划定的就是**落盘时那个审计串**
+# （只含日期时间，不含 "try again at " 这个引子），而位置号会随着日后加一个
+# 括号整体漂移，漂了之后 raw 里悄悄多出半句英文，谁也不会发现。
+_RESET_AT = re.compile(
+    r"try again at\s+"
+    r"(?P<raw>"
+    r"(?P<month>[A-Z][a-z]{2})\s+"              # Sep
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th),\s+"      # 25th,
+    r"(?P<year>\d{4})\s+"                       # 2026
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*"   # 5:04
+    r"(?P<half>[AP]M)"                          # PM
+    r")")
+_MONTHS = {name: number for number, name in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+
+
+def parse_reset_time(text):
+    """从撞上限的那段话里抠出恢复时间，抠不到就 `None`。
+
+    返回 `(时间, 原始串)`——两样必须来自**同一次匹配**：原始串是落盘时的审计线索
+    （解析错了一眼看得出），拆成两个函数就可能各匹配各的、对不上。
+
+    **返回朴素本地时间，不编造时区。** 消息里没有时区，实测也推不出来（恢复时间在
+    3~4 天后，拿文件 mtime 反推不出来）。这样做安全，是因为这个值**只当排序键**
+    （见 `accounts_by_availability`）：误差 ±12h 只在两个账号的恢复时间相差 12h
+    以内时才改变顺序，代价是多一次 codex 启动。
+
+    抠不到宁可返回 `None`——调用方会退化成「无记录＝排最前＝照样会被试到」，
+    比写一个假时间进去安全得多。
+
+    **额度消息有第二种形态，它就是抠不到的那一类。** 2026-09-22 全量核对现网
+    268 份日志：27 份带真·额度错误，其中 16 份写 `try again at Sep 25th,
+    2026 5:04 PM.`（带日期），另外 11 份写 `try again at 11:10 AM.`
+    ——**只有时刻，没有日期**。后者刻意不解析：补出日期就得读当前时钟再猜
+    「是今天还是明天」，而本功能一处都不读时钟（`accounts_by_availability`
+    不做过期清理，理由同源）。它退化成 `None`，那个账号照样会被试到，
+    而「它撞没撞上限」由 `hit_usage_limit` 独立判定，不受这里影响。
+    """
+    m = _RESET_AT.search(text)
+    if m is None:
+        return None
+    month = _MONTHS.get(m.group("month"))   # [A-Z][a-z]{2} 会匹配 "Foo"，必须再查表
+    if month is None:
+        return None
+    # 12 AM = 0 点、12 PM = 12 点。直接 +12 会把这两个都算错。
+    hour = int(m.group("hour")) % 12 + (12 if m.group("half") == "PM" else 0)
+    try:
+        return (datetime.datetime(int(m.group("year")), month, int(m.group("day")),
+                                  hour, int(m.group("minute"))),
+                m.group("raw"))
+    except ValueError:                  # Feb 31st 这种
+        return None
+
+
 def extract_session_id(log_text):
     m = _SESSION_ID.search(strip_ansi(log_text))
     return m.group(1) if m else None

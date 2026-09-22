@@ -93,6 +93,7 @@ interrupt-and-resume、退出码怎么读），正好把这次重写的目的做
 """
 import argparse
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -121,6 +122,13 @@ ERR_USER_LAYER_CURLY = ERR_USER_LAYER.replace("You've", "You’ve")
 # 这一行是 2026-09-22 从 /home/xy/.codex-subagent-acct3/logs/audit-should-exist-2.log 逐字节拷出来的，
 # 没有经过任何转写。判据要是再一次押在某个会变的字符上，这条第一个红。
 ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Sep 25th, 2026 5:04 PM.'
+# **第二种真实形态：只有时刻，没有日期。** 2026-09-22 全量核对现网日志时发现的，
+# spec 和计划都没写到它：27 份带额度错误的日志里，11 份是这个形状（共 22 行）。
+# 它解析不出日期，`parse_reset_time` 返回 None——**这是对的，不是缺陷**：
+# 补日期就得读当前时钟再猜「是今天还是明天」，而本功能刻意一处都不读时钟。
+# None 的含义是「无记录＝排最前＝照样会被试到」，落在安全的那一边。
+# 逐字节拷自 /home/xy/.codex-subagent-acct3/logs/bn5m-engine-5min.log。
+ERR_USER_LAYER_REAL_NO_DATE = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:02 AM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
 ERR_TRACING = ("\x1b[2m2026-09-18T16:49:02.380969Z\x1b[0m \x1b[31mERROR\x1b[0m "
                "\x1b[2mcodex_models_manager::manager\x1b[0m\x1b[2m:\x1b[0m "
@@ -934,6 +942,68 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])
+
+
+class TestParseResetTime(unittest.TestCase):
+    """真实消息长这样（2026-09-22 从现网日志取，全量 54 行同一个形状）：
+
+        ERROR: You’ve hit your usage limit. Upgrade to Pro (…), visit
+        https://chatgpt.com/codex/settings/usage to purchase more credits
+        or try again at Sep 25th, 2026 5:04 PM.
+    """
+
+    def test_解析真实消息(self):
+        got = ca.parse_reset_time("or try again at Sep 25th, 2026 5:04 PM.")
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 25, 17, 4))
+        self.assertEqual(got[1], "Sep 25th, 2026 5:04 PM")
+
+    def test_从整行真实日志字节里也解析得出(self):
+        # 未经我手的那一份（见 ERR_USER_LAYER_REAL）。fixture 自己敲的那些
+        # 只能证明正则和我的假设自洽，证明不了它对得上现实。
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL)[0],
+                         datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_第二种真实形态_只有时刻没有日期_返回None而不是猜一个(self):
+        """现网 27 份带额度错误的日志里，11 份是这个形状（`try again at 11:10 AM.`）。
+        spec 和计划都只写了带日期的那一种。
+
+        **返回 None 是结论，不是妥协。** 要从「11:10 AM」算出一个 datetime，
+        就得读当前时钟再猜是今天还是明天——而本功能刻意一处都不读时钟
+        （见 `accounts_by_availability` 为什么不做过期清理）。None 会让这个账号
+        退化成「无记录＝排最前＝照样会被试到」，落在安全的那一边；
+        它撞没撞上限仍然由 `hit_usage_limit` 独立判定，不受这里影响。
+        """
+        self.assertIsNone(ca.parse_reset_time(ERR_USER_LAYER_REAL_NO_DATE))
+        self.assertTrue(ca.hit_usage_limit([ERR_USER_LAYER_REAL_NO_DATE]),
+                        "前提不成立：这条样本本来就该被判成撞上限，"
+                        "否则这条测的不是「解析不出时间」而是「根本没撞上」")
+
+    def test_四种序数后缀都要认(self):
+        for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (4, "th")):
+            with self.subTest(日=day):
+                self.assertEqual(
+                    ca.parse_reset_time(f"try again at Sep {day}{suffix}, 2026 5:04 PM")[0].day,
+                    day)
+
+    def test_中午和午夜(self):
+        # 12 AM = 0 点、12 PM = 12 点。直接 +12 会把两者都算错。
+        self.assertEqual(ca.parse_reset_time("try again at Sep 1st, 2026 12:30 AM")[0].hour, 0)
+        self.assertEqual(ca.parse_reset_time("try again at Sep 1st, 2026 12:30 PM")[0].hour, 12)
+
+    def test_没这句话就返回None(self):
+        self.assertIsNone(ca.parse_reset_time("ERROR: something else entirely"))
+
+    def test_月份名乱写返回None不崩(self):
+        # 正则的 [A-Z][a-z]{2} 会匹配 "Foo"，所以月份必须再查一次表
+        self.assertIsNone(ca.parse_reset_time("try again at Foo 1st, 2026 5:04 PM"))
+
+    def test_不存在的日期返回None不崩(self):
+        self.assertIsNone(ca.parse_reset_time("try again at Feb 31st, 2026 5:04 PM"))
+
+    def test_返回朴素时间_不编造时区(self):
+        # 消息里没有时区，实测也推不出来。编一个出来就是撒谎；
+        # 这个值只当排序键，朴素时间足够。
+        self.assertIsNone(ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM")[0].tzinfo)
 
 
 class TestIsolation(_HomeSandbox):
