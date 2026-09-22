@@ -20,7 +20,8 @@ sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brie
 sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brief brief.md --effort max     --no-skill
 ```
 
-带值参数**全必填**，外加 `--skill`/`--no-skill` 二选一，没有默认值。
+带值参数**一个都别省**（`--account` 例外：它只有 `codex` 要，`deepseek` 给了反而被拒，
+见下表），外加 `--skill`/`--no-skill` 二选一，没有默认值。
 `run_in_background: true` 是唯一正确的启动方式——harness 追踪它、面板可监控、
 **完成时的通知里直接带成败结论**。
 绝不 `nohup … &`：detach 之后就只剩存活、没有通知。

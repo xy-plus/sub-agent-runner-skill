@@ -49,6 +49,10 @@ ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-a
 日志里的轮次分隔符和打断标记同理（它们被整行正则匹配）。
 改的只是命令名和文件名——用户敲的是命令名，盘上的东西谁都不该动。
 
+同上：**改名／搬家时，旧命令的 symlink 必须同时废掉。** 只要旧命令还能跑，
+它就还在按老格式写元数据，而少一个字段的元数据会让整个 `status` 列表读不出来
+（见 `sub_agent_runner.py` 里 `REQUIRED_META_KEYS` 上方那段）。
+
 ## 怎么用
 
 **看 [`SKILL.md`](SKILL.md)** —— 它是这个工具面向调用方的全部契约：五条命令、
