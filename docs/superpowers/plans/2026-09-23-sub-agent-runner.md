@@ -78,7 +78,7 @@ plan v2 定义了五个新函数、写了 31 条测试，**全绿**——审查�
 
 ---
 
-### Task 3: 测试护栏 + deepseek 的纯函数 + PID 反查 runner 化
+### Task 3: 测试护栏 + deepseek 的纯函数 + PID 反查 runner 化 ✅ 已完成 — `3522b20`
 
 **Files:** `codex_sub_agent.py`、`test_codex_sub_agent.py`
 
@@ -88,7 +88,7 @@ plan v2 定义了五个新函数、写了 31 条测试，**全绿**——审查�
   清单提成 `_REAL_AGENT_BINS`，只有一个家。
   **这一条必须排在任何 deepseek 代码之前**，它是后面所有步骤的前提。
 
-- [ ] **Step 1: 写失败的测试 —— 纯函数**
+- [x] **Step 1: 写失败的测试 —— 纯函数**
 
   `TestDeepseekRunner`：
   - uuid 是独立 argv 元素（`--session-id` / `--resume` 两处），不是 `=` 连接
@@ -105,7 +105,7 @@ plan v2 定义了五个新函数、写了 31 条测试，**全绿**——审查�
     不许丢、也不许当成完整行（突变「`join`+`splitlines`」必须红）
   - `new_session_id()`：两次不同、长度 36
 
-- [ ] **Step 2: 写失败的测试 —— PID 反查的 6 个调用点**
+- [x] **Step 2: 写失败的测试 —— PID 反查的 6 个调用点**
 
   `TestFindAgentPid`（真陪练进程，照抄既有 `TestPid` 的形状）：
   - `find_agent_pid(DEEPSEEK, uuid)` 命中 `comm=claude` 且 argv 里有该 uuid 的进程
@@ -116,9 +116,9 @@ plan v2 定义了五个新函数、写了 31 条测试，**全绿**——审查�
     构造「磁盘上记着旧 uuid、传进来的 meta 是新 uuid、旧 uuid 的进程还活着」，断言它还在等
   - `cmd_status` / `cmd_stop` 对一个 deepseek 任务真的有效（spec 判据 11）
 
-- [ ] **Step 3: 跑测试确认失败**
+- [x] **Step 3: 跑测试确认失败**
 
-- [ ] **Step 4: 实现**
+- [x] **Step 4: 实现**
 
 ```python
 DEEPSEEK_BIN = "claude-deepseek"
@@ -165,15 +165,15 @@ def find_task_agent_pid(runner, home, task):
   `cmd_run` 的存活闸、`cmd_status`、`cmd_resume`、`cmd_interrupt_and_resume`、`cmd_stop`。
   `_wait_previous_round_ends` 签名加 runner（由 `run_codex` 从 `meta["runner"]` 传）。
 
-- [ ] **Step 5: 跑全量 + 提交**
+- [x] **Step 5: 跑全量 + 提交**
 
 ---
 
-### Task 4: 接线 —— `run_codex` 里真的分叉（最严重的一条）
+### Task 4: 接线 —— `run_codex` 里真的分叉（最严重的一条）✅ 已完成 — `94a778e`
 
 **这一步是 v2 整个漏掉的东西。** 没有它，Task 3 那些函数一个调用点都没有。
 
-- [ ] **Step 1: 写失败的集成测试**（spec 判据 13 的五条，假 `Popen` 驱动**真实** `run_codex`）
+- [x] **Step 1: 写失败的集成测试**（spec 判据 13 的五条，假 `Popen` 驱动**真实** `run_codex`）
 
 ```python
 class TestDeepseekWiring(_HomeSandbox):
@@ -190,9 +190,9 @@ class TestDeepseekWiring(_HomeSandbox):
     #    codex 的日志里它必须原样在（反向护栏，比 assertIsNone(log_line_filter) 强）
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现接线**
+- [x] **Step 3: 实现接线**
 
   `run_codex` 里三处按 runner 分叉 + 一处两侧都加：
 
@@ -216,7 +216,7 @@ def _tee_until_exit(proc, log, home, task, meta):
   `_tee_lines(proc, log, keep)` 攒 buffer 走 `split_complete_lines`；
   **残片在 EOF 后原样写出**——它是「这一轮被杀在半路」的现场证据。
 
-- [ ] **Step 4: 拿真实现场日志验过滤比例**
+- [x] **Step 4: 拿真实现场日志验过滤比例**
 
 ```bash
 python3 -c "
@@ -232,13 +232,13 @@ print(f'行 {len(raw)}→{len(kept)}（压掉 {100-100*len(kept)/len(raw):.1f}%�
   **两个口径不一样，别混着说**：审查实测行数压掉 99.8%、字节压掉 92.4%
   （`thinking_tokens` 行短而密）。预期行数 ≥99%、字节 ≥90%。
 
-- [ ] **Step 5: 跑全量 + 提交**
+- [x] **Step 5: 跑全量 + 提交**
 
 ---
 
-### Task 5: CLI —— `--runner`、三条硬拒绝、uuid 的生命周期
+### Task 5: CLI —— `--runner`、三条硬拒绝、uuid 的生命周期 ✅ 已完成 — `400d245`
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 ```python
 class TestRunnerCLI(_HomeSandbox):
@@ -274,9 +274,9 @@ class TestRunnerCLI(_HomeSandbox):
         # （--account auto 只在 codex 的账号之间搬）。当场拒，别让这个状态建起来。
 ```
 
-- [ ] **Step 2: 跑测试确认失败**
+- [x] **Step 2: 跑测试确认失败**
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
   - `build_parser`：`--runner` 必填 `choices=list(RUNNERS)`；`--account` 改可选
     （argparse 表达不了「A 必填当且仅当 B 是某值」）
@@ -296,9 +296,9 @@ class TestRunnerCLI(_HomeSandbox):
     **不加第五列**——`split(maxsplit=4)` 是机器切分的契约，加一列会把它改掉。
     顺带修掉一个真 bug：deepseek 的 `account` 是 `None`，`f"{None:<8}"` 当场 `TypeError`
 
-- [ ] **Step 4: 跑全量**
+- [x] **Step 4: 跑全量**
 
-- [ ] **Step 5: 真跑一次冒烟 —— 必须产出真文件 + 必须核对隔离**
+- [x] **Step 5: 真跑一次冒烟 —— 必须产出真文件 + 必须核对隔离**
 
 ```bash
 WD=$(mktemp -d)
@@ -314,13 +314,13 @@ grep -c thinking_tokens ~/.claude-subagent/logs/smoke-deepseek.log   # ← 必�
   **只断言「报告非空」挡不住「零工作量的成功」**——必须核对文件真的落在 `--dir` 里。
   **只跑一次，别反复跑。codex 侧不跑冒烟**：三个账号全部限流。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ---
 
-### Task 6: 改名 —— 三类，不是两类
+### Task 6: 改名 —— 三类，不是两类 ✅ 已完成 — `f4b085e`（安全网）+ `871d1f4`（改名）
 
-- [ ] **Step 1: 先把盘上契约钉住**（这条测试改名前就该绿，它是安全网）
+- [x] **Step 1: 先把盘上契约钉住**（这条测试改名前就该绿，它是安全网）
 
 ```python
 def test_盘上契约的字面量一个都没改(self):
@@ -330,7 +330,7 @@ def test_盘上契约的字面量一个都没改(self):
     self.assertEqual(ca.isolation_home(ca.CODEX, "default").name, ".codex-subagent")
 ```
 
-- [ ] **Step 2: 逐处分类**（spec 第二节那张表）
+- [x] **Step 2: 逐处分类**（spec 第二节那张表）
 
 ```bash
 grep -n "codex-sub-agent\|codex_sub_agent" codex_sub_agent.py test_codex_sub_agent.py \
@@ -347,7 +347,7 @@ grep -n "codex-sub-agent\|codex_sub_agent" codex_sub_agent.py test_codex_sub_age
   v2 把它判成「盘上契约，不改」是**错的**——它是 `TestSkillDocDoesNotRepeatCode`
   在钉 SKILL.md 里的**命令名**。SKILL.md 改了它必红，照 v2 的字面执行会卡死。
 
-- [ ] **Step 3: 改模块名（下划线那个可以全局替换）**
+- [x] **Step 3: 改模块名（下划线那个可以全局替换）**
 
 ```bash
 git mv codex_sub_agent.py sub_agent_runner.py
@@ -357,16 +357,16 @@ sed -i 's/codex_sub_agent/sub_agent_runner/g' sub_agent_runner.py test_sub_agent
   `codex_sub_agent`（下划线）是模块名，**不出现在任何盘上契约里**。
   `codex-sub-agent`（连字符）**不可以**全局替换——它在两个 MARK 里。
 
-- [ ] **Step 4: 逐处改连字符那个**，然后
+- [x] **Step 4: 逐处改连字符那个**，然后
       `python3 -m unittest test_sub_agent_runner -k 盘上契约 -v`（必须仍然绿）+ 全量
 
-- [ ] **Step 5: 文档**：SKILL.md 的账号那一格拆成 runner + 账号；
+- [x] **Step 5: 文档**：SKILL.md 的账号那一格拆成 runner + 账号；
       写明 deepseek 的 effort 只能是 max（**说事实，不写「记得传 max」**——代码已经硬拒绝了）。
       README 同步，含安装段那条命令。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
-- [ ] **Step 7: 留给协调者在主 checkout 上做的两件事（本计划范围之外，写在这里免得丢）**
+- [x] **Step 7: 留给协调者在主 checkout 上做的两件事（本计划范围之外，写在这里免得丢）**
 
       1. `mv ~/.claude/skills/codex-sub-agent ~/.claude/skills/sub-agent-runner`
          ——**worktree 里不能做**（会挪走主仓目录、连带 worktree 注册失效）
@@ -395,3 +395,42 @@ sed -i 's/codex_sub_agent/sub_agent_runner/g' sub_agent_runner.py test_sub_agent
 要求的四条（run 铸新 uuid、落元数据、两次 run 不同、argv 用元数据里那个）全部满足，
 而放在构造器里让「复用任务名 = 新一轮 = 新 uuid」从软约定变成结构事实——
 和 `new_meta` 里 writer 身份自取那条注释是同一条论证。
+
+
+---
+
+## 执行结果（2026-09-23）
+
+| Task | 状态 | commit |
+|---|---|---|
+| 1 迁移 260 份元数据 | 完成 | 无（一次操作，不是代码） |
+| 2 runner 轴 | 完成 | `1e02eea` |
+| 3 纯函数 + PID 反查 | 完成 | `08a2559`（护栏）+ `3522b20` |
+| 4 接线 + 集成测试 | 完成 | `94a778e` |
+| 5 CLI + 冒烟 | 完成 | `400d245` |
+| 6 改名 | 完成 | `f4b085e` + `871d1f4` |
+
+全量测试：**`Ran 400 tests` / `OK`**（基线 318 → 400，净增 82 条）。
+
+**冒烟（唯一一次真跑，$0.12）**：
+
+```
+ANTHROPIC_MODEL=claude-opus-5 ./sub_agent_runner.py run --task smoke-deepseek \
+    --runner deepseek --dir /tmp/smoke-ds-Xss5 --brief /tmp/smoke-ds.md --effort max --no-skill
+→ 退出码 0
+→ /tmp/smoke-ds-Xss5/proof.txt 内容正好 8 字节 `SMOKE-OK`
+→ status: smoke-deepseek  deepseek  success  0  /tmp/smoke-ds-Xss5  正常收尾，本轮日志无未分类错误
+→ 隔离核对：init 事件里 mcp_servers=[]、skills 里一个用户 skill 都没有
+→ 模型变量核对：设了 ANTHROPIC_MODEL=claude-opus-5 也没被 claude-deepseek 退 2
+```
+
+**留给协调者在主 checkout 上做的两件事**（worktree 里做不了）：
+
+1. `mv ~/.claude/skills/codex-sub-agent ~/.claude/skills/sub-agent-runner`
+2. `ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-agent-runner`
+   并删掉旧的 `~/.local/bin/codex-sub-agent`（现指向
+   `/home/xy/.claude/skills/codex-sub-agent/codex_sub_agent.py`，合并后就是死链）
+
+**顺带产生的一条真实盘上状态**：冒烟留下了任务 `smoke-deepseek`（在
+`~/.claude-subagent`），所以 `all_metas()` 现在是 **261** 而不是 260。
+要清掉就删 `~/.claude-subagent/{tasks,reports,logs}/smoke-deepseek.*`。

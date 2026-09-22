@@ -2490,9 +2490,14 @@ def check_can_resume(task, meta, brief_path):
 
     抽成独立函数，是因为 `interrupt-and-resume` 必须把**全部**拒绝跑在发信号
     之前：INT 发出去就收不回来，先打断、再发现没 session id，那一轮白毁**且拿
-    不回来**（没 session id 就没法 resume）。这个窗口真实可达——session_id 要等
-    codex 第一块输出才写进元数据，实测父进程 4.06 秒才看到 banner，而任务刚起
-    那几秒正是最可能被打断的时候（刚发现 brief 写错）。
+    不回来**（没 session id 就没法 resume）。
+
+    **「没 session id」这个窗口只在 codex 那侧真实可达**：它的 id 要等 codex
+    第一块输出才被正则抠出来写进元数据，实测父进程 4.06 秒才看到 banner，
+    而任务刚起那几秒正是最可能被打断的时候（刚发现 brief 写错）。
+    deepseek 那侧的 id 是 `new_meta` 那一刻就铸好落盘的，所以这道闸对它
+    **结构上不可达**——但它留着：一份被手改坏的元数据照样该被挡下，
+    而闸的代价是一次字典取值。
 
     `_resume_round` 自己也调它：闸留在续跑动作里，才没有一条绕过去的后门。
     两次调用是刻意的，纯拒绝、无副作用，跑两遍不花钱。
