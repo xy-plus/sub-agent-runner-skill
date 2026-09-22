@@ -1197,6 +1197,103 @@ class TestUsageLimitFile(unittest.TestCase):
         self.assertEqual(seen, ["旧"], "替换发生前目标文件必须还是完整的旧内容")
 
 
+class TestProbeAccountQuota(_HomeSandbox):
+    """探测是「换不换账号」的唯一依据，所以它自己的可信度就是整条链路的上界。"""
+
+    OUT_OF_QUOTA = ("OpenAI Codex v0.155.1\n--------\nsession id: 01a0\n--------\n"
+                    "user\nok\n"
+                    "ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
+                    "settings/usage to purchase more credits or try again at "
+                    "Sep 26th, 2026 5:47 PM.\n")
+    FINE = ("OpenAI Codex v0.155.1\n--------\nsession id: 01a0\n--------\nuser\nok\n"
+            "thinking\ncodex\nok\n")
+
+    def setUp(self):
+        super().setUp()
+        self.home = ca.ensure_isolation("default")
+        self.now = datetime.datetime(2026, 9, 22, 9, 0)
+
+    def _probe(self, stderr_text, returncode=1):
+        done = subprocess.CompletedProcess(args=[], returncode=returncode,
+                                           stdout="", stderr=stderr_text)
+        with mock.patch.object(ca.subprocess, "run", return_value=done) as run:
+            got = ca.probe_account_quota(self.home, now=self.now)
+        return got, run
+
+    def test_探测用的prompt是常量且不含额度字样(self):
+        # **这是探测全部可信度的来源。** prompt 里只要有额度字样，
+        # codex 的回显就会把它写进探测自己的输出，探测就开始自证自己撞了上限。
+        # 做成常量而不是参数——参数就能被调用方污染，那就绕回原点了。
+        # 钉的是 USAGE_LIMIT_MARK 本身而不是另抄一份字面串：抄一份就会漂。
+        self.assertIsInstance(ca.PROBE_PROMPT, str)
+        self.assertNotIn(ca.USAGE_LIMIT_MARK, ca.PROBE_PROMPT.lower())
+
+    def test_撞上限_返回True和恢复时间(self):
+        (limited, hit), _ = self._probe(self.OUT_OF_QUOTA)
+        self.assertTrue(limited)
+        self.assertEqual(hit[0], datetime.datetime(2026, 9, 26, 17, 47))
+
+    def test_没撞上限_返回False(self):
+        (limited, hit), _ = self._probe(self.FINE, returncode=0)
+        self.assertFalse(limited)
+        self.assertIsNone(hit)
+
+    def test_撞上限但时间解析不出_仍然是True(self):
+        # 「撞上了」和「几点恢复」是两件事，**不许用后者的缺失推翻前者**。
+        # 推翻的话，一个消息格式变了的账号会被永远当成可用的反复重试。
+        (limited, hit), _ = self._probe(
+            "ERROR: You’ve hit your usage limit. 后面什么都没有\n")
+        self.assertTrue(limited)
+        self.assertIsNone(hit)
+
+    def test_探测本身失败_一律当成没撞上限(self):
+        # 探不出来就不换号：宁可少试一个账号（调用方重跑即可），
+        # 也不要凭猜去删元数据、重跑任务。
+        for boom in (OSError("boom"), subprocess.TimeoutExpired("codex", 1)):
+            with self.subTest(故障=type(boom).__name__):
+                with mock.patch.object(ca.subprocess, "run", side_effect=boom):
+                    self.assertEqual(ca.probe_account_quota(self.home, now=self.now),
+                                     (False, None))
+
+    def test_探测是只读沙箱且跳过git检查(self):
+        # 探测只是去问一句话，不该有动任何东西的能力。
+        # 这几条合起来钉的是同一件事：**探测的命令行不是 build_run_argv**
+        # ——后者带 -o、带 effort、带 danger-full-access，每一条对探测都是错的。
+        _, run = self._probe(self.OUT_OF_QUOTA)
+        argv = run.call_args[0][0]
+        self.assertIn("read-only", argv)
+        self.assertNotIn("danger-full-access", argv)
+        self.assertIn("--skip-git-repo-check", argv)
+        self.assertNotIn("-o", argv, "探测不产出报告，给了 -o 就会去写别人的报告文件")
+        self.assertEqual(argv[-1], ca.PROBE_PROMPT, "真正发出去的必须就是那个常量")
+
+    def test_探测走这个账号的隔离目录(self):
+        _, run = self._probe(self.OUT_OF_QUOTA)
+        self.assertEqual(run.call_args.kwargs["env"]["CODEX_HOME"], str(self.home))
+
+    def test_探测不读stdin(self):
+        # 实测：不关 stdin 时 codex 停在「Reading additional input from stdin...」不动，
+        # 探测会挂满整个超时。
+        _, run = self._probe(self.OUT_OF_QUOTA)
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+
+    def test_探测必须带超时(self):
+        # 上面那条「超时也当成没撞上限」是 mock 出来的，它**证明不了**真的传了
+        # timeout——把 timeout= 删掉，那条照样绿。探测卡住会把整条 run 拖死，
+        # 所以这里单独钉住它真的传了。
+        _, run = self._probe(self.OUT_OF_QUOTA)
+        self.assertEqual(run.call_args.kwargs["timeout"], ca.PROBE_TIMEOUT)
+        self.assertGreater(ca.PROBE_TIMEOUT, 0)
+
+    def test_stdout和stderr都要看(self):
+        # 实测额度消息在 stderr，但那是当前版本的行为，不是契约。
+        done = subprocess.CompletedProcess(args=[], returncode=1,
+                                           stdout=self.OUT_OF_QUOTA, stderr="")
+        with mock.patch.object(ca.subprocess, "run", return_value=done):
+            limited, _ = ca.probe_account_quota(self.home, now=self.now)
+        self.assertTrue(limited)
+
+
 class TestAccountChoicesGuards(_HomeSandbox):
     def test_保留名目录要拒跑并点名(self):
         # default：现有代码会返回两个 'default'，两次指向同一个 home，

@@ -1016,6 +1016,65 @@ def codex_env(home):
     return env
 
 
+# 探测用的 prompt。**写死在代码里，且不含任何额度字样。**
+# 这是探测全部可信度的来源：codex 会把 prompt 原样回显进输出（实测在 stderr），
+# prompt 里只要有额度字样，探测就开始自证自己撞了上限。
+# 做成常量而不是参数——参数就能被调用方污染，那就绕回原点了。
+PROBE_PROMPT = "reply with two letters: ok"
+# 实测一个真·限流账号 15 秒返回。给足余量，但必须有上界：
+# 探测卡住不能把整条 run 拖死。
+PROBE_TIMEOUT = 120
+
+
+# 位置在 `codex_env` **之下**：它依赖 codex_env、MODEL 和上面那一整组文本判据。
+# 本文件一律自下而上排（见 `accounts_by_availability` 的同一条理由），所以它
+# 不和 `parse_reset_time` 挨着——那里 codex_env 还没出生。
+def probe_account_quota(home, now):
+    """单独问一次这个账号还有没有额度。返回 `(撞上限了吗, (恢复时间, 原始串) 或 None)`。
+
+    **「换不换账号」由本函数决定，不由任务日志决定。** 任务日志里混着 brief 原文、
+    codex 读文件的回显、子进程输出——2026-09-22 实测：一个**完全正常**的账号，
+    因为任务内容涉及额度处理，日志里就出现了 `ERROR: …hit your usage limit`
+    （codex 带行号 cat 出了含这个字面串的文件）。`runtime_error_lines()` 只认格式
+    不认来源，挡不住它。而在 `cmd_run` 里，误判的后果是**删掉元数据、换账号把整个
+    任务重跑一遍**。
+
+    探测的输出只含我们自己写死的 prompt，**不可能有被回显进来的假证据**。
+
+    实测过没有非文本信号可用（2026-09-22 拿一个真·限流账号实跑）：退出码 1
+    （和普通失败没区别）、15 秒返回、消息在 stderr，而 prompt 回显也在 stderr。
+    所以证据只能是文本，唯一的出路就是换一份没被污染的文本。
+
+    返回**两个值而不是一个**：「撞上了」和「几点恢复」是两件事，现网 39% 的额度消息
+    只有时刻甚至没有时间（见 `parse_reset_time`）。合成一个返回值的话，
+    「时间解析不出」会被当成「没撞上限」，于是一个消息格式变了的账号会被永远
+    当成可用的反复重试。
+
+    **探测本身失败（起不来、超时）一律当成没撞上限**：宁可少试一个账号
+    （调用方重跑即可），也不要凭猜去删元数据、重跑任务。
+
+    代价：账号真的满了，15 秒、零 token（服务端直接拒）；账号其实没满，
+    会真跑一轮极短的 prompt。只在「本轮已失败且日志里有额度字样」时才发生。
+    """
+    # **刻意不复用 `build_run_argv`**：它带 `-o`、带 effort、带 danger-full-access，
+    # 每一条对探测都是错的——探测只是去问一句话，不该有动任何东西的能力，
+    # 也不该去写别人的报告文件。
+    argv = ["codex", "exec", "--cd", str(home), "-m", MODEL,
+            "--sandbox", "read-only", "--color", "never",
+            "--skip-git-repo-check", PROBE_PROMPT]
+    try:
+        done = subprocess.run(argv, env=codex_env(home), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, errors="replace",
+                              timeout=PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+    # 两个流都看：实测额度消息在 stderr，但那是当前版本的行为，不是契约。
+    text = strip_ansi(done.stdout + done.stderr)
+    if not hit_usage_limit(runtime_error_lines(text)):
+        return False, None
+    return True, parse_reset_time(text, now=now)
+
+
 def meta_path(home, task):
     return home / "tasks" / f"{task}.json"
 
