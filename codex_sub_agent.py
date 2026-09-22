@@ -439,13 +439,19 @@ def hit_usage_limit(error_lines):
     已经为同一个理由否掉了裸 grep ERROR）。2026-09-22 全量核对 268 份现网日志：
     27 份里有 54 行真·额度错误，另有 3 份里 71 行只是**提到**这句话（brief 原文、
     源码引用）。对整轮文本做子串匹配，后面那 71 行会被判成额度问题——而在
-    `cmd_run` 里，那意味着**删掉元数据、换账号重跑整个任务**。判据一旦成为
-    控制依据，证据就必须来自**已经分类过的错误行**。
+    `cmd_run` 里，那意味着给一个**健康账号**写下限流记录。配上「不做过期清理」
+    和「纯按 reset_at 排序」，一条 2099 年的假记录会让它**永远排最后**，
+    auto 再也不会先试它。判据一旦成为控制依据，证据就必须来自**已经分类过的错误行**。
 
     **`judge` 和 `cmd_run` 共用这一个谓词。** 两处各写一套必然漂移，
-    而判据漂移正是本工具反复在修的那类 bug。`cmd_run` 为此要多跑一次
-    `runtime_error_lines`（实测 0.83MB 日志约 7.6ms，而 run 是分钟级的）——
-    不为省这 8ms 给 `Verdict` 加字段：那要改 7 个构造点，churn 比多一次扫描大。
+    而判据漂移正是本工具反复在修的那类 bug。`cmd_run` 不自己再扫一遍，
+    它喂的是 `verdict.detail`——failed 态下那就是本轮已分类的错误行
+    （三个 `Verdict("failed", …)` 构造点全传 `errors`，有测试守着这条契约：
+    `test_failed态的detail恒等于本轮已分类的错误行`）。这样两边看的是
+    **同一批行**，不是两次各自扫出来的两批。
+
+    「几点恢复」走 `usage_limit_reset()`，收的也是这同一批行——**两个谓词的输入
+    类型必须一样**，否则下一个人会给其中一个喂整轮文本（2026-09-22 真踩过）。
     """
     return any(USAGE_LIMIT_MARK in line for line in error_lines)
 
@@ -541,6 +547,34 @@ def parse_reset_time(text, now):
     if when < now:                      # 今天这个点已经过了，那说的就是明天
         when += datetime.timedelta(days=1)
     return when, m.group("raw")
+
+
+def usage_limit_reset(error_lines, now):
+    """这批错误行说这个账号几点恢复；说不出来就 `None`。
+
+    **收的是已分类的错误行，和 `hit_usage_limit` 一模一样。** 这是同一条规矩的
+    两半：判「撞没撞上」看已分类的错误行，判「几点恢复」也必须看同一批行。
+    只守前一半是没用的——2026-09-22 实测，污染行排在真错误**前面**时，
+    对整轮文本 `search()` 取到的是污染那一条：
+
+        47  ERR_USER_LAYER_REAL = '… or try again at Dec 31st, 2099 11:59 PM.'
+        ERROR: You’ve hit your usage limit. … or try again at Sep 25th, 2026 5:04 PM.
+
+    整轮文本给出 2099-12-31，已分类行给出 2026-09-25。前者会被落盘、会被当成
+    排序键、还会印给人看——而它是从一行 fixture 回显里捡来的。
+
+    **逐行试，取第一条解析得出的**，不把几行拼起来再 `search`——拼起来就又回到
+    「在一个大块文本里捡第一个匹配」，正是这个函数要消灭的东西。
+    命中了额度字样但那一行没有时间（现网确有这种形态），就**到此为止返回 None**，
+    绝不退回去扫别的行：那又是从别处捡一个时间。
+    """
+    for line in error_lines:
+        if USAGE_LIMIT_MARK not in line:
+            continue
+        got = parse_reset_time(line, now=now)
+        if got is not None:
+            return got
+    return None
 
 
 USAGE_LIMIT_FILE = "usage_limit.json"
@@ -1811,12 +1845,16 @@ def cmd_run(args):
     #
     # 判据不可靠这件事在这里的爆炸半径只有**记录**：误判最多给一个健康账号写条
     # 限流记录，于是它排到后面——仍然会被选中、仍然会被试，只是顺序差一格。
-    if verdict.state == "failed" and hit_usage_limit(runtime_error_lines(this_round.text)):
-        # 从**本轮的文本**解析，绝不另读整份历史日志——那会把上一轮、上一个任务
-        # 的旧额度错误和旧恢复时间当成本轮事实。
+    # **证据只有一批：`verdict.detail`。** failed 态下它就是本轮已分类的错误行
+    # （`judge` 三个 failed 构造点全传 `errors`，有测试守着这条契约）。
+    # 不自己再扫一遍整轮文本：扫两遍就有两批行，而「判撞没撞上」和「判几点恢复」
+    # 一旦看的不是同一批，就是 2026-09-22 那个 bug 的形状——污染行排在真错误前面时，
+    # 对整轮文本 search() 取到的是污染那一条，于是一个健康账号被记上 2099 年的
+    # 恢复时间，从此永远排最后。
+    if verdict.state == "failed" and hit_usage_limit(verdict.detail):
         # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
         # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
-        reset = parse_reset_time(this_round.text, now=datetime.datetime.now())
+        reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
         if reset is None:
             record_note = "日志里没有恢复时间可记（现网确有这种形态）"
         else:

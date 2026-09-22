@@ -912,6 +912,24 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
 
+    def test_failed态的detail恒等于本轮已分类的错误行(self):
+        """**`cmd_run` 靠这条契约省掉一次重复扫描**，所以它得有人守着。
+
+        `Verdict.detail` 的注释写着「suspect／failed：出事的那几行」。三个
+        `Verdict("failed", …)` 构造点全传 `errors`，而 `errors` 就是
+        `runtime_error_lines(round_text)`。哪天有人给某一支传了个**过滤过**的
+        清单，`cmd_run` 就会静默地少看几行——撞上限却不记录，而没有任何信号。
+        """
+        for name, text in (
+                ("额度上限", ERR_USER_LAYER_REAL + "\n"),
+                ("写锁", ERR_FATAL + "\n"),
+                ("报告缺失", "什么都没有\n"),
+                ("报告缺失且有杂错误", "ERROR: boom\n" + ERR_TRACING_UNKNOWN + "\n")):
+            with self.subTest(情形=name):
+                v = ca.judge(ca.Round(self.report, text))
+                self.assertEqual(v.state, "failed", "前提不成立：这条根本不是 failed")
+                self.assertEqual(v.detail, ca.runtime_error_lines(text))
+
     def test_没有打断标记时_额度上限和写锁仍然是failed(self):
         """这两条的补救是换账号／新起任务，不是 resume——不许被第五态顺手吃掉。
 
@@ -1098,6 +1116,55 @@ class TestParseResetTime(unittest.TestCase):
         # 给了缺省就会有人不传，于是「今天还是明天」随调用时刻飘而没人看得见。
         with self.assertRaises(TypeError):
             ca.parse_reset_time("try again at 11:10 AM")
+
+
+class TestUsageLimitReset(unittest.TestCase):
+    """恢复时间**只从已分类且命中额度字样的那些行**里取。
+
+    这条和 `hit_usage_limit` 是同一条规矩的两半：判「撞没撞上」看已分类的错误行，
+    判「几点恢复」也必须看同一批行。只守前一半是没用的——2026-09-22 实测，
+    污染行排在真错误**前面**时，对整轮文本 `search()` 取到的是污染那一条。
+    """
+
+    NOW = datetime.datetime(2026, 9, 22, 9, 0)
+    # 污染样本抄自真实现场：plan 审查任务里 codex 带行号 cat 出了测试 fixture。
+    POISON = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
+
+    def test_只认命中额度字样的那一行_不认整轮文本(self):
+        # **污染行排在前面**——这是承重的排列：`search()` 取全文第一个匹配。
+        lines = ca.runtime_error_lines(self.POISON + "\n" + ERR_USER_LAYER_REAL + "\n")
+        self.assertNotIn(self.POISON, lines, "前提不成立：污染行被分类成了错误行")
+        got = ca.usage_limit_reset(lines, now=self.NOW)
+        self.assertEqual(got[0], datetime.datetime(2026, 9, 25, 17, 4),
+                         "取到了 2099 就是从整轮文本里捡的，不是从错误行里取的")
+        self.assertEqual(got[1], "Sep 25th, 2026 5:04 PM", "raw 也要是真那条，它是审计线索")
+
+    def test_没有命中额度字样的行就返回None(self):
+        self.assertIsNone(ca.usage_limit_reset(["Error: 别的毛病"], now=self.NOW))
+        self.assertIsNone(ca.usage_limit_reset([], now=self.NOW))
+
+    def test_命中了但那一行没有时间_返回None(self):
+        # 现网确有这种形态（`hit your usage limit` 后面什么都没有）。
+        # **不许退回去扫别的行**：那就又是「从别处捡一个时间」。
+        lines = ["ERROR: You’ve hit your usage limit",
+                 "Error: 顺便提一句 try again at Dec 31st, 2099 11:59 PM"]
+        self.assertIsNone(ca.usage_limit_reset(lines, now=self.NOW))
+
+    def test_多行命中时取第一条解析得出的(self):
+        lines = ["ERROR: You’ve hit your usage limit",          # 命中但没时间
+                 ERR_USER_LAYER_REAL]                            # 命中且有时间
+        self.assertEqual(ca.usage_limit_reset(lines, now=self.NOW)[0],
+                         datetime.datetime(2026, 9, 25, 17, 4))
+
+    def test_和hit_usage_limit收同一种东西(self):
+        """两个谓词的**输入类型必须一样**，否则下一个人会给其中一个喂整轮文本。
+
+        这不是形式主义：C1 那个 bug 的形状就是「判撞没撞上用错误行，
+        判几点恢复用整轮文本」。
+        """
+        lines = ca.runtime_error_lines(ERR_USER_LAYER_REAL + "\n")
+        self.assertTrue(ca.hit_usage_limit(lines))
+        self.assertIsNotNone(ca.usage_limit_reset(lines, now=self.NOW))
 
 
 class TestUsageLimitFile(unittest.TestCase):
@@ -2996,6 +3063,31 @@ class TestAutoAccountPick(_HomeSandbox):
                          "没有别的账号可换时要说出来，不许含糊过去")
         self.assertNotRegex(self.printed, r"会先试 default",
                             "不许把「仍是它自己」印成一个像是换了号的句子")
+
+    def test_日志里的污染行不许变成恢复时间(self):
+        """**C1 回归锁。** 2026-09-22 实测：`cmd_run` 拿整轮文本解析恢复时间，
+        而整轮文本正是被污染的那个东西——上一行刚用已分类的错误行判「撞没撞上」，
+        下一行就把这条规矩丢了，`search()` 取的是全文**第一个**匹配。
+
+        这条是 Critical 而不是「顺序差一格」：配上「不做过期清理」和「纯按
+        reset_at 排序」，一条 2099 年的假记录会让那个健康账号**永远排最后**，
+        auto 再也不会先试它。落盘的 `raw` 也会是那行 fixture，审计线索一起失效。
+        """
+        污染 = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
+        code = self._run(ca.AUTO, 污染 + "\n" + self.LIMIT_LINE)
+        self.assertEqual(code, ca.EXIT["failed"])
+        记录 = ca.read_usage_limit(ca.isolation_home("acct2"))
+        self.assertEqual(记录, self.RESET_AT,
+                         "记下的是污染行里那个 2099——恢复时间没有从已分类的错误行里取")
+        落盘 = json.loads(ca.usage_limit_path(ca.isolation_home("acct2")).read_text())
+        self.assertEqual(落盘["raw"], "Sep 25th, 2026 5:04 PM",
+                         "raw 是审计线索，存了污染行就等于线索也一起坏了")
+        # 只看**工具自己写的那一行**。整屏里当然有 2099——tee 会把 codex 的原始
+        # 输出逐字回显到屏幕上，那是它该做的事；要钉的是工具自己的结论。
+        结论行 = [l for l in self.printed.splitlines() if "撞上额度上限" in l]
+        self.assertEqual(len(结论行), 1, "前提不成立：没有（或不止一条）结论行")
+        self.assertIn("09-25 17:04", 结论行[0], "印给人看的那个时间也不许是编的")
+        self.assertNotIn("2099", 结论行[0])
 
     def test_解析不出恢复时间_不落盘但要说清楚(self):
         # 现网第三种形态（`hit your usage limit` 后面什么都没有）。
