@@ -1066,6 +1066,98 @@ class TestUsageLimitFile(unittest.TestCase):
         self.assertEqual(seen, ["旧"], "替换发生前目标文件必须还是完整的旧内容")
 
 
+class TestAccountChoicesGuards(_HomeSandbox):
+    def test_保留名目录要拒跑并点名(self):
+        # default：现有代码会返回两个 'default'，两次指向同一个 home，
+        #          find_meta 会对同一份元数据数出两份，当场误拒。
+        # auto   ：它是 --account 的模式词，真账号同名就再也没法被明确指定。
+        for name in ("default", "auto"):
+            with self.subTest(保留名=name):
+                d = self.home / ".codex-accounts" / name
+                d.mkdir(parents=True)
+                with self.assertRaises(ca.Rejected) as got:
+                    ca.account_choices()
+                self.assertIn(name, got.exception.message)
+                self.assertIn(str(d), got.exception.message, "要点名是哪个目录")
+                d.rmdir()
+
+    def test_候选各自指向不同的隔离目录(self):
+        # 重名只是表象，**真正咬人的是两个候选指向同一个 home**：
+        # find_meta 会把同一份元数据数成两份，当场拒绝「任务名在多个隔离目录里都有」。
+        for name in ("acct2", "acct3"):
+            (self.home / ".codex-accounts" / name).mkdir(parents=True)
+        got = ca.account_choices()
+        self.assertEqual(len(got), len(set(got)))
+        homes = [ca.isolation_home(a) for a in got]
+        self.assertEqual(len(homes), len(set(homes)))
+
+
+class TestAccountOrder(_HomeSandbox):
+    """排序只影响**先试谁**，不影响**试不试**。所以这里每条断言都是关于顺序的，
+    只有最后一条是关于「一个都不少」——那是本设计的核心约束。
+    """
+
+    def setUp(self):
+        super().setUp()      # HOME 沙箱：Path.home() 和 $HOME 两条都 patch 掉
+        for name in ("acct2", "acct3"):
+            d = self.home / ".codex-accounts" / name
+            d.mkdir(parents=True)
+            (d / "auth.json").write_text("{}")     # 有登录态才进候选
+        for account in ("default", "acct2", "acct3"):
+            (ca.isolation_home(account) / "tasks").mkdir(parents=True)
+
+    def _limit(self, account, when):
+        ca.write_usage_limit(ca.isolation_home(account), when, "测试写的")
+
+    def test_没记录的排在有记录的前面(self):
+        self._limit("default", datetime.datetime(2099, 1, 1))
+        self._limit("acct3", datetime.datetime(2098, 1, 1))
+        self.assertEqual(ca.accounts_by_availability("t")[0], "acct2")
+
+    def test_有记录的按恢复时间升序(self):
+        self._limit("default", datetime.datetime(2099, 1, 2))
+        self._limit("acct2", datetime.datetime(2099, 1, 1))
+        self._limit("acct3", datetime.datetime(2099, 1, 3))
+        self.assertEqual(ca.accounts_by_availability("t"), ["acct2", "default", "acct3"])
+
+    def test_全都没记录时按账号名_顺序必须确定(self):
+        # 不写第二键的话，顺序跟着 account_choices 的扫描顺序漂，
+        # 同一个输入在两台机器上给出两种结果。
+        self.assertEqual(ca.accounts_by_availability("t"), ["acct2", "acct3", "default"])
+
+    def test_已存在的任务名_它的账号排最前(self):
+        # 即使那个账号有一条最晚的恢复记录，也照样排最前：沿用它的家。
+        # skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
+        # 传 [] 当场 ValueError（计划里那段代码粘进来就是这么红的）。
+        ca.write_meta(ca.isolation_home("acct3"), "t",
+                      ca.new_meta("t", "acct3", "/tmp", "high", ()))
+        self._limit("acct3", datetime.datetime(2099, 12, 31))
+        self.assertEqual(ca.accounts_by_availability("t")[0], "acct3")
+
+    def test_过期记录排在无记录之后_但语义仍然正确(self):
+        # **这条钉的是一个曾经写错的理由。** 排序不读当前时间，所以过期记录
+        # 不会「自动变成无记录」——它排进「恢复得早的那一批」，批内按先后排。
+        # 机制是对的，第一版 spec 说的「时间一过自然排到最前面」是错的。
+        self._limit("default", datetime.datetime(2000, 1, 1))   # 早就过期了
+        self._limit("acct3", datetime.datetime(2099, 1, 1))
+        got = ca.accounts_by_availability("t")
+        self.assertEqual(got, ["acct2", "default", "acct3"],
+                         "无记录的 acct2 仍排第一，过期的 default 排第二")
+
+    def test_没有登录态的账号不进候选(self):
+        # ensure_isolation 会因为缺登录态直接 reject 退出 2。不过滤的话，
+        # 一个账号缺登录态就会把整条 auto 命令打死，哪怕别的账号完全可用。
+        (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
+        self.assertNotIn("acct3", ca.accounts_by_availability("t"))
+
+    def test_有登录态的一个都不少(self):
+        # **本设计的核心约束。** 额度记录只排顺序，绝不把账号排除出候选。
+        for account in ("default", "acct2", "acct3"):
+            self._limit(account, datetime.datetime(2099, 1, 1))
+        self.assertEqual(sorted(ca.accounts_by_availability("t")),
+                         sorted(ca.account_choices()))
+
+
 class TestIsolation(_HomeSandbox):
     def setUp(self):
         super().setUp()
