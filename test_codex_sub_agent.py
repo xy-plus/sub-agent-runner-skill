@@ -1592,6 +1592,59 @@ class TestIsolation(_HomeSandbox):
         self.assertIn("登录", cm.exception.message)
 
 
+class TestOnDiskContract(_HomeSandbox):
+    """**改名的安全网。** 这三样写在盘上，改了就读不回来。
+
+    工具改名 `codex-sub-agent` → `sub-agent-runner`，但下面这三样**一字不动**：
+
+        ROUND_MARK       写在每一份日志里，`_ROUND_LINE` **整行**匹配它。
+                         改掉之后 `read_last_round` 在旧日志上找不到轮次起点，
+                         会把整份日志当成这一轮——前几轮的错误全算进来
+        INTERRUPT_MARK   同上，`_MARK_LINE` 整行匹配。改掉之后盘上已有的打断痕迹
+                         认不出，`interrupted` 退回 `failed`（代码里记着那个
+                         28k token 的坑），而且 `cmd_interrupt_and_resume` 那道
+                         「不发第二发 INT」的闸也一起失效
+        隔离目录名       260 份现存元数据的归属，改名会让那些任务从
+                         `status`/`resume`/`stop` 里全部消失
+
+    **一次全局 `sed 's/codex-sub-agent/sub-agent-runner/g'` 会同时踩中前两条。**
+    这条测试就是为了让那次 sed 当场变红。断言写**字面量**，不写
+    `ca.ROUND_MARK == ca.ROUND_MARK`——后者两边一起动，等于什么都没测。
+    """
+
+    def test_盘上契约的字面量一个都没改(self):
+        self.assertEqual(ca.ROUND_MARK, "===== codex-sub-agent ")
+        self.assertEqual(ca.INTERRUPT_MARK,
+                         "----- codex-sub-agent 本轮被 INT 打断，上下文保留，可 resume -----")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "default").name, ".codex-subagent")
+        self.assertEqual(ca.isolation_home(ca.CODEX, "acct2").name, ".codex-subagent-acct2")
+        self.assertEqual(ca.isolation_home(ca.DEEPSEEK, None).name, ".claude-subagent")
+
+    def test_旧日志的轮次边界和打断痕迹仍然认得出(self):
+        """比上一条强一格：钉的是「**盘上已有的那些字节**还读得回来」。
+
+        上一条只钉常量的值；这一条把一段**旧格式的日志原文**喂进去，
+        断言边界切得对、打断标记认得出。常量和解析器一起被改掉时，
+        上一条会红、这一条也会红；只改解析器时只有这一条红。
+        """
+        旧日志 = (
+            "===== codex-sub-agent run t 2026-09-19T10:00:00 =====\n"
+            "上一轮的输出\n"
+            "ERROR: 上一轮的错误\n"
+            "\n"
+            "===== codex-sub-agent resume t 2026-09-19T11:00:00 =====\n"
+            "本轮的输出\n"
+            "----- codex-sub-agent 本轮被 INT 打断，上下文保留，可 resume ----- [stop]\n")
+        q = pathlib.Path(tempfile.mkdtemp()) / "t.log"
+        q.write_text(旧日志)
+        本轮 = ca.read_last_round(q)
+        self.assertIn("本轮的输出", 本轮)
+        self.assertNotIn("上一轮的错误", 本轮, "轮次边界认不出了——前几轮的错误全算进这一轮")
+        self.assertTrue(ca.has_interrupt_mark(本轮),
+                        "打断痕迹认不出了——interrupted 会退回 failed")
+
+
+
 class TestRunnerAxis(_HomeSandbox):
     """runner 是一条**新的轴**：换 runner 连隔离机制、工作目录怎么传、报告怎么拿、
     有没有账号都不一样。这条轴的全部结构性后果都钉在这里。
