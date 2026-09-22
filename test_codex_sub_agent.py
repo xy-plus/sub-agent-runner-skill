@@ -840,6 +840,27 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
 
+    def test_只是提到额度字样_不算撞上限(self):
+        """**这条钉的是整个额度判据的地基，而它之前一条测试都没有。**
+
+        2026-09-22 实测突变：把 `hit_usage_limit(errors)` 改回
+        `USAGE_LIMIT_MARK in round_text`，**全套 313 条照样全绿**。
+        原因是模块头第 5/6 条那个形状：既有那条钉优先级的测试喂的是
+        「额度字样 + 打断标记」，而打断分支排最前，**短路把断言吃掉了**。
+
+        所以这里喂的是一行**不以 `ERROR:` 开头**、只是提到该字样的文本，
+        而且是真实现场的形状：codex 带行号 `cat` 出了含这个字面串的源码行。
+        它进不了 `runtime_error_lines()`，就不该被判成额度问题。
+        """
+        污染 = "    47  ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. …'"
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行，那它本来就该算数")
+        v = self._judge(污染 + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+        self.assertNotIn("额度", v.reason,
+                         "判据在拿整轮裸文本做子串匹配——brief 回显、源码引用都会命中")
+
     def test_打断标记优先于额度字样(self):
         # 打断标记是本工具自己写的，是关于「我们做了什么」的不可伪造证据；
         # 额度字样可以来自 brief 回显、codex 读文件的回显、子进程输出。
@@ -3063,6 +3084,30 @@ class TestAutoAccountPick(_HomeSandbox):
                          "没有别的账号可换时要说出来，不许含糊过去")
         self.assertNotRegex(self.printed, r"会先试 default",
                             "不许把「仍是它自己」印成一个像是换了号的句子")
+
+    def test_只是提到额度字样_不许记限流(self):
+        """**cmd_run 侧的同一条地基，同样一条测试都没有过。**
+
+        实测突变：把闸门改回 `USAGE_LIMIT_MARK in this_round.text`，
+        全套 313 条照样全绿。后果是给一个**健康账号**记上限流记录，
+        而「不做过期清理 + 纯按 reset_at 排序」会让它从此排到最后。
+        """
+        污染 = ("    47  fixture = 'You’ve hit your usage limit … "
+                "try again at Dec 31st, 2099 11:59 PM'")
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行")
+        # 这一轮**因为别的原因失败**，而日志里恰好回显了那句话——2026-09-22 的
+        # 真实现场就是这个形状（任务内容涉及额度处理，于是 brief 和源码都被回显）。
+        # 用 failed 而不是 success：闸门的前半是 `state == "failed"`，
+        # 成功的那一轮压根走不到额度判据，测不出这件事。
+        code = self._run(ca.AUTO, 污染 + "\n" + self.BROKEN)
+        self.assertEqual(code, ca.EXIT["failed"], "前提不成立：这一轮没有失败")
+        self.assertNotIn("额度", self.printed.split("报告 ")[0].split("t: failed")[-1],
+                         "failed 的理由不该是额度问题")
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "只是被回显进日志的一句话，不许变成这个账号的限流记录")
+        self.assertNotIn("撞上额度上限", self.printed,
+                         "闸门在拿整轮裸文本做子串匹配")
 
     def test_日志里的污染行不许变成恢复时间(self):
         """**C1 回归锁。** 2026-09-22 实测：`cmd_run` 拿整轮文本解析恢复时间，
