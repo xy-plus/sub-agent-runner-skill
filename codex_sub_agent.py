@@ -611,11 +611,16 @@ def write_usage_limit(home, reset_at, raw):
     **没有 `seen_at`**——唯一的读者是排序，排序只看 `reset_at`；
     没有消费者的字段一旦加进去就再也删不掉了。
 
-    **写不进去只提示、不抛。** 这条记录是优化不是前提：写失败最多让下次排序少
-    一条依据，而抛出去会把**正在进行的换号重试打断**——一次本来还能被下一个
-    账号救回来的任务就这么死了。吞在这里而不是留给调用方包 try：调用方每多
-    一个就要记得包一层，而「必须记得」正是这个工具存在的理由本身。
+    **写不进去只提示、不抛，并返回 `False`。** 这条记录是优化不是前提：写失败
+    最多让下次排账号顺序时少一条依据，而抛出去会把本轮的收尾整个打断。
+    吞在这里而不是留给调用方包 try：调用方每多一个就要记得包一层，
+    而「必须记得」正是这个工具存在的理由本身。
     吞掉但**出声**——静默失效是这个仓库反复在修的那类病。
+
+    **成败必须走返回值，光印一行不够。** 不返回的话调用方只能假定「写进去了」，
+    于是同一屏会出现两句矛盾的话——2026-09-22 实测：本函数印「限流记录写不进…」，
+    `cmd_run` 紧接着印「恢复时间 09-25 17:04 已记下」。约束做进签名，
+    调用方就说不错；做在注释里，下一个人照样会假定成功。
     """
     tmp = _usage_limit_tmp(home, os.getpid())
     try:
@@ -625,6 +630,8 @@ def write_usage_limit(home, reset_at, raw):
     except OSError as e:
         print(f"[codex-sub-agent] 提示：限流记录写不进 {usage_limit_path(home)}（{e}）。"
               f"不影响本轮，只是下次排账号顺序时少一条依据。")
+        return False
+    return True
 
 
 def read_usage_limit(home):
@@ -1855,11 +1862,14 @@ def cmd_run(args):
         # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
         # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
         reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
+        # 三路分叉，**不许把第三路并进第二路**：写失败时说「已记下」，
+        # 和 write_usage_limit 自己刚印的那行「写不进…」在同一屏上自相矛盾。
         if reset is None:
             record_note = "日志里没有恢复时间可记（现网确有这种形态）"
-        else:
-            write_usage_limit(home, *reset)       # 写失败它自己吞掉并出声
+        elif write_usage_limit(home, *reset):     # 写失败它自己吞掉并出声
             record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
+        else:
+            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 没能记下（原因见上一行）"
         # 下一个账号**算出来，不写死**：记完这一笔之后重新排一次序，第一个就是
         # 下次会跑的那个。说「下次 auto 会先试」而不是「重跑这条命令会换成」，
         # 因为后者在强制模式下是假话——重跑的还是 `--account` 指定的那一个。

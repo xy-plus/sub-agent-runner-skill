@@ -1259,9 +1259,19 @@ class TestUsageLimitFile(unittest.TestCase):
         """
         gone = self.home / "这个目录不存在"
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            ca.write_usage_limit(gone, datetime.datetime(2026, 9, 25, 17, 4), "raw")
-        self.assertIn("codex-sub-agent", out.getvalue(), "写不进去要说一声，不许静默失效")
+            成了 = ca.write_usage_limit(gone, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertFalse(成了, "写失败必须**告诉调用方**，不能只印一行就算完")
+        self.assertIn(str(ca.usage_limit_path(gone)), out.getvalue(),
+                      "出声要点名是哪个文件写不进去，不然人不知道去看哪儿")
         self.assertIsNone(ca.read_usage_limit(gone))
+
+    def test_写成功要返回True_否则调用方没法说真话(self):
+        # **返回值就是那道约束。** 不返回的话，调用方只能假定「写进去了」，
+        # 于是写失败时同一屏会出现两句矛盾的话（实测过：write_usage_limit 印
+        # 「写不进…」，紧接着 cmd_run 印「恢复时间 09-25 17:04 已记下」）。
+        成了 = ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 25, 17, 4), "raw")
+        self.assertTrue(成了)
+        self.assertIsNotNone(ca.read_usage_limit(self.home), "返回 True 就必须真的读得回来")
 
     def test_临时文件名带pid_两个并发写者不会互相污染(self):
         # **这条钉的是本文件和 write_meta 的关键区别。** usage_limit.json 是账号级的，
@@ -3155,14 +3165,28 @@ class TestAutoAccountPick(_HomeSandbox):
             ca.cmd_status(ca.build_parser().parse_args(["status"]))
         self.assertNotIn("还没有任何任务", printed["text"])
 
-    def test_限流记录写不进去_不影响本轮结论但要出声(self):
-        # 记录是优化不是前提。**让真的写入失败**（目标位置被一个目录占住），
-        # 不 mock write_usage_limit——那样测的是 mock 的行为，不是代码的。
+    def test_限流记录写不进去_不影响本轮结论_而且不许说已记下(self):
+        """记录是优化不是前提，但**不许假装记下了**。
+
+        原来这条断言的是 `assertIn("codex-sub-agent", printed)`——而本工具
+        **每一行输出都以它开头**，所以那是一条空测试（模块头总纲那条）。
+        它放过的正是这个 bug：`write_usage_limit` 印「写不进…」，
+        `cmd_run` 紧接着印「恢复时间 09-25 17:04 已记下」，同一屏两句矛盾。
+
+        **让真的写入失败**（目标位置被一个目录占住），不 mock write_usage_limit
+        ——那样测的是 mock 的行为，不是代码的。
+        """
         ca.ensure_isolation("acct2")
         ca.usage_limit_path(ca.isolation_home("acct2")).mkdir()
         code = self._run(ca.AUTO, self.LIMIT_LINE)
         self.assertEqual(code, ca.EXIT["failed"], "写盘失败不许改写本轮结论")
-        self.assertIn("codex-sub-agent", self.printed, "写不进去要出声，不许静默失效")
+        self.assertIn("写不进", self.printed, "写不进去要出声，不许静默失效")
+        结论行 = [l for l in self.printed.splitlines() if "撞上额度上限" in l]
+        self.assertEqual(len(结论行), 1, "前提不成立：没有结论行")
+        self.assertNotIn("已记下", 结论行[0], "没记下就不许说已记下")
+        self.assertIn("没能记下", 结论行[0], "要如实说这次没记下")
+        self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),
+                          "前提不成立：其实写进去了，这条测的就不是写失败")
 
     def test_brief里有额度字样又真被打断_退130且不写限流记录(self):
         # 打断标记是本工具自己写的，不可伪造（见 judge 里「打断排最前」）。
