@@ -841,6 +841,31 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "interrupted")
         self.assertIn("resume", v.reason)
 
+    def test_只是提到写锁字样_不算被写锁占住(self):
+        """和上一条同一个病，`THREAD_LOCK_MARK` 这一支之前是整轮裸子串匹配。
+
+        **现网数据：这个标记出现在 12 行里，已分类的错误行 0 行**——12 行全是
+        codex 带行号 cat 出本项目自己的源码和测试（`THREAD_LOCK_MARK = …`、
+        `ERR_FATAL = …`、`assertIn("already has an active writer", …)`）。
+        裸子串匹配在真实语料上是 12/12 全假阳。
+
+        后果不只是「解释错了」：写锁那句 reason 的处置是**「只能新起一个任务」**
+        ——让人把一个其实只是没产出报告的任务整个丢掉重来。
+
+        真的写锁错误是 `Error: …` 开头（见 `ERR_FATAL`），本来就进
+        `runtime_error_lines()`，所以收窄是安全的。
+        """
+        污染 = '        141\tTHREAD_LOCK_MARK = "already has an active writer"'
+        self.assertEqual(ca.runtime_error_lines(污染), [],
+                         "前提不成立：这行被分类成了错误行")
+        v = self._judge(污染 + "\n")
+        self.assertEqual(v.state, "failed")
+        self.assertIn("没正常收尾", v.reason)
+        self.assertNotIn("写锁", v.reason, "判据在拿整轮裸文本做子串匹配")
+        # 真的写锁错误仍然要认出来，否则这条就只是把功能删了
+        self.assertIn("写锁", self._judge(ERR_FATAL + "\n").reason,
+                      "收窄过头了：真的写锁错误也不认了")
+
     def test_只是提到额度字样_不算撞上限(self):
         """**这条钉的是整个额度判据的地基，而它之前一条测试都没有。**
 
@@ -1180,8 +1205,10 @@ class TestUsageLimitReset(unittest.TestCase):
         self.assertIsNone(ca.usage_limit_reset([], now=self.NOW))
 
     def test_命中了但那一行没有时间_返回None(self):
-        # 现网确有这种形态（`hit your usage limit` 后面什么都没有）。
-        # **不许退回去扫别的行**：那就又是「从别处捡一个时间」。
+        # 命中了额度字样但那一行没有时间。这个形状现网见得到（2 行），但那 2 行
+        # 是**污染不是形态**——出自本项目自己的日志，codex 把报告正文引了进来；
+        # OpenAI 的两种真消息都带时间。来源不影响这里该怎么做：
+        # **不许退回去扫别的行**，那就又是「从别处捡一个时间」。
         lines = ["ERROR: You’ve hit your usage limit",
                  "Error: 顺便提一句 try again at Dec 31st, 2099 11:59 PM"]
         self.assertIsNone(ca.usage_limit_reset(lines, now=self.NOW))
@@ -3001,7 +3028,8 @@ class TestAutoAccountPick(_HomeSandbox):
     LIMIT_LINE = ("ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
                   "settings/usage to purchase more credits or try again at "
                   "Sep 25th, 2026 5:04 PM.\n")
-    NO_TIME = "ERROR: You’ve hit your usage limit\n"      # 现网第三种形态
+    # 命中额度字样却没有时间的一行。现网见得到，但那是污染不是形态（见 spec 第三节）。
+    NO_TIME = "ERROR: You’ve hit your usage limit\n"
     BROKEN = "Error: 代码写错了\n"
     FINE = "一切正常\n"
     RESET_AT = datetime.datetime(2026, 9, 25, 17, 4)
@@ -3181,8 +3209,8 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertNotIn("2099", 结论行[0])
 
     def test_解析不出恢复时间_不落盘但要说清楚(self):
-        # 现网第三种形态（`hit your usage limit` 后面什么都没有）。
-        # 写一个假时间进去比不写坏得多：它会让这个账号被错误地排到后面。
+        # 命中了额度字样、那一行却没有时间。写一个假时间进去比不写坏得多：
+        # 排序永不过期，一个编出来的未来时间会让这个账号从此排到最后。
         code = self._run(ca.AUTO, self.NO_TIME)
         self.assertEqual(code, ca.EXIT["failed"])
         self.assertIsNone(ca.read_usage_limit(ca.isolation_home("acct2")),

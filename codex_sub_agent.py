@@ -565,8 +565,10 @@ def usage_limit_reset(error_lines, now):
 
     **逐行试，取第一条解析得出的**，不把几行拼起来再 `search`——拼起来就又回到
     「在一个大块文本里捡第一个匹配」，正是这个函数要消灭的东西。
-    命中了额度字样但那一行没有时间（现网确有这种形态），就**到此为止返回 None**，
-    绝不退回去扫别的行：那又是从别处捡一个时间。
+    命中了额度字样但那一行**没有时间**，就到此为止返回 `None`，绝不退回去扫别的行：
+    那又是从别处捡一个时间。这个形状现网见得到（2 行），但**它们是污染不是形态**
+    ——全部出自本项目自己的日志，codex 把报告正文引了进来。OpenAI 的两种真消息
+    都带时间。不管来源如何这条路都得有个落点，而落点是 `None` 不是「扫下一行」。
     """
     for line in error_lines:
         if USAGE_LIMIT_MARK not in line:
@@ -788,7 +790,13 @@ def judge(round):
                            "本轮被 INT 打断，上下文保留——接着 resume 即可，不用重跑", errors)
         if hit_usage_limit(errors):
             return Verdict("failed", "撞上账号额度上限，换账号或等额度恢复", errors)
-        if THREAD_LOCK_MARK in round_text:
+        # 和上面那条同一条规矩：**看已分类的错误行，不看整轮裸文本**。
+        # 现网实测：这个标记出现在 12 行里，已分类的错误行 **0 行**——12 行全是
+        # codex 带行号 cat 出本项目自己的源码和测试。裸子串匹配在真实语料上
+        # 是 12/12 全假阳，而这一支的处置是「只能新起一个任务」，
+        # 假阳会让人把一个其实只是没产出报告的任务整个丢掉重来。
+        # 真的写锁错误是 `Error: …` 开头（形式 C，一律致命），本来就在 errors 里。
+        if any(THREAD_LOCK_MARK in line for line in errors):
             return Verdict("failed",
                            "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
                            errors)
@@ -1890,7 +1898,7 @@ def cmd_run(args):
         # 三路分叉，**不许把第三路并进第二路**：写失败时说「已记下」，
         # 和 write_usage_limit 自己刚印的那行「写不进…」在同一屏上自相矛盾。
         if reset is None:
-            record_note = "日志里没有恢复时间可记（现网确有这种形态）"
+            record_note = "这一行里没有恢复时间可记"
         elif write_usage_limit(home, *reset):     # 写失败它自己吞掉并出声
             record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
         else:
