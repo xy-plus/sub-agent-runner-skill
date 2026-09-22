@@ -20,6 +20,9 @@
 - 测试数**只增不减**（当前 250）
 - 提交时**不要传** `-c user.email` / `-c user.name`，也不要设 `GIT_AUTHOR_*` / `GIT_COMMITTER_*`
 - 每个新函数都要有中文 docstring 说明**为什么这么做**，不只是做了什么（沿用本文件既有风格）
+- **凡需要 HOME 沙箱的测试类一律继承 `_HomeSandbox`，不许手写第二份。** 它同时 patch `Path.home()` 和 `$HOME`，两条缺一不可——手写的那份必然漏掉 `$HOME` 那条，而漏掉之后测试**不会红**，只是悄悄读写**真实**的 `~/.codex-subagent`，把开发机上真实的任务元数据当成被测数据（理由见该类 docstring）
+- patch 一律写 `mock.patch`（文件顶部是 `from unittest import mock`，现有 99 处都这么写），不写 `mock.patch`
+- 临时目录用 `pathlib.Path(tempfile.mkdtemp())`，**不加 rmtree 清理**——本文件现有 8 处都这样，不引入 `shutil`
 
 ---
 
@@ -212,7 +215,7 @@ class TestParseResetTime(unittest.TestCase):
         self.assertIsNone(ca.parse_reset_time("try again at Sep 25th, 2026 5:04 PM")[0].tzinfo)
 ```
 
-文件顶部若还没 `import datetime`，加上。
+文件顶部**只差 `datetime`**（`tempfile`/`json`/`os`/`mock` 都已有），把它加进 import 块。
 
 - [ ] **Step 2: 跑测试确认它失败**
 
@@ -265,7 +268,7 @@ def parse_reset_time(text):
         return None
 ```
 
-`codex_sub_agent.py` 顶部若还没 `import datetime`，加上。
+`codex_sub_agent.py` 顶部**已经有 `import datetime`**（第 9 行），不用加。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -314,8 +317,8 @@ git commit -m "feat: 解析额度上限消息里的恢复时间
 ```python
 class TestUsageLimitFile(unittest.TestCase):
     def setUp(self):
+        # 纯文件操作，不碰 HOME——`_HomeSandbox` 的 docstring 说了「纯函数测试不要它」
         self.home = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
 
     def test_写了能读回来(self):
         when = datetime.datetime(2026, 9, 25, 17, 4)
@@ -360,12 +363,13 @@ class TestUsageLimitFile(unittest.TestCase):
         def spy(src, dst):
             seen.append(json.loads(pathlib.Path(dst).read_text())["raw"])
             return real_replace(src, dst)
-        with unittest.mock.patch("os.replace", spy):
+        # patch 模块自己的 os，别 patch 全局的——全局的会波及 unittest 内部
+        with mock.patch.object(ca.os, "replace", spy):
             ca.write_usage_limit(self.home, datetime.datetime(2026, 9, 26, 17, 47), "新")
         self.assertEqual(seen, ["旧"], "替换发生前目标文件必须还是完整的旧内容")
 ```
 
-文件顶部若还没 `import tempfile, shutil, json, os, unittest.mock`，加上。
+文件顶部已有 `tempfile` / `json` / `os` / `mock`，**只差 `datetime`**，把它加进 import 块（按字母序排在 `contextlib` 后面）。
 
 - [ ] **Step 2: 跑测试确认它失败**
 
@@ -473,15 +477,13 @@ git commit -m "feat: usage_limit.json —— 每个隔离目录记一条恢复�
 测试：
 
 ```python
+class TestAccountChoicesGuards(_HomeSandbox):
     def test_账号目录叫auto要拒跑(self):
         # auto 是 --account 的保留字。真账号也叫 auto，那个参数就有两种含义了。
-        d = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
-        (d / ".codex-accounts" / "auto").mkdir(parents=True)
-        with unittest.mock.patch.object(pathlib.Path, "home", lambda: d):
-            with self.assertRaises(ca.Rejected) as got:
-                ca.account_choices()
-        self.assertIn("auto", str(got.exception.message))
+        (self.home / ".codex-accounts" / "auto").mkdir(parents=True)
+        with self.assertRaises(ca.Rejected) as got:
+            ca.account_choices()
+        self.assertIn("auto", got.exception.message)
 ```
 
 实现——在 `account_choices()` 里那个 `for name in extra:` 循环体内，坏字符检查之后加：
@@ -496,19 +498,15 @@ git commit -m "feat: usage_limit.json —— 每个隔离目录记一条恢复�
 - [ ] **Step 2: 写排序的失败测试**
 
 ```python
-class TestAccountOrder(unittest.TestCase):
+class TestAccountOrder(_HomeSandbox):
     """排序只影响**先试谁**，不影响**试不试**。所以这里的每条断言都是关于顺序的，
     没有一条是关于「某个账号被排除了」——那种事在本设计里不存在。
     """
 
     def setUp(self):
-        self.root = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        super().setUp()      # HOME 沙箱：Path.home() 和 $HOME 两条都 patch 掉
         for name in ("acct2", "acct3"):
-            (self.root / ".codex-accounts" / name).mkdir(parents=True)
-        patcher = unittest.mock.patch.object(pathlib.Path, "home", lambda: self.root)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+            (self.home / ".codex-accounts" / name).mkdir(parents=True)
         for account in ("default", "acct2", "acct3"):
             (ca.isolation_home(account) / "tasks").mkdir(parents=True)
 
@@ -630,29 +628,24 @@ git commit -m "feat: 按恢复时间给账号排序，并给 account_choices 加
 - [ ] **Step 1: 写失败的测试**
 
 ```python
-class TestRunRetry(unittest.TestCase):
+class TestRunRetry(_HomeSandbox):
     """全部用假的 `run_codex` —— 真跑 codex 既慢又要花钱，而这里要测的是
     **循环的控制流**，不是 codex 本身。
     """
 
     def setUp(self):
-        self.root = pathlib.Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        super().setUp()      # 基类已经建好 ~/.codex/auth.json（default 账号的登录态）
         for name in ("acct2", "acct3"):
-            (self.root / ".codex-accounts" / name).mkdir(parents=True)
-            (self.root / ".codex-accounts" / name / "auth.json").write_text("{}")
-        (self.root / ".codex").mkdir()
-        (self.root / ".codex" / "auth.json").write_text("{}")
-        (self.root / "work").mkdir()
-        self.brief = self.root / "brief.md"
+            d = self.home / ".codex-accounts" / name
+            d.mkdir(parents=True)
+            (d / "auth.json").write_text("{}")
+        (self.home / "work").mkdir()
+        self.brief = self.home / "brief.md"
         self.brief.write_text("干活\n")
-        patcher = unittest.mock.patch.object(pathlib.Path, "home", lambda: self.root)
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.tried = []
 
     def _args(self, account):
-        return argparse.Namespace(task="t", dir=str(self.root / "work"),
+        return argparse.Namespace(task="t", dir=str(self.home / "work"),
                                   brief=str(self.brief), effort="high",
                                   account=account, skills=[])
 
@@ -676,7 +669,7 @@ class TestRunRetry(unittest.TestCase):
     def test_第一个撞上限就换下一个(self):
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.FINE,
                                "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake):
+        with mock.patch.object(ca, "run_codex", fake):
             code = ca.cmd_run(self._args(ca.AUTO))
         self.assertEqual(self.tried[:2], ["acct2", "acct3"])
         self.assertEqual(code, ca.EXIT["success"])
@@ -686,7 +679,7 @@ class TestRunRetry(unittest.TestCase):
         # 不变量：一个任务名在任何时刻只属于一个隔离目录。
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.FINE,
                                "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake):
+        with mock.patch.object(ca, "run_codex", fake):
             ca.cmd_run(self._args(ca.AUTO))
         self.assertFalse(ca.meta_path(ca.isolation_home("acct2"), "t").exists())
         self.assertTrue(ca.meta_path(ca.isolation_home("acct3"), "t").exists())
@@ -694,7 +687,7 @@ class TestRunRetry(unittest.TestCase):
     def test_撞上限要把恢复时间记下来(self):
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.FINE,
                                "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake):
+        with mock.patch.object(ca, "run_codex", fake):
             ca.cmd_run(self._args(ca.AUTO))
         self.assertEqual(ca.read_usage_limit(ca.isolation_home("acct2")),
                          datetime.datetime(2026, 9, 25, 17, 4))
@@ -702,8 +695,8 @@ class TestRunRetry(unittest.TestCase):
     def test_全撞上限_退出码是failed且逐个列出恢复时间(self):
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.LIMIT_ACCT3,
                                "default": self.LIMIT_ACCT3})
-        with unittest.mock.patch.object(ca, "run_codex", fake), \
-             unittest.mock.patch("sys.stdout", io.StringIO()) as out:
+        with mock.patch.object(ca, "run_codex", fake), \
+             mock.patch("sys.stdout", io.StringIO()) as out:
             code = ca.cmd_run(self._args(ca.AUTO))
         self.assertEqual(code, ca.EXIT["failed"])
         printed = out.getvalue()
@@ -714,8 +707,8 @@ class TestRunRetry(unittest.TestCase):
     def test_尝试次数上界是账号数(self):
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.LIMIT_ACCT3,
                                "default": self.LIMIT_ACCT3})
-        with unittest.mock.patch.object(ca, "run_codex", fake), \
-             unittest.mock.patch("sys.stdout", io.StringIO()):
+        with mock.patch.object(ca, "run_codex", fake), \
+             mock.patch("sys.stdout", io.StringIO()):
             ca.cmd_run(self._args(ca.AUTO))
         self.assertEqual(len(self.tried), len(ca.account_choices()))
 
@@ -723,16 +716,16 @@ class TestRunRetry(unittest.TestCase):
         # 换号救不了「代码写错了」这种失败，白烧一轮。只有额度问题才换。
         fake = self._fake_run({"acct2": "ERROR: something broke", "acct3": self.FINE,
                                "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake), \
-             unittest.mock.patch("sys.stdout", io.StringIO()):
+        with mock.patch.object(ca, "run_codex", fake), \
+             mock.patch("sys.stdout", io.StringIO()):
             ca.cmd_run(self._args(ca.AUTO))
         self.assertEqual(self.tried, ["acct2"])
 
     def test_指定账号撞上限_记录但不重试(self):
         fake = self._fake_run({"acct2": self.LIMIT_ACCT2, "acct3": self.FINE,
                                "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake), \
-             unittest.mock.patch("sys.stdout", io.StringIO()):
+        with mock.patch.object(ca, "run_codex", fake), \
+             mock.patch("sys.stdout", io.StringIO()):
             code = ca.cmd_run(self._args("acct2"))
         self.assertEqual(self.tried, ["acct2"], "强制模式不许换号")
         self.assertEqual(code, ca.EXIT["failed"])
@@ -742,14 +735,14 @@ class TestRunRetry(unittest.TestCase):
 
     def test_成功那一轮的账号里留着元数据(self):
         fake = self._fake_run({"acct2": self.FINE, "acct3": self.FINE, "default": self.FINE})
-        with unittest.mock.patch.object(ca, "run_codex", fake), \
-             unittest.mock.patch("sys.stdout", io.StringIO()):
+        with mock.patch.object(ca, "run_codex", fake), \
+             mock.patch("sys.stdout", io.StringIO()):
             ca.cmd_run(self._args(ca.AUTO))
         homes = [h for h, _ in ca.all_metas()]
         self.assertEqual(len(homes), 1, "一个任务名只能住一个隔离目录")
 ```
 
-文件顶部若还没 `import argparse, io`，加上。
+`argparse` 和 `io` 测试文件顶部**都已经有了**，不用加。
 
 - [ ] **Step 2: 跑测试确认它失败**
 
