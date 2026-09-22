@@ -2231,6 +2231,171 @@ class TestDeepseekTaskIsReachable(_HomeSandbox):
         self.assertEqual(codex_row.split()[1], "codex:acct2")
 
 
+@contextlib.contextmanager
+def _fake_agent_proc(output):
+    """把 spawn 换成一个吐出 `output` 然后 EOF 的假进程，yield 出 `Popen` 的 mock。
+
+    和 `_no_codex()` 的区别是**它真的吐字节**：`_no_codex` 立刻 EOF，测不到
+    tee、过滤、收尾这一整条链。patch 的仍然是 `subprocess.Popen` 而不是
+    `run_codex`——要验的行为（落元数据、清报告、写分隔符、tee、收尾、还原信号）
+    全都住在 `run_codex` 里，把它整个 mock 掉就什么都没测。
+    """
+    with mock.patch.object(ca.subprocess, "Popen") as popen:
+        proc = popen.return_value
+        proc.stdout = io.BytesIO(output)
+        proc.wait.return_value = 0
+        proc.pid = 4242
+        yield popen
+
+
+class TestDeepseekWiring(_HomeSandbox):
+    """**接线**：假 `Popen` 驱动**真实** `run_codex`，断言的是产物不是「函数被调用了」。
+
+    这个类存在的理由是一次真实的失败：plan v2 定义了五个新函数、写了 31 条测试、
+    全绿，而照着它搭出的参考实现里那五个函数**一个调用点都没有**——
+    一个「永不写报告、永不滤日志、**完全没有隔离**」的 deepseek runner 照样能让
+    那 31 条全绿。**定义了函数不等于接上了线。**
+    """
+
+    THINK = '{"type":"system","subtype":"thinking_tokens","n":1}'
+    INIT = '{"type":"system","subtype":"init","cwd":"/x"}'
+    OK = ('{"type":"result","subtype":"success","is_error":false,'
+          '"result":"干完了","permission_denials":[]}')
+    INT = ('{"type":"result","subtype":"error_during_execution","is_error":true,'
+           '"result":"","permission_denials":[]}')
+    DENIED = ('{"type":"result","subtype":"success","is_error":false,"result":"我写不进去",'
+              '"permission_denials":[{"tool_name":"Write"},{"tool_name":"Bash"}]}')
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+
+    def _run(self, events, runner=None, trailing=b""):
+        runner = ca.DEEPSEEK if runner is None else runner
+        account = None if runner == ca.DEEPSEEK else "default"
+        d = ca.ensure_isolation(runner, account)
+        meta = ca.new_meta("t", runner, account, str(self.workdir), "max", ())
+        output = ("\n".join(events) + "\n").encode() + trailing
+        with _fake_agent_proc(output) as popen, \
+             mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
+            round_ = ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+        return d, meta, popen, round_
+
+    # ── ① 隔离真的接上了 ────────────────────────────────────────────
+    def test_交给子进程的env里有CLAUDE_CONFIG_DIR(self):
+        # 不接上 deepseek_env，DeepSeek 子代理就**完全没有隔离**：
+        # 它看得见整台机器上所有的 skill/MCP/hook，spec 的隔离承诺当场是空的。
+        d, _, popen, _ = self._run([self.INIT, self.OK])
+        env = popen.call_args.kwargs["env"]
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(d))
+        self.assertNotIn("CODEX_HOME", env)
+
+    def test_交给子进程的env里一个模型变量都没有(self):
+        # claude-deepseek 见到「别处在定模型」就退 2，而用户的场景正是
+        # 「我现在正在用原生的 Claude Code」——那一刻 ANTHROPIC_MODEL 就是 claude-*。
+        with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5",
+                                          "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku"}):
+            _, _, popen, _ = self._run([self.OK])
+        leaked = [k for k in popen.call_args.kwargs["env"]
+                  if re.match(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$", k)]
+        self.assertEqual(leaked, [], f"这些会让 claude-deepseek 当场退 2：{leaked}")
+
+    # ── ② 工作目录真的接上了 ────────────────────────────────────────
+    def test_工作目录走cwd_产物才落在dir里(self):
+        # claude -p 没有 --cd 等价物。不传 cwd，子代理就在包装器的 cwd 里干活，
+        # 而元数据说的是 --dir——元数据说谎。
+        _, meta, popen, _ = self._run([self.OK])
+        self.assertEqual(popen.call_args.kwargs["cwd"], meta["dir"])
+
+    def test_codex那侧也传cwd_两侧都传少一个分支(self):
+        _, meta, popen, _ = self._run([self.OK], runner=ca.CODEX)
+        self.assertEqual(popen.call_args.kwargs["cwd"], meta["dir"])
+
+    # ── ③④ 日志过滤真的接上了 ──────────────────────────────────────
+    def test_日志开头写明滤过_thinking_tokens不在日志里(self):
+        d, _, _, _ = self._run([self.INIT, self.THINK, self.THINK, self.OK])
+        log = ca._log_path(d, "t").read_text()
+        self.assertIn(ca.DEEPSEEK_LOG_NOTE.strip(), log, "没写滤除说明＝读日志的人不知道少了东西")
+        # 只看**事件行**（以 { 开头的那些）：滤除说明自己也含 thinking_tokens 这个词，
+        # 裸 assertNotIn 会被它挡住，于是「过滤没接上」这条永远测不到。
+        事件行 = [l for l in log.splitlines() if l.startswith("{")]
+        self.assertEqual([l for l in 事件行 if "thinking_tokens" in l], [], "过滤没接上")
+        self.assertEqual(事件行, [self.INIT, self.OK], "只该滤 thinking_tokens，别的一个不动")
+
+    def test_尾部残片留在日志里_它是被杀在半路的现场证据(self):
+        d, _, _, _ = self._run([self.INIT, self.OK], trailing=b'{"type":"system","subty')
+        self.assertIn('{"type":"system","subty', ca._log_path(d, "t").read_text())
+
+    def test_codex那条tee路径一个字节没改_同样的行原样留着(self):
+        # **反向护栏。** codex 的分块读是承重的（banner 只有 ~170 字节，之后可能
+        # 思考几十分钟，按行读会把 session id 卡在缓冲里）。喂同一行进去，
+        # codex 的日志里它必须原样在。
+        d, _, _, _ = self._run([self.INIT, self.THINK, self.OK], runner=ca.CODEX)
+        log = ca._log_path(d, "t").read_text()
+        self.assertIn("thinking_tokens", log, "codex 那侧被误接上过滤了")
+        self.assertNotIn(ca.DEEPSEEK_LOG_NOTE.strip(), log, "codex 的日志里不该有这句")
+
+    # ── ⑤ 收尾真的接上了 ───────────────────────────────────────────
+    def test_success才写报告_judge给success(self):
+        d, _, _, round_ = self._run([self.INIT, self.OK])
+        self.assertEqual(ca._report_path(d, "t").read_text(), "干完了")
+        self.assertEqual(ca.judge(round_).state, "success")
+
+    def test_被打断不写报告_judge给failed而不是假success(self):
+        d, _, _, round_ = self._run([self.INIT, self.INT])
+        self.assertFalse(ca._report_path(d, "t").exists())
+        self.assertEqual(ca.judge(round_).state, "failed")
+        self.assertTrue(any("error_during_execution" in l for l in ca.judge(round_).detail),
+                        "失败时 detail 是空的＝调用方拿不到任何线索")
+
+    def test_打断标记在日志里时judge给interrupted(self):
+        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
+        output = ("\n".join([self.INIT, self.INT]) + "\n").encode()
+        with _fake_agent_proc(output) as popen, \
+             mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
+            # 打断标记由 interrupt_codex 写进日志，这里模拟它已经落过盘
+            def 先留痕(*a, **kw):
+                ca.interrupt_codex(4242, ca._log_path(d, "t"), "stop")
+                return popen.return_value
+            popen.side_effect = 先留痕
+            with mock.patch.object(ca.os, "kill"):
+                round_ = ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+        self.assertEqual(ca.judge(round_).state, "interrupted")
+        self.assertEqual(ca.EXIT[ca.judge(round_).state], 130)
+
+    # ── ⑥ 权限受阻真的变红 ─────────────────────────────────────────
+    def test_工具被拒时日志有ERROR行_而且judge看得见(self):
+        # **ERROR 行必须落在本轮边界之内**，否则补了等于没补。
+        d, _, _, round_ = self._run([self.INIT, self.DENIED])
+        self.assertTrue(ca._report_path(d, "t").exists(), "它确实收尾了，报告该在")
+        self.assertIn("ERROR: ", ca._log_path(d, "t").read_text())
+        self.assertIn("ERROR: ", round_.text, "补的行落在本轮边界之外，judge 看不见")
+        v = ca.judge(round_)
+        self.assertEqual(v.state, "suspect")
+        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertIn("Write", "".join(v.detail))
+
+    def test_一切正常时日志里不许多出ERROR行(self):
+        d, _, _, round_ = self._run([self.INIT, self.OK])
+        self.assertNotIn("ERROR: ", ca._log_path(d, "t").read_text())
+        self.assertEqual(ca.judge(round_).state, "success")
+
+    # ── 两侧共有的那几件事一件没丢 ─────────────────────────────────
+    def test_元数据落盘_分隔符写了_报告清过(self):
+        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        ca._report_path(d, "t").write_text("上一轮的旧报告")
+        meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
+        with _fake_agent_proc(("\n".join([self.INT]) + "\n").encode()), \
+             mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
+            ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+        self.assertTrue(ca.meta_path(d, "t").exists())
+        self.assertTrue(ca._log_path(d, "t").read_text().startswith(ca.ROUND_MARK))
+        self.assertFalse(ca._report_path(d, "t").exists(),
+                         "旧报告没被清掉——一次失败的运行会被判成 success")
+
+
 class TestFixedArgs(unittest.TestCase):
     """两条命令都必须带上的固定参数。
 

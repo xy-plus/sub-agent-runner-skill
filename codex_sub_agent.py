@@ -1282,6 +1282,14 @@ def build_deepseek_resume_argv(effort, session_id, brief):
     return _deepseek_base_argv(effort) + ["--resume", session_id, brief]
 
 
+# 写在每一轮日志的分隔符之后。**读日志的人有权知道这份日志被动过。**
+# 不带工具名（那会跟着改名走，而这行是写进盘上日志的），也不以 ROUND_MARK 开头
+# （`_ROUND_LINE` 整行匹配 `===== codex-sub-agent <三段> =====`，这行匹配不上，
+# 所以它不会被误当成轮次边界）。
+DEEPSEEK_LOG_NOTE = ("===== 以下已滤掉 claude 的 thinking_tokens 进度事件"
+                     "（每 token 一条，实测约 58 KB/s）；其余事件一字未改 =====\n")
+
+
 def keep_deepseek_line(line):
     """这一行要不要进日志。**只滤 `thinking_tokens`，别的一个不动。**
 
@@ -1941,9 +1949,14 @@ def run_codex(kind, home, task, meta, make_argv):
     # 校验排在 write_meta／clear_report／spawn **全部之前**：任何一件先发生，
     # 失败就会留下半个状态（元数据落了盘、上一轮报告被删掉，而 codex 没起来）。
     _require_enum(kind, _KINDS, "kind")
+    runner = meta["runner"]
     report = _report_path(home, task)
     argv = make_argv(str(report))
-    env = codex_env(home)
+    # **隔离在这里接上，别处没有第二个入口。** 漏接的后果不对称：codex 那侧
+    # 没有 CODEX_HOME 只是用错配置目录，deepseek 那侧没有 CLAUDE_CONFIG_DIR
+    # 就是**完全没有隔离**——子代理看得见整台机器上所有的 skill/MCP/hook，
+    # 本工具的核心承诺当场是空的。
+    env = codex_env(home) if runner == CODEX else deepseek_env(home)
 
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
     # 不会留下一个没人管的孤儿进程。
@@ -2017,8 +2030,14 @@ def run_codex(kind, home, task, meta, make_argv):
         if log.tell() > 0:
             log.write(b"\n")
         log.write((round_separator(kind, task, _now_iso()) + "\n").encode())
+        if runner == DEEPSEEK:
+            # **读日志的人有权知道这份日志被动过。** 过滤是承重的（不滤 30 分钟
+            # 的任务约 104 MB，而判据要扫日志），但「少了东西」必须看得见。
+            # 写在 start_offset **之前**：它是关于这份日志的话，不是本轮的产物，
+            # 不该进 judge 看的那段文本。
+            log.write(DEEPSEEK_LOG_NOTE.encode())
         log.flush()
-        # 本轮的起点：分隔符之后的第一个字节。
+        # 本轮的起点：分隔符（deepseek 还有那行滤除说明）之后的第一个字节。
         # O_APPEND 下每次 write 都是「原子地跳到末尾再写」，所以即使别的进程
         # 正往同一个日志追加（留痕、另一轮的分隔符），这个位置依然精确指向
         # **我们自己刚写的那行之后**——拥有者的边界由此成为事实而非推测。
@@ -2033,7 +2052,13 @@ def run_codex(kind, home, task, meta, make_argv):
         # stdin 固定接 /dev/null：否则 codex 等 stdin 永久挂死（日志只剩
         # "Reading additional input from stdin" + 进程 0% CPU）。
         # 不设 timeout：会误杀正当的长任务。
-        proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+        #
+        # `cwd` **两侧都传**，少一个分支：codex 本来就有 `--cd`，多传无害；
+        # 而 `claude -p` **没有 `--cd` 等价物**（实测），不传它就在包装器的 cwd 里
+        # 干活——而元数据里写的是 `--dir`，元数据当场说谎。
+        # 传 `meta["dir"]` 而不是另收一个参数：那个字段就是这个任务的工作目录，
+        # 两条 resume 路上也是它（`check_can_resume` 已经验过它还在）。
+        proc = subprocess.Popen(argv, env=env, cwd=meta["dir"], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True)
 
@@ -2056,6 +2081,15 @@ def run_codex(kind, home, task, meta, make_argv):
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
+    # deepseek 的收尾：把本轮产物摆成 judge 认识的形状。
+    # **必须在回传 Round 之前**——补的 ERROR: 行要落在本轮边界之内，
+    # 否则 judge 看不见，等于没补。
+    # codex 那侧没有对应的一步：报告由 codex 自己写（`-o`），错误行本来就在它的
+    # 输出里。这条不对称是两个 agent 的输出形态造成的，不是设计选择。
+    if runner == DEEPSEEK:
+        finish_deepseek_round(read_round(_log_path(home, task), start_offset),
+                              report, _log_path(home, task))
+
     # 回传**报告路径 + 本轮日志文本**这一对，而不是偏移。
     # 偏移是可以被悄悄丢掉的：调用方忘了接，唯一还能拿到本轮文本的路就是
     # read_last_round——正好是这次要修的那个 bug。文本丢不掉，它就是 judge 的参数。
@@ -2066,6 +2100,14 @@ def run_codex(kind, home, task, meta, make_argv):
 
 
 def _tee_until_exit(proc, log, home, task, meta):
+    if meta["runner"] == DEEPSEEK:
+        # deepseek 走行模式：要按行滤掉 thinking_tokens（实测每 token 一条、
+        # 约 58 KB/s，一次审查的日志 12 MB），而分块读切不出行边界。
+        # session id 不用从输出里抠——它是我们自己铸的（见 new_meta），
+        # **绝不从输出里读回来核对**：那会把一个已知事实变成待验证的推测。
+        _tee_lines(proc, log)
+        return
+    # ↓↓↓ 以下是 codex 那一支，一个字节未改 ↓↓↓
     head, session_id = b"", None
     # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
@@ -2091,6 +2133,36 @@ def _tee_until_exit(proc, log, home, task, meta):
                 meta["session_id"] = session_id
                 write_meta(home, task, meta)
     proc.wait()
+
+
+def _tee_lines(proc, log):
+    """行模式 tee：滤掉 `thinking_tokens`，其余一字节不改地转发到屏幕和日志。
+
+    **只有 deepseek 走这里。** codex 那一支必须是分块读——它的 banner 只有
+    ~170 字节，之后可能思考几十分钟，按行读会把 session id 卡在缓冲里，
+    包装进程此时被杀这一轮就再也 resume 不回来。
+
+    残片（`buffer` 里还没收齐的那一段）在 EOF 后**原样写出**：进程被 SIGINT
+    杀掉时最后一行必然是残的（实测），那一片是「这一轮被杀在半路」的现场证据。
+    """
+    buffer = b""
+    for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+        buffer += chunk
+        lines, buffer = split_complete_lines(buffer)
+        for line in lines:
+            if keep_deepseek_line(line):
+                _write_both(log, line + b"\n")
+    if buffer:
+        _write_both(log, buffer)
+    proc.wait()
+
+
+def _write_both(log, data):
+    """同时写屏幕和日志，各自 flush。两个写者共用一条 fd 的规矩见 `main()`。"""
+    sys.stdout.buffer.write(data)
+    sys.stdout.buffer.flush()
+    log.write(data)
+    log.flush()
 
 
 # status 数据行的列序是**机器切分的契约**：前四列无空白，所以
