@@ -172,23 +172,30 @@ GONE_START = "1"
 # 当时还没装上，cmd_run 一路走到 spawn，真的起了 codex（沙箱 HOME 没登录态，
 # 秒退，没花钱——但那是运气，不是设计）。
 # 在这里插一次桩，之后漏包**当场喊出来**，而且不必每个作者记得任何事。
-# 只挡 argv[0] 恰好是 "codex" 的那一种：陪练进程（sleep、python 驱动、
-# 命名成 codex 的假二进制都走绝对路径）一个都不受影响。
-# 真机冒烟（要真起 codex 的那一类）不在本文件里；将来若要加，给它一条显式豁免
+# 只挡 argv[0] 恰好是 `codex` / `claude-deepseek` 的那一种：陪练进程（sleep、
+# python 驱动、命名成 codex 的假二进制都走绝对路径）一个都不受影响。
+# **`claude-deepseek` 是和 `codex` 同等重要的一条**，不是顺手加的：加了第二个
+# runner 之后，漏包一层 mock 的测试会真的把 DeepSeek 叫起来——花钱、发网络请求，
+# 而且 deepseek 侧的 argv 带着 `--dangerously-skip-permissions`，
+# 它会在测试的临时目录里真的动手写文件。
+# 真机冒烟（要真起 agent 的那一类）不在本文件里；将来若要加，给它一条显式豁免
 # 并在那里写清为什么。
 _REAL_POPEN_INIT = subprocess.Popen.__init__
+# 清单只有一个家。挡的是「argv[0] 恰好是这个名字」，所以它就是 runner 的
+# 可执行名清单——加第三个 runner 时这里必须跟着加，否则那条护栏对它是空的。
+_REAL_AGENT_BINS = ("codex", "claude-deepseek")
 
 
 def setUpModule():
-    """全套测试里没有任何一条允许把真的 codex 叫起来。"""
+    """全套测试里没有任何一条允许把真的 agent 叫起来。"""
     assert not pathlib.Path(f"/proc/{GONE_PID}").exists(), (
         f"前提不成立：/proc/{GONE_PID} 居然存在。换一个必定不存在的 pid，"
         f"否则一批「上一轮早停了」的测试会静默测到另一条分支上。")
 
-    def no_real_codex(self, args, *a, **kw):
+    def no_real_agent(self, args, *a, **kw):
         argv0 = args[0] if isinstance(args, (list, tuple)) else args
-        assert argv0 != "codex", (
-            f"这条测试把真的 codex 叫起来了：{args!r}。少包了一层 _no_codex。")
+        assert argv0 not in _REAL_AGENT_BINS, (
+            f"这条测试把真的 {argv0} 叫起来了：{args!r}。少包了一层 _no_codex。")
         return _REAL_POPEN_INIT(self, args, *a, **kw)
     # **它刻意不还原**（没有 tearDownModule，也没有 addModuleCleanup）：
     # 泄漏半径是**整个测试进程的余生**，同进程里后来 import 的任何模块调
@@ -197,7 +204,7 @@ def setUpModule():
     # **安全性唯一的地基是上面那行 `_REAL_POPEN_INIT` 在模块顶层、import 那一刻
     # 抓的**，所以插桩永远只有一层。实测 50 次 importlib.reload + setUpModule
     # 会叠成 RecursionError——真要多次 reload 本模块，先把这条前提想清楚。
-    subprocess.Popen.__init__ = no_real_codex
+    subprocess.Popen.__init__ = no_real_agent
 
 
 @contextlib.contextmanager
