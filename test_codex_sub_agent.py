@@ -1340,27 +1340,35 @@ class TestAccountOrder(_HomeSandbox):
     def test_没记录的排在有记录的前面(self):
         self._limit("default", datetime.datetime(2099, 1, 1))
         self._limit("acct3", datetime.datetime(2098, 1, 1))
-        self.assertEqual(ca.accounts_by_availability("t")[0], "acct2")
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2")
 
     def test_有记录的按恢复时间升序(self):
         self._limit("default", datetime.datetime(2099, 1, 2))
         self._limit("acct2", datetime.datetime(2099, 1, 1))
         self._limit("acct3", datetime.datetime(2099, 1, 3))
-        self.assertEqual(ca.accounts_by_availability("t"), ["acct2", "default", "acct3"])
+        self.assertEqual(ca.accounts_by_availability(), ["acct2", "default", "acct3"])
 
     def test_全都没记录时按账号名_顺序必须确定(self):
         # 不写第二键的话，顺序跟着 account_choices 的扫描顺序漂，
         # 同一个输入在两台机器上给出两种结果。
-        self.assertEqual(ca.accounts_by_availability("t"), ["acct2", "acct3", "default"])
+        self.assertEqual(ca.accounts_by_availability(), ["acct2", "acct3", "default"])
 
-    def test_已存在的任务名_它的账号排最前(self):
-        # 即使那个账号有一条最晚的恢复记录，也照样排最前：沿用它的家。
-        # skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
-        # 传 [] 当场 ValueError（计划里那段代码粘进来就是这么红的）。
+    def test_任务住在哪不影响顺序_否则限流的那个家会变成死循环(self):
+        """**这条钉的是一个被删掉的排序键。**
+
+        v3 有过「这个任务已经住在哪」这个第一键（住着的排最前，沿用它的家），
+        那是为**轮内重试**服务的：先试旧家，撞上限再搬走。v4 去掉重试之后
+        它变成陷阱——任务住的那个账号限流了也照样被选中，于是每次重跑都选它、
+        每次都撞上限，**永远换不掉**，而 auto 的全部意义就是换掉它。
+
+        skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
+        传 [] 当场 ValueError。
+        """
         ca.write_meta(ca.isolation_home("acct3"), "t",
                       ca.new_meta("t", "acct3", "/tmp", "high", ()))
         self._limit("acct3", datetime.datetime(2099, 12, 31))
-        self.assertEqual(ca.accounts_by_availability("t")[0], "acct3")
+        self.assertEqual(ca.accounts_by_availability()[0], "acct2",
+                         "任务住在 acct3 且 acct3 限流到 2099——它不许排第一")
 
     def test_过期记录排在无记录之后_但语义仍然正确(self):
         # **这条钉的是一个曾经写错的理由。** 排序不读当前时间，所以过期记录
@@ -1368,7 +1376,7 @@ class TestAccountOrder(_HomeSandbox):
         # 机制是对的，第一版 spec 说的「时间一过自然排到最前面」是错的。
         self._limit("default", datetime.datetime(2000, 1, 1))   # 早就过期了
         self._limit("acct3", datetime.datetime(2099, 1, 1))
-        got = ca.accounts_by_availability("t")
+        got = ca.accounts_by_availability()
         self.assertEqual(got, ["acct2", "default", "acct3"],
                          "无记录的 acct2 仍排第一，过期的 default 排第二")
 
@@ -1376,13 +1384,13 @@ class TestAccountOrder(_HomeSandbox):
         # ensure_isolation 会因为缺登录态直接 reject 退出 2。不过滤的话，
         # 一个账号缺登录态就会把整条 auto 命令打死，哪怕别的账号完全可用。
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
-        self.assertNotIn("acct3", ca.accounts_by_availability("t"))
+        self.assertNotIn("acct3", ca.accounts_by_availability())
 
     def test_有登录态的一个都不少(self):
         # **本设计的核心约束。** 额度记录只排顺序，绝不把账号排除出候选。
         for account in ("default", "acct2", "acct3"):
             self._limit(account, datetime.datetime(2099, 1, 1))
-        self.assertEqual(sorted(ca.accounts_by_availability("t")),
+        self.assertEqual(sorted(ca.accounts_by_availability()),
                          sorted(ca.account_choices()))
 
 
@@ -3131,7 +3139,7 @@ class TestRunRetry(_HomeSandbox):
     def test_每个候选最多启动一次(self):
         self._run(ca.AUTO, self._all(self.LIMIT_LINE),
                   out_of_quota={"default", "acct2", "acct3"})
-        候选 = ca.accounts_by_availability("t")
+        候选 = ca.accounts_by_availability()
         self.assertEqual(len(self.spawned), len(set(self.spawned)), "每个候选最多启动一次")
         self.assertEqual(sorted(self.spawned), sorted(候选))
 
@@ -3151,7 +3159,7 @@ class TestRunRetry(_HomeSandbox):
                          "前提不成立：任务没住进 acct3，下面测的就不是这件事")
 
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
-        self.assertNotIn("acct3", ca.accounts_by_availability("t"),
+        self.assertNotIn("acct3", ca.accounts_by_availability(),
                          "前提不成立：掉了登录态的账号仍在候选里")
 
         self.spawned.clear()

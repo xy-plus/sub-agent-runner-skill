@@ -620,6 +620,41 @@ def read_usage_limit(home):
     return None if when.tzinfo is not None else when
 
 
+def accounts_by_availability():
+    """按「预计什么时候能用」给候选账号排序。
+
+    **额度记录只排顺序，不准拒绝**——本设计最重要的一条约束。
+    「这个账号真的没额度了」这个结论只能来自**真实尝试**，不能来自这里读到的
+    文件。文件会错（时区、时钟偏移、OpenAI 改文案，以及日志被回显污染——
+    见 `hit_usage_limit`）。只排顺序的话后果被限制在「顺序排差一格」；一旦允许
+    它拒绝，同一个错就变成「把好账号误判成死的、还告诉调用方没号可用」。
+
+    **登录态是唯一的例外，而且它不违反上面那条。** 那条约束管的是**额度记录**
+    ——一份会过期、会出错的缓存。登录态是当场可查的硬前提：没有 `auth.json`，
+    `ensure_isolation` 会直接 `reject` 退出 2，于是**一个账号缺登录态就会把整条
+    auto 命令打死**，哪怕别的账号完全可用。所以在这里就把它们滤掉。
+
+    排序键两段：
+    ① 恢复时间；没记录就是 `datetime.min`，排最前，照样会被试到。
+       **过期记录不会自动变成「无记录」**：本函数不读当前时间，一条过期记录
+       永远排在无记录之后。这不是 bug——它排进「恢复得早的那一批」，
+       批内按先后排，语义依然正确，而清理需要读时钟、需要定义「多久算过期」，
+       是纯增实体
+    ② 账号名——**第二键必须有**，否则顺序跟着 `account_choices()` 的扫描顺序漂，
+       同一个输入在两台机器上给出两种结果
+
+    **刻意没有「这个任务已经住在哪」这一键，也就不收 `task`。** v3 有过
+    （住着的排最前，沿用它的家），那是为**轮内重试**服务的：先试旧家，
+    撞上限再搬走。v4 去掉重试之后它变成陷阱——任务住的那个账号限流了也照样
+    被选中，于是每次重跑都选它、每次都撞上限，**永远换不掉**，而 auto 的
+    全部意义就是换掉它。搬家现在由 `cmd_run` 在入口处显式做一次。
+    """
+    def sort_key(account):
+        return (read_usage_limit(isolation_home(account)) or datetime.datetime.min,
+                account)
+    return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
+
+
 def extract_session_id(log_text):
     m = _SESSION_ID.search(strip_ansi(log_text))
     return m.group(1) if m else None
@@ -1283,44 +1318,6 @@ def all_metas():
     return out
 
 
-# 位置在 `find_meta` **之下**：它依赖 find_meta。本文件一律自下而上排
-# （见 `hit_usage_limit` 排在 `runtime_error_lines` 之后的同一条理由），
-# 虽然 Python 在调用时才解析名字，但读的人是从上往下读的。
-def accounts_by_availability(task):
-    """按「预计什么时候能用」给候选账号排序。
-
-    **额度记录只排顺序，不准拒绝**——本设计最重要的一条约束。
-    「全部账号都撞上额度上限」这个结论必须来自**真实尝试**（见 `cmd_run` 的循环），
-    不能来自这里读到的文件。文件会错（时区、时钟偏移、OpenAI 改文案），
-    只排顺序的话后果被限制在「顺序排差、多几次启动」；一旦允许它拒绝，
-    同一个错就变成「把好账号误判成死的、还告诉调用方没号可用」。
-
-    **登录态是唯一的例外，而且它不违反上面那条。** 那条约束管的是**额度记录**
-    ——一份会过期、会出错的缓存。登录态是当场可查的硬前提：没有 `auth.json`，
-    `ensure_isolation` 会直接 `reject` 退出 2，于是**一个账号缺登录态就会把整条
-    auto 命令打死**，哪怕别的账号完全可用。所以在这里就把它们滤掉。
-
-    排序键三段：
-    ① 这个任务是不是已经住在该账号——住着的排最前（沿用它的家），
-       但仍可被 `cmd_run` 的重试搬走
-    ② 恢复时间；没记录就是 `datetime.min`，排最前，照样会被试到。
-       **过期记录不会自动变成「无记录」**：本函数不读当前时间，一条过期记录
-       永远排在无记录之后。这不是 bug——它排进「恢复得早的那一批」，
-       批内按先后排，语义依然正确，而清理需要读时钟、需要定义「多久算过期」，
-       是纯增实体
-    ③ 账号名——**第二键必须有**，否则顺序跟着 `account_choices()` 的扫描顺序漂，
-       同一个输入在两台机器上给出两种结果
-    """
-    own_home, _ = find_meta(task)
-
-    def sort_key(account):
-        home = isolation_home(account)
-        return (0 if home == own_home else 1,
-                read_usage_limit(home) or datetime.datetime.min,
-                account)
-    return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
-
-
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -1820,7 +1817,7 @@ def cmd_run(args):
         print(f"[codex-sub-agent] 提示：任务名 {args.task} 复用，上一轮的报告会被删掉、日志会被追加")
 
     if args.account == AUTO:
-        candidates = accounts_by_availability(args.task)
+        candidates = accounts_by_availability()
         if not candidates:
             reject("没有任何账号有登录态，auto 模式无从分配：\n"
                    + "\n".join(f"  {a} 缺 {auth_source(a)}" for a in account_choices())
