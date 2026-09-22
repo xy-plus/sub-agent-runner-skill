@@ -108,9 +108,27 @@ deepseek 侧可以用 `--session-id` **由工具自己指定**（实测：指定
 uuid 在任务创建时生成、落进元数据，此后每一轮都从元数据读。**不从输出里读回来核对**——
 那会把一个已知事实变成一个待验证的推测。
 
-**日志过滤也归 runner**：deepseek 侧在 tee 的时候丢掉 `thinking_tokens` 事件
-（58 KB/s，长任务会把日志涨到几十 MB）。丢弃是**有损**的，所以要在日志开头写明
-「本轮日志已滤掉 thinking_tokens 进度事件」——不然读日志的人会以为工具漏记了。
+### 日志：必须过滤，而且过滤归 runner
+
+实测没有任何开关能让 claude 不发 `thinking_tokens`，而 `stream-json` 又强制要 `--verbose`。
+不滤的话 30 分钟的任务约 **104 MB**（58 KB/s），而判据要扫日志。
+
+| 决定 | 理由 |
+|---|---|
+| 在 **tee 的时候**滤，不是读的时候滤 | 读的时候滤，磁盘上那 104 MB 还是要写要读 |
+| tee 需要**按行**处理，而现有 tee 是按 1024 字节分块的 | JSONL 的过滤单位是行。给 tee 加一个「行模式」，**只在 runner 提供了行过滤器时启用**——codex 那条路一个字节都不动（它那段注释说明了分块读是承重的：banner 只有 ~170 字节，之后可能思考几十分钟） |
+| 滤掉的事同时从 **stdout 和日志**消失 | 往用户终端刷 2300 行进度事件本来也是噪音 |
+| 日志开头写明滤过 | 丢弃是有损的，不写明读日志的人会以为工具漏记了 |
+
+### 失败时 `detail` 里该有东西——让 runner 写一行 judge 已经认识的
+
+`judge` 的 `detail` 来自 `runtime_error_lines(本轮文本)`，而那套正则认的是
+`^ERROR:` / tracing / `^Error:`。deepseek 的日志是 JSONL，每行以 `{` 开头，**一条都不会命中**
+——于是失败时 `detail` 是空的，调用方看不到任何线索。
+
+修法**不是**给 judge 加分支，而是：**`result` 事件说失败时，runner 往日志里写一行
+`ERROR: <subtype>: <错误信息>`**。现有分类器原样认得它，`detail` 自然就有内容。
+这正是「runner 的职责是把本轮产物摆成 judge 认识的形状」这条边界的又一个实例。
 
 ## 六、隔离目录
 
@@ -166,15 +184,18 @@ deepseek 侧不适用。
    `prepend_skill_guard` 一行未改
 4. **deepseek 的判据**：`subtype=="success"` → 写报告 → judge 判 success；
    `subtype=="error_during_execution"` → 不写报告 → 有打断标记时判 interrupted／退 130
-5. **日志**：`thinking_tokens` 被滤掉，且日志开头写明滤过；
-   **尾部坏行不许让解析崩**（实测被杀时必然产生一行残行）
-6. **续跑**：deepseek 侧 `resume` 和 `interrupt-and-resume` 都能接上上下文
+5. **日志**：`thinking_tokens` 被滤掉（滤在 tee，不是读的时候），且日志开头写明滤过；
+   **codex 那条 tee 路径一个字节都没改**；
+   **尾部坏行不许让解析崩**（实测被杀时必然产生一行残行，`status` 读活日志时也会撞到）
+6. **失败时 `detail` 不空**：deepseek 的 `result` 事件报错时，日志里有一行
+   `ERROR: <subtype>: …`，且 `judge` 把它收进 `detail`——**不许为此给 judge 加分支**
+7. **续跑**：deepseek 侧 `resume` 和 `interrupt-and-resume` 都能接上上下文
    （实测打断后 resume 可用）
-7. **元数据**：新任务记 `runner` 与 `account`（deepseek 侧 `account` 是 `None`）；
+8. **元数据**：新任务记 `runner` 与 `account`（deepseek 侧 `account` 是 `None`）；
    **260 份现存元数据全部迁移完毕**，迁移后 `status` 能把它们全列出来，一个都不少；
    代码里**没有**任何「读不到 runner 就当 codex」的路径
-8. **PID 反查两侧都准**：`status`／`stop`／「还在跑」的闸在 deepseek 侧同样有效；
+9. **PID 反查两侧都准**：`status`／`stop`／「还在跑」的闸在 deepseek 侧同样有效；
    反查判据按 runner 分叉，且**不许用正则**（codex 侧那条注释记了实测事故：
    任务 `a` 的报告路径拿去 pgrep 命中了任务 `aXmd`）
-9. **既有测试全绿**，且 codex 侧行为一字未变
-10. **收尾**：结论内化进注释后删除 spec 与计划文档
+10. **既有测试全绿**，且 codex 侧行为一字未变
+11. **收尾**：结论内化进注释后删除 spec 与计划文档
