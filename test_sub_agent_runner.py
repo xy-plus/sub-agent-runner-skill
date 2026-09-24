@@ -1934,31 +1934,15 @@ class TestDeepseekRunner(_HomeSandbox):
         # 所以空目录正是我们要的隔离：一个 skill、一个 MCP、一个 hook 都看不见。
         env = ca.deepseek_env(pathlib.Path("/d"))
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "/d")
-        self.assertNotIn("CODEX_HOME", env, "codex 的隔离变量不该出现在 deepseek 的环境里")
+        self.assertEqual(env.get("CODEX_HOME"), os.environ.get("CODEX_HOME"),
+                         "继承环境原样透传，不额外设置 codex 的隔离变量")
 
-    def test_交出去的env里一个模型变量都没有(self):
-        """**没有这一条，整个功能在用户的真实场景下一次都跑不起来。**
-
-        `claude-deepseek` 开头会扫环境里所有
-        `^(ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$` 的变量，值不等于
-        `deepseek-flash[1m]` 就退 2（它自己的注释：「静默跑错模型变成大声退 2」）。
-        而用户的原话场景是「我现在正在用原生的 Claude Code」——那一刻
-        `ANTHROPIC_MODEL` 就是 `claude-*`。实测：
-            ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p "说一个字：好"
-            → claude-deepseek: 别处在定模型，拒绝启动
-        删掉它们不改变正确性：wrapper 自己 export 全套模型变量。
-        """
-        dirty = {"ANTHROPIC_MODEL": "claude-opus-5",
-                 "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4",
-                 "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku",
-                 "CLAUDE_CONTEXT_COLLAPSE_MODEL": "claude-x",
-                 "ANTHROPIC_CUSTOM_MODEL_OPTION_1": "别的",
-                 "CLAUDE_CODE_NO_MODEL_FALLBACK": "1"}
-        with mock.patch.dict(os.environ, dirty):
+    def test_deepseek_env_passes_environment_through_and_only_sets_config_dir(self):
+        """模型变量不再剥：claude-deepseek 现在挂 DeepSeek 档案，档案的 env 压过继承值
+        （~/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。"""
+        with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5", "PATH": "/bin"}, clear=True):
             env = ca.deepseek_env(pathlib.Path("/d"))
-        leaked = [k for k in env if re.match(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$", k)]
-        self.assertEqual(leaked, [], f"这些会让 claude-deepseek 当场退 2：{leaked}")
-        self.assertIn("PATH", env, "只删模型变量，别把整个环境清空——子进程还要 PATH")
+        self.assertEqual(env, {"ANTHROPIC_MODEL": "claude-opus-5", "PATH": "/bin", "CLAUDE_CONFIG_DIR": "/d"})
 
     def test_成功才写报告(self):
         rp, lp = self.home / "r.md", self.home / "t.log"
@@ -2429,17 +2413,15 @@ class TestDeepseekWiring(_HomeSandbox):
         d, _, popen, _ = self._run([self.INIT, self.OK])
         env = popen.call_args.kwargs["env"]
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(d))
-        self.assertNotIn("CODEX_HOME", env)
+        self.assertEqual(env.get("CODEX_HOME"), os.environ.get("CODEX_HOME"))
 
-    def test_交给子进程的env里一个模型变量都没有(self):
-        # claude-deepseek 见到「别处在定模型」就退 2，而用户的场景正是
-        # 「我现在正在用原生的 Claude Code」——那一刻 ANTHROPIC_MODEL 就是 claude-*。
+    def test_继承模型变量时仍传入隔离目录(self):
+        # claude-deepseek 现在挂 DeepSeek 档案，档案的 env 压过继承来的模型变量
+        # （~/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。
         with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5",
                                           "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku"}):
-            _, _, popen, _ = self._run([self.OK])
-        leaked = [k for k in popen.call_args.kwargs["env"]
-                  if re.match(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$", k)]
-        self.assertEqual(leaked, [], f"这些会让 claude-deepseek 当场退 2：{leaked}")
+            d, _, popen, _ = self._run([self.OK])
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(d))
 
     # ── ② 工作目录真的接上了 ────────────────────────────────────────
     def test_工作目录走cwd_产物才落在dir里(self):
@@ -3952,8 +3934,8 @@ def _capture_stdout():
 class TestRunnerCLI(_HomeSandbox):
     """`--runner` 必填 + 三条硬拒绝 + uuid 的生命周期。
 
-    三条硬拒绝**一律退 2 并说清为什么，不静默改正**——`claude-deepseek` 自己
-    就是这么干的（它的注释：「静默跑错模型变成大声退 2」）。
+    三条硬拒绝**一律退 2 并说清为什么，不静默改正**，这是本工具对参数组合的约束。
+    DeepSeek 的模型由档案锁定，不再因继承来的模型变量拒绝启动。
     """
 
     def setUp(self):

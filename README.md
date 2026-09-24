@@ -9,8 +9,12 @@
 `</dev/null` 不能漏、只能 `kill -INT` 不能裸 `kill`、退出码 1 不等于失败、
 `resume` 收的参数比主线少三个；DeepSeek 那边工作目录只能走 `cwd`（`claude -p` 没有
 `--cd`）、不给 `--dangerously-skip-permissions` 会跑出一个**一个字都没写成的
-「成功」**、`stream-json` 不带 `--verbose` 直接退 1、继承来的模型变量会让 wrapper
-当场退 2……**原来这些写在文档里，靠每次读一遍记住。**
+「成功」**、`stream-json` 不带 `--verbose` 直接退 1……
+**原来这些写在文档里，靠每次读一遍记住。**
+
+DeepSeek 的 token 和模型由 `claude-deepseek` 每次生成的私有档案经 settings 的 env
+注入 Claude Code 进程，档案的 env 压过继承来的模型变量；本工具原样透传环境，
+只设置 `CLAUDE_CONFIG_DIR` 来隔离配置目录。
 
 这个项目把它们编译成了一个可执行文件：调用方只提供任务本身的信息
 （干什么、在哪干、多难），其余由代码保证。写错的参数**当场拒跑**，

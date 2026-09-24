@@ -1265,28 +1265,18 @@ DEEPSEEK_BIN = "claude-deepseek"
 # 写成常量而不是散落字面量：`cmd_run` 的硬拒绝和错误信息都指向它。
 DEEPSEEK_EFFORT = "max"
 
-# `claude-deepseek` 开头会扫环境里所有匹配这个模式的变量，值不等于它自己那个
-# 模型就**退 2**（它的注释：「静默跑错模型变成大声退 2」）。
-# **用户的场景正是「我现在正在用原生的 Claude Code」**——那一刻 `ANTHROPIC_MODEL`
-# 就是 `claude-*`，原样透传 `os.environ` 会让整个功能一次都跑不起来。
-# 实测：`ANTHROPIC_MODEL=claude-opus-5 claude-deepseek -p "说一个字：好"` → 退 2。
-# 模式逐字抄自 wrapper（`^(ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$`）：
-# 两边宽窄必须一致，我们这边窄一格就漏掉一个变量、它那边照样退 2。
-_MODEL_ENV = re.compile(r"^(?:ANTHROPIC_|CLAUDE_)[A-Z0-9_]*MODEL[A-Z0-9_]*$")
-
 
 def deepseek_env(home):
-    """deepseek 侧的隔离：`CLAUDE_CONFIG_DIR` + **清掉继承来的模型变量**。
+    """deepseek 侧的隔离：只设 `CLAUDE_CONFIG_DIR`。
 
-    2026-09-23 实测 `CLAUDE_CONFIG_DIR` 指向空目录照跑——auth 走环境变量里的 token，
-    不在配置目录里，所以空目录正是我们要的隔离：子代理一个 skill、一个 MCP、
+    2026-09-23 实测 `CLAUDE_CONFIG_DIR` 指向空目录照跑：token 由 claude-deepseek 挂的 DeepSeek 档案
+    经 settings 的 env 注入，不在配置目录里。所以空目录正是我们要的隔离：子代理一个 skill、一个 MCP、
     一个 hook 都看不见。
 
-    删模型变量**不改变正确性**：`claude-deepseek` 自己 export 全套（11 个），
-    而且它显式传 `--model`，命令行优先级最高。这里删的只是「别处定的那一份」。
-    只删模型变量、不清空整个环境：子进程还要 `PATH`／`HOME`／代理设置。
+    继承来的模型变量不用剥：档案（~/claude-switch/claude_switch/deepseek.py）的 env 压过它们
+    （2026-09-25 实测）。effort 也在档案里定为 max，与本工具传的 --effort max 一致。
     """
-    env = {k: v for k, v in os.environ.items() if not _MODEL_ENV.match(k)}
+    env = dict(os.environ)
     env["CLAUDE_CONFIG_DIR"] = str(home)
     return env
 
@@ -2333,9 +2323,8 @@ def _reject_bad_runner_combo(args):
     argparse 表达不了「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范
     第 5 条要消灭的东西——所以这三条必须是代码。
 
-    **一律退 2 并说清为什么，不静默改正。** `claude-deepseek` 自己就是这么干的
-    （它的注释：「静默跑错模型变成大声退 2」，理由是 DeepSeek 的 API 对不存在的
-    模型名静默返回 200——静默纠正会让调用方以为自己传的那个生效了）。
+    **一律退 2 并说清为什么，不静默改正。** 这是本工具对参数组合的约束，
+    静默纠正会让调用方以为自己传的参数生效了。DeepSeek 的模型由档案锁定。
 
     「排在任何状态变更之前」这条的检验方式**不是**「排在那段删旧元数据的迁移分支
     之前」——那半句不可达：迁移分支的门是 `--account auto`，而这三条与 auto 互斥
