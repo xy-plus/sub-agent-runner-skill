@@ -1,14 +1,12 @@
 ---
 name: sub-agent-runner
-description: 把有明确规划的执行类任务（照 DoD 写代码、对抗审查、e2e 验证）派给 codex 或 DeepSeek 子代理后台跑，省 claude token。用 Bash run_in_background 启动 run。
+description: 把任务派给 codex 或 DeepSeek 子代理后台跑，省 claude token。用 Bash run_in_background 启动 run。
 ---
 
 # sub-agent-runner
 
-**本 skill 一旦激活，默认就不再开 claude 原生子代理了**——执行类的活交给子代理，
-claude 只编排。同时开两边等于白烧 claude 的 token，那正是这个 skill 要省的东西。
-
-把**有明确规划的执行类任务**派出去干。Prompt 写进 `brief.md`。
+**本 skill 一旦激活，默认就不再开 claude 原生子代理了**，
+改用本 skill 调用其他 agent，Prompt 写进 `brief.md`。
 
 命令怎么拼、隔离目录怎么建、进程怎么判活、成败怎么判、信号怎么发，全部由
 `sub_agent_runner.py` 保证，本文件只讲**人／模型才能决定的事**。
@@ -30,7 +28,7 @@ sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brie
 
 | runner | 跑的是什么 | 账号 | effort |
 |---|---|---|---|
-| `codex` | `codex exec`，`gpt-6-astra` | `--account` 必填 | 五档任选 |
+| `codex` | `codex exec`，`gpt-6-astra` | `--account` 必填 | 只许 `low`／`medium` |
 | `deepseek` | `claude-deepseek -p`，`deepseek-flash[1m]`（1M 上下文） | **不收 `--account`**（只有一个 token） | **只有 `max`** |
 
 两侧的任务名、判据、报告、退出码、打断／续跑协议完全一样；
@@ -41,19 +39,8 @@ sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brie
 
 ## 难度靠 effort 分档，不靠换模型
 
-codex 侧的 `gpt-6-astra` 只有这五档（2026-09 查证，`minimal` 和 `ultra` 是别的模型的）。
-deepseek 侧只有 `max`，所以下面这张表只对 codex 有意义。
-
-| 档 | 什么时候用 |
-|---|---|
-| `low` | 照一份已经写死的 DoD 改代码、批量重构、跑闸收集结果——**确认是纯机械劳动才降到这** |
-| `medium` | 要读一段陌生代码再改、线索明确的 debug |
-| **`high`** | **默认档。没有明确理由降档，就用它** |
-| `xhigh` | 根因不明的 bug、要推翻前提的设计 |
-| `max` | 没有已知解法，判据得自己找 |
-
-**不要拿成本当降档的理由。** 五档之间的价差只有约 4 倍，而档位不够导致的返工要
-搭进整整一轮——省下的那点远不够赔。降档的唯一正当理由是「这活真的不需要判断」。
+codex 侧的 `gpt-6-astra` 支持 `low`／`medium`／`high`／`xhigh`／`max` 五档，但只允许用 `low`、`medium`，默认情况用 `low`。
+deepseek 侧只有 `max`。
 
 ## 另外四条命令
 
