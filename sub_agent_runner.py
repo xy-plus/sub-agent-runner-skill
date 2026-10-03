@@ -10,8 +10,8 @@
 只按 runner 取事实。
 **命令入口里只有 `cmd_run` 带 runner 分支**：选 argv builder、「撞额度上限」那一支
 限 codex（那两件事本来就只属于调用入口——builder 要用刚铸好的 session id，而
-账号／限流记录是 codex 独有的概念），外加它第一行调的那三条硬拒绝
-（`_reject_bad_runner_combo`——三条各自只对某一个 runner 成立）。
+账号／限流记录是 codex 独有的概念），外加它第一行调的那两条硬拒绝
+（`_reject_bad_runner_combo`——两条各自只对某一个 runner 成立）。
 `status`／`resume`／`stop`／`interrupt-and-resume` 里一处都没有：它们从元数据取
 runner，再交给 `find_task_agent_pid` 和 `_resume_round`。
 
@@ -885,7 +885,9 @@ def judge(round):
     return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
-MODEL = "gpt-6-astra"
+# 用户 2026-10-03：「要求只用gpt6 luna max」。模型与 effort 都只有一个取值，
+# 写死在这里（effort 由下面的 EFFORTS 守门），不留给调用方挑。
+MODEL = "gpt-6-luna"
 
 # 隔离目录自己的 config，绝不软链主配置。
 # 2026 年踩过：`codex-acct` 把 config.toml 软链到主配置，一用就把 MCP、plugins、
@@ -1261,9 +1263,6 @@ def codex_env(home):
 # 和本段那些纯函数测试缺一不可。
 
 DEEPSEEK_BIN = "claude-deepseek"
-# 用户的硬约束（原话：「如果是 DeepSeek 的话，它的 effort 必须要是 max」）。
-# 写成常量而不是散落字面量：`cmd_run` 的硬拒绝和错误信息都指向它。
-DEEPSEEK_EFFORT = "max"
 
 
 def deepseek_env(home):
@@ -1858,10 +1857,11 @@ def _previous_writer_alive(home, task):
     return start == previous["writer_start"] and state != "Z"
 
 
-# codex 全集是 minimal/low/medium/high/xhigh/max/ultra，这五档是**刻意裁剪**。
+# **只有 max 一档**（用户 2026-10-03：「要求只用gpt6 luna max」；DeepSeek 一侧本来就只有 max）。
 # argparse 的 choices 是唯一守门员——实测 codex 对 `-c model_reasoning_effort=bogus`
-# 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你。
-EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+# 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你，
+# 所以「只许 max」必须在这里拦，不能只写在 SKILL.md 里。
+EFFORTS = ["max"]
 
 # 五个状态回答的是同一个问题：**接下来该干什么**。
 #   success 0 不用干什么 / running 4 等 / interrupted 130 **接着 resume** /
@@ -2317,17 +2317,18 @@ def _print_verdict(task, verdict):
 
 
 def _reject_bad_runner_combo(args):
-    """`--runner` 与 `--account`／`--effort` 的三条硬拒绝。**必须排在 `cmd_run`
+    """`--runner` 与 `--account` 的两条硬拒绝。**必须排在 `cmd_run`
     任何状态变更之前**，所以它被抽成一个函数、由 `cmd_run` 第一行调用。
 
     argparse 表达不了「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范
-    第 5 条要消灭的东西——所以这三条必须是代码。
+    第 5 条要消灭的东西——所以这两条必须是代码。`--effort` 不在这里：两侧都只有
+    `max` 一档，由 argparse 的 `choices=EFFORTS` 直接拦。
 
     **一律退 2 并说清为什么，不静默改正。** 这是本工具对参数组合的约束，
     静默纠正会让调用方以为自己传的参数生效了。DeepSeek 的模型由档案锁定。
 
     「排在任何状态变更之前」这条的检验方式**不是**「排在那段删旧元数据的迁移分支
-    之前」——那半句不可达：迁移分支的门是 `--account auto`，而这三条与 auto 互斥
+    之前」——那半句不可达：迁移分支的门是 `--account auto`，而这两条与 auto 互斥
     （deepseek 给任何 account 都拒，codex 不给 account 也拒）。真正可检验的
     判据是**盘上什么都没多出来**：`ensure_isolation` 是第一个落盘的动作。
     """
@@ -2337,10 +2338,6 @@ def _reject_bad_runner_combo(args):
                    f"不要传 --account（收到 {args.account!r}）。\n"
                    f"账号只属于 codex：它的登录态是每账号一份 auth.json，"
                    f"而 DeepSeek 的 token 走环境变量。")
-        if args.effort != DEEPSEEK_EFFORT:
-            reject(f"--runner {DEEPSEEK} 只接受 --effort {DEEPSEEK_EFFORT}"
-                   f"（收到 {args.effort!r}）。\n"
-                   f"不替你改成 {DEEPSEEK_EFFORT}：静默改正会让你以为自己传的那档生效了。")
     elif args.account is None:
         reject(f"--runner {CODEX} 必须给 --account（{'／'.join(account_choices())}／{AUTO}）。\n"
                f"没有隐式选中的账号——选错账号要花钱才发现。")
@@ -2813,8 +2810,7 @@ def build_parser():
     # `--runner` **必填，没有缺省**：这不是「换个模型」，而是换隔离机制、换工作
     # 目录的传法、换报告怎么拿、换有没有账号——给缺省值就是替调用方选了这一整套。
     r.add_argument("--runner", required=True, choices=list(RUNNERS),
-                   help=f"派给哪个 agent 跑；{DEEPSEEK} 的 --effort 只能是 {DEEPSEEK_EFFORT}"
-                        f"、且不收 --account")
+                   help=f"派给哪个 agent 跑；{DEEPSEEK} 不收 --account")
     # `--account` 从必填改成可选，**不是放松**：它现在由 `_reject_bad_runner_combo`
     # 守着——codex 不给就拒、deepseek 给了也拒。argparse 表达不了
     # 「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范第 5 条要消灭的东西。

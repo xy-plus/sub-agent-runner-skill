@@ -682,7 +682,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
@@ -695,7 +695,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
@@ -2618,11 +2618,11 @@ class TestFixedArgs(unittest.TestCase):
 
     def test_模型固定且就是这一个(self):
         # 绝对值：写成 `== ca.MODEL` 的话，改掉 MODEL 两边一起动，等于没测
-        self.assertEqual(ca.MODEL, "gpt-6-astra")
+        self.assertEqual(ca.MODEL, "gpt-6-luna")
         for name, build in self.CASES.items():
             with self.subTest(cmd=name):
                 argv = build()
-                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-astra")
+                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-luna")
 
     def test_难度分档如实传给codex(self):
         for name, build in self.CASES.items():
@@ -2796,7 +2796,7 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
@@ -2814,7 +2814,7 @@ class TestMetaShape(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
         with _no_codex():
             ca.cmd_run(args)
         落盘 = json.loads(ca.meta_path(d, "t").read_text())
@@ -2840,7 +2840,7 @@ class TestMetaShape(_HomeSandbox):
         skill.write_text("---\nname: tdd\n---\n")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--skill", str(skill)])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(skill)])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
@@ -2853,13 +2853,13 @@ class TestMetaShape(_HomeSandbox):
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir),
                                          skills=[str(first)]))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "high",
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max",
              "--skill", str(second)])
         with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
         meta = json.loads(ca.meta_path(d, "t").read_text())
         self.assertEqual(meta["skills"], [str(second)], "skills 没跟着 effort 一起刷新")
-        self.assertEqual(meta["effort"], "high", "前提不成立：effort 本来就该刷新")
+        self.assertEqual(meta["effort"], "max", "元数据记的是本轮那一档（effort 只有 max 一档）")
 
     def test_interrupt_and_resume也把skills接了进去(self):
         # _resume_round 是两条路共用的，但接线是各自的：这条命令传成 [] 或漏传，
@@ -2869,7 +2869,7 @@ class TestMetaShape(_HomeSandbox):
         skill.write_text("---\nname: x\n---\n")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
              "--skill", str(skill)])
         with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_interrupt_and_resume(args)
@@ -3520,7 +3520,7 @@ class TestParser(_HomeSandbox):
             # --no-skill 不加的话这条就静默退化成同义反复：缺 --skill/--no-skill
             # 照样 SystemExit，于是不管 --task/--dir/… 还必不必填，它都绿。
             argv = ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                    "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"]
+                    "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
@@ -3547,11 +3547,11 @@ class TestParser(_HomeSandbox):
     def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
         for argv in (["run", "--task", "a|b", "--dir", "/tmp", "--brief", "b.md",
-                      "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"],
+                      "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"],
                      ["status", "a|b"],
-                     ["resume", "a|b", "--brief", "b.md", "--effort", "low", "--no-skill"],
+                     ["resume", "a|b", "--brief", "b.md", "--effort", "max", "--no-skill"],
                      ["stop", "a|b"],
-                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "low",
+                     ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "max",
                       "--no-skill"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
@@ -3559,7 +3559,7 @@ class TestParser(_HomeSandbox):
     def test_resume和stop不收account_账号是查出来的(self):
         parser = ca.build_parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "low",
+            parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "max",
                                "--no-skill", "--account", "default"])
 
     def test_不提供会造成误用的参数(self):
@@ -3583,7 +3583,7 @@ class TestParser(_HomeSandbox):
         for bad in ["--timeout", "--background", "-o", "--log", "--model", "--sandbox"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill",
+                                   "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill",
                                    bad, "x"])
 
 
@@ -3595,7 +3595,7 @@ class TestInterruptAndResumeParser(_HomeSandbox):
     def test_与resume同一张参数表_少一个都不收(self):
         parser = ca.build_parser()
         for missing in ["--brief", "--effort"]:
-            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low",
+            argv = ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "max",
                     "--no-skill"]
             i = argv.index(missing)
             del argv[i:i + 2]
@@ -3617,7 +3617,7 @@ class TestInterruptAndResumeParser(_HomeSandbox):
     def test_不收account_账号是查出来的(self):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                          "--effort", "low", "--no-skill",
+                                          "--effort", "max", "--no-skill",
                                           "--account", "default"])
 
     def test_不提供任何旋钮_没有第二种正确行为(self):
@@ -3631,15 +3631,15 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         for bad in ["--now", "--wait", "--force", "--timeout", "--message", "--account"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", "low", "--no-skill", bad, "x"])
+                                   "--effort", "max", "--no-skill", bad, "x"])
 
     def test_子命令接到的确实是这条命令的实现(self):
         # TestInterruptAndResumeOrder 是直接拿 Namespace 调命令体的，接错了函数它测不出来。
         # 这里是命令行到实现之间唯一那根线。
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "low", "--no-skill"])
+            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "max", "--no-skill"])
         self.assertIs(args.func, ca.cmd_interrupt_and_resume)
-        self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "low"))
+        self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "max"))
 
 
 class TestSkillWhitelistFlags(_HomeSandbox):
@@ -3662,10 +3662,10 @@ class TestSkillWhitelistFlags(_HomeSandbox):
 
     def _argv(self, cmd, *tail):
         base = {"run": ["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                        "--effort", "low", "--runner", "codex", "--account", "default"],
-                "resume": ["resume", "t", "--brief", "b.md", "--effort", "low"],
+                        "--effort", "max", "--runner", "codex", "--account", "default"],
+                "resume": ["resume", "t", "--brief", "b.md", "--effort", "max"],
                 "interrupt-and-resume": ["interrupt-and-resume", "t", "--brief", "b.md",
-                                         "--effort", "low"]}[cmd]
+                                         "--effort", "max"]}[cmd]
         return base + list(tail)
 
     def test_三条带prompt的命令都必须二选一_都不给就拒(self):
@@ -3766,7 +3766,7 @@ class TestRunGuards(_HomeSandbox):
 
     def _args(self, **over):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
-                "--brief", over.get("brief", str(self.brief)), "--effort", "low",
+                "--brief", over.get("brief", str(self.brief)), "--effort", "max",
                 "--runner", "codex", "--account", "default", "--no-skill"]
         return ca.build_parser().parse_args(argv)
 
@@ -3831,7 +3831,7 @@ class TestRunGuards(_HomeSandbox):
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
         def grab(*a, **k):
             seen["argv"] = a[0]
             return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
@@ -3932,9 +3932,9 @@ def _capture_stdout():
 
 
 class TestRunnerCLI(_HomeSandbox):
-    """`--runner` 必填 + 三条硬拒绝 + uuid 的生命周期。
+    """`--runner` 必填 + 两条硬拒绝 + uuid 的生命周期。
 
-    三条硬拒绝**一律退 2 并说清为什么，不静默改正**，这是本工具对参数组合的约束。
+    两条硬拒绝**一律退 2 并说清为什么，不静默改正**，这是本工具对参数组合的约束。
     DeepSeek 的模型由档案锁定，不再因继承来的模型变量拒绝启动。
     """
 
@@ -3961,7 +3961,7 @@ class TestRunnerCLI(_HomeSandbox):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(
                 ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-                 "--effort", "low", "--account", "default", "--no-skill"])
+                 "--effort", "max", "--account", "default", "--no-skill"])
 
     def test_runner不在白名单argparse就拦下(self):
         with self.assertRaises(SystemExit):
@@ -3976,16 +3976,16 @@ class TestRunnerCLI(_HomeSandbox):
         self.assertIn("账号", got.exception.message)
         self.assertEqual(got.exception.code, ca.USAGE_ERROR)
 
-    def test_deepseek的effort不是max就拒(self):
-        # 不静默改成 max：静默改正就是「调用方以为自己传的那个生效了」。
-        with self.assertRaises(ca.Rejected) as got:
-            ca.cmd_run(self._args("deepseek", None, "high"))
-        self.assertIn("max", got.exception.message)
-        self.assertEqual(got.exception.code, ca.USAGE_ERROR)
+    def test_effort不是max_argparse就拦下(self):
+        # 两侧都只有 max 一档（用户 2026-10-03「要求只用gpt6 luna max」），由 argparse 的
+        # choices 拦，不进 cmd_run；不静默改成 max——静默改正就是「调用方以为传的那档生效了」。
+        for runner, account in (("codex", "default"), ("deepseek", None)):
+            with self.subTest(runner=runner), self.assertRaises(SystemExit):
+                self._args(runner, account, "high")
 
     def test_codex仍然必须给account(self):
         with self.assertRaises(ca.Rejected) as got:
-            ca.cmd_run(self._args("codex", None, "low"))
+            ca.cmd_run(self._args("codex", None, "max"))
         self.assertIn("--account", got.exception.message)
 
     def test_被拒的调用不留任何盘上副作用(self):
@@ -4000,15 +4000,15 @@ class TestRunnerCLI(_HomeSandbox):
         拒绝排在它后面这条就红。
         """
         with self.assertRaises(ca.Rejected) as got:
-            ca.cmd_run(self._args("deepseek", None, "high"))
-        self.assertIn("max", got.exception.message, "钉住是哪一条拒绝在说话")
+            ca.cmd_run(self._args("deepseek", "acct2", "max"))
+        self.assertIn("账号", got.exception.message, "钉住是哪一条拒绝在说话")
         self.assertFalse((self.home / ".claude-subagent").exists(),
                          "被拒的调用不许建隔离目录——ensure_isolation 是第一个落盘的动作")
         self.assertEqual(ca.all_metas(), [], "也不许落任何元数据")
 
     def test_resume和stop都不收runner(self):
         # runner 从元数据查出来，不让调用方再报一遍（报错了就指向另一个隔离目录）。
-        for argv in (["resume", "t", "--brief", str(self.brief), "--effort", "low",
+        for argv in (["resume", "t", "--brief", str(self.brief), "--effort", "max",
                       "--no-skill", "--runner", "codex"],
                      ["stop", "t", "--runner", "codex"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
@@ -4170,7 +4170,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def _args(self, account, task="t"):
         return ca.build_parser().parse_args(
             ["run", "--task", task, "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", account, "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", account, "--no-skill"])
 
     def _spawn_says(self, popen, text):
         """让这一轮吐 `text`，然后 EOF。
@@ -4511,7 +4511,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def _args(self, task):
         return ca.build_parser().parse_args(
-            ["resume", task, "--brief", str(self.brief), "--effort", "low", "--no-skill"])
+            ["resume", task, "--brief", str(self.brief), "--effort", "max", "--no-skill"])
 
     def test_任务不存在就报错(self):
         # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
@@ -4787,7 +4787,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -4797,7 +4797,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--skill", str(self.skill)])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(self.skill)])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -4810,7 +4810,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
     def test_resume这条路_有白名单(self):
         self._meta_for_resume()
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low",
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max",
              "--skill", str(self.skill)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
@@ -4822,7 +4822,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
     def test_interrupt_and_resume这条路_无白名单(self):
         self._meta_for_resume()
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
              "--no-skill"])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(
@@ -4989,11 +4989,11 @@ class TestExitCodeContract(_HomeSandbox):
     def _run_args(self):
         return ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "low", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
 
     def _resume_args(self):
         return ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "low", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
 
     def _spawner(self, d, report_text, log_extra):
         """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
@@ -5051,7 +5051,7 @@ class TestExitCodeContract(_HomeSandbox):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "low",
+            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
              "--no-skill"])
         # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
         with _no_codex() as popen, mock.patch.object(ca, "find_task_agent_pid", return_value=None):

@@ -14,7 +14,7 @@ description: 把任务派给 codex 或 DeepSeek 子代理后台跑，省 claude 
 ## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
 
 ```bash
-sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md --effort <档位> --account auto --no-skill
+sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md --effort max --account auto --no-skill
 sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brief brief.md --effort max     --no-skill
 ```
 
@@ -28,7 +28,7 @@ sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brie
 
 | runner | 跑的是什么 | 账号 | effort |
 |---|---|---|---|
-| `codex` | `codex exec`，`gpt-6-astra` | `--account` 必填 | 只许 `low`／`medium` |
+| `codex` | `codex exec`，`gpt-6-luna` | `--account` 必填 | **只有 `max`** |
 | `deepseek` | `claude-deepseek -p`，`deepseek-flash[1m]`（1M 上下文） | **不收 `--account`**（只有一个 token） | **只有 `max`** |
 
 两侧的任务名、判据、报告、退出码、打断／续跑协议完全一样；
@@ -37,17 +37,19 @@ sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brie
 
 **同一个任务名不能换 runner**：会话、报告、日志都在原来那一侧，换个任务名。
 
-## 难度靠 effort 分档，不靠换模型
+**新任务一律 `--runner codex`**；`deepseek` 只留给已经在跑的任务查状态、续跑（用户 2026-10-03：「后续只使用codex……不用deepseek，已经启动的不用停」）。
 
-codex 侧的 `gpt-6-astra` 支持 `low`／`medium`／`high`／`xhigh`／`max` 五档，但只允许用 `low`、`medium`，默认情况用 `low`。
-deepseek 侧只有 `max`。
+## 模型与 effort 都定死
+
+codex 侧只用 `gpt-6-luna`，effort 只有 `max`；deepseek 侧也只有 `max`（用户 2026-10-03：「要求只用gpt6 luna max」）。
+两者都写死在 `sub_agent_runner.py` 里（`MODEL`、`EFFORTS`），传别的档位当场退 2，不会替你改正。
 
 ## 另外四条命令
 
 ```bash
 sub-agent-runner status [任务名]        # 省略则列出全部
-sub-agent-runner resume <任务名> --brief follow.md --effort <档位> --no-skill
-sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort <档位> --no-skill
+sub-agent-runner resume <任务名> --brief follow.md --effort max --no-skill
+sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort max --no-skill
 sub-agent-runner stop <任务名>          # 上下文保留，之后还能 resume
 ```
 

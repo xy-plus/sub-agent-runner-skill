@@ -29,12 +29,12 @@ DeepSeek 的 token 和模型由 `claude-deepseek` 每次生成的私有档案经
 
 ```bash
 sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md \
-                --effort high --account auto --no-skill
+                --effort max --account auto --no-skill
 sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brief brief.md \
                 --effort max --no-skill
 sub-agent-runner status [任务名]
-sub-agent-runner resume <任务名> --brief follow.md --effort high --no-skill
-sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort high --no-skill
+sub-agent-runner resume <任务名> --brief follow.md --effort max --no-skill
+sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort max --no-skill
 sub-agent-runner stop <任务名>
 ```
 
