@@ -2618,11 +2618,11 @@ class TestFixedArgs(unittest.TestCase):
 
     def test_模型固定且就是这一个(self):
         # 绝对值：写成 `== ca.MODEL` 的话，改掉 MODEL 两边一起动，等于没测
-        self.assertEqual(ca.MODEL, "gpt-6-luna")
+        self.assertEqual(ca.MODEL, "gpt-6.1-sol")
         for name, build in self.CASES.items():
             with self.subTest(cmd=name):
                 argv = build()
-                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-luna")
+                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6.1-sol")
 
     def test_难度分档如实传给codex(self):
         for name, build in self.CASES.items():

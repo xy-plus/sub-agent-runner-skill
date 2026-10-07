@@ -885,9 +885,9 @@ def judge(round):
     return Verdict("success", "正常收尾，本轮日志无未分类错误", preview)
 
 
-# 用户 2026-10-03：「要求只用gpt6 luna max」。模型与 effort 都只有一个取值，
+# 用户 2026-10-03：「要求只用gpt6 luna max」；2026-10-07 改为「把现在写死的 Luna 改成 GPT 6.1 sol……用 6.1 的 sol max。然后只支持这个档位，其他档位都不准用」。模型与 effort 都只有一个取值，
 # 写死在这里（effort 由下面的 EFFORTS 守门），不留给调用方挑。
-MODEL = "gpt-6-luna"
+MODEL = "gpt-6.1-sol"
 
 # 隔离目录自己的 config，绝不软链主配置。
 # 2026 年踩过：`codex-acct` 把 config.toml 软链到主配置，一用就把 MCP、plugins、
@@ -1857,7 +1857,7 @@ def _previous_writer_alive(home, task):
     return start == previous["writer_start"] and state != "Z"
 
 
-# **只有 max 一档**（用户 2026-10-03：「要求只用gpt6 luna max」；DeepSeek 一侧本来就只有 max）。
+# **只有 max 一档**（用户 2026-10-03：「要求只用gpt6 luna max」，2026-10-07 模型换成 gpt-6.1-sol、档位仍只有 max；DeepSeek 一侧本来就只有 max）。
 # argparse 的 choices 是唯一守门员——实测 codex 对 `-c model_reasoning_effort=bogus`
 # 静默接受、banner 照打 `reasoning effort: bogus_effort_value`，档位写错没人告诉你，
 # 所以「只许 max」必须在这里拦，不能只写在 SKILL.md 里。
