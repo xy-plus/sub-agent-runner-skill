@@ -356,18 +356,25 @@ def interrupt_agent(pid, log_path, cause):
 
 
 # codex 自己的错误有三种锚定形式（2026-09-19 对 106 份真实日志全量统计），
-# 少认一种就等于判据失效：
+# 都是顶格输出；缩进的 status 明细等转述内容不能去掉行首空白后冒充它们：
 #   A 用户层   `ERROR: Reconnecting... 2/5`                  行首是 ERROR:／WARN:   23 行
 #   B tracing `<ISO 时间戳> ERROR codex_core::session: …`     行首是时间戳，带 target 92 行
-#   C 顶层致命 `Error: thread/resume: … active writer`        行首是大写 Error:       5 行
+#   C 致命候选 `Error: thread/resume: … active writer`        行首是大写 Error:       5 行
 # 形式 C 首字母是大写 E，`^ERROR:` 大小写敏感、匹配不到它——而它恰恰是「会话被
-# 锁死」那条最该报的错。
+# 锁死」那条最该报的错，但只有本轮没有非空报告时才计入判据（见 judge）。
+# 2026-10-10 全量日志复核：旧规则识别的 30 行 C 全在日志中间，后面还有 codex
+# 继续工作的输出，来自 Rust anyhow、cargo 测试 panic、caddy 等子进程或状态回显。
+# codex 只在正常收尾时写 -o 报告；顶层致命错误会在收尾前退出，两者不会同时出现。
+# 同日实现重判另发现 18 份有报告的任务仅因顶格 A（unittest、pip、pytest）判 3：
+# A 与工具输出按文字分不开。有报告时的 A、C 是转述或已恢复的瞬时错误，
+# 不说明交付有问题；因此有报告时只按 B（时间戳 + 内部 target）判 suspect。
+# 没有非空报告时仍收 A、B、C，保留额度、写锁等失败原因；B 的良性名单不变。
 # 日志里还混着 brief 原文和 codex 转述的子进程输出（cargo 的 error[E0599]、
 # pytest 的 `E   KeyError`、markdown 的 `## Warning Signs`），
 # 所以绝不能用裸 grep ERROR —— 会大面积误报。
 _ERR_USER = re.compile(r"^(?:ERROR|WARN):\s+(.*)")
 _ERR_TRACING = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:ERROR|WARN)\s+(\S+?):\s")
-_ERR_FATAL = re.compile(r"^Error:\s")          # 形式 C，一律致命，没有白名单
+_ERR_FATAL = re.compile(r"^Error:\s")          # 形式 C，由 judge 按本轮报告决定是否计入
 
 # 形式 B 按 module target 分类，不按自由文本——文本会变，target 不会。
 # 白名单之外一律计入判据，**包括 codex_core::session\***（会话建不起来正是最该报的）。
@@ -444,7 +451,10 @@ def read_last_round(log_path):
 
 
 def runtime_error_lines(round_text):
-    """本轮日志里 codex 自己的错误行（已滤掉良性 target 与良性用户层消息）。
+    """本轮顶格的错误候选行（已滤掉良性 target 与良性用户层消息）。
+
+    行首空白保留：缩进行是子进程或别的任务的状态明细，不分类；行尾空白照旧去掉。
+    返回的 A、C 尚未结合报告判断；judge 无报告时保留全部候选，有报告时只保留 B。
 
     **本轮的边界由调用方划好再传进来**，本函数不再自己切——切法有两种
     （拥有者用偏移、观察者用最后一轮），藏在这里面就只剩「猜」一种。
@@ -460,7 +470,7 @@ def runtime_error_lines(round_text):
     """
     hits = []
     for raw in strip_ansi(round_text).splitlines():
-        line = raw.strip()
+        line = raw.rstrip()
         if _ERR_FATAL.match(line):
             hits.append(line)
             continue
@@ -820,6 +830,8 @@ def judge(round):
 
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
+    没有非空报告时收 A、B、C；有报告说明正常收尾，A、C 是已恢复的瞬时错误或
+    转述输出，只保留顶格、非良性 target 的结构化形式 B 作为 suspect 的证据。
     """
     report_path, round_text = round.report_path, round.text
     errors = runtime_error_lines(round_text)
@@ -857,13 +869,16 @@ def judge(round):
         # codex 带行号 cat 出本项目自己的源码和测试。裸子串匹配在真实语料上
         # 是 12/12 全假阳，而这一支的处置是「只能新起一个任务」，
         # 假阳会让人把一个其实只是没产出报告的任务整个丢掉重来。
-        # 真的写锁错误是 `Error: …` 开头（形式 C，一律致命），本来就在 errors 里。
+        # 无报告时，真的写锁错误是 `Error: …` 开头（形式 C），仍在 errors 里。
         if any(THREAD_LOCK_MARK in line for line in errors):
             return Verdict("failed",
                            "会话被写锁占住（上一轮没真的结束，或曾被 SIGTERM 杀过），只能新起一个任务",
                            errors)
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
+    # 有非空报告只留 B：A 与工具输出按文字分不开，A、C 都可能是转述或已恢复的错误。
+    # 没报告那一支保留完整 errors 与额度、写锁原因；B 已由 runtime_error_lines 滤过良性 target。
+    errors = [line for line in errors if _ERR_TRACING.match(line)]
     if errors:
         # 说「子代理」不说「codex」：deepseek 走到这一支时它就是假话。
         # **「`judge` 一行不改」挡的是「在 judge 里按 runner 分支」，不是禁止修
@@ -1292,7 +1307,7 @@ def _deepseek_base_argv(effort):
     # `--dangerously-skip-permissions` 对应 codex 侧的 `--sandbox danger-full-access`
     # + `approval_policy="never"`。**不给的话子代理一个字都写不成，而这一轮仍报
     # success**（实测 permission_denials 三条全拒、工作目录为空）——正是 `--skill`
-    # 那次立项要杀的「零工作量的成功」。第二道防线见 `deepseek_log_lines`。
+    # 那次立项要杀的「零工作量的成功」。被拒诊断仍由 `deepseek_log_lines` 留在日志中。
     # **工作目录不在 argv 里**：`claude -p` 没有 `--cd` 等价物，它走 `Popen(cwd=)`。
     return [DEEPSEEK_BIN, "-p", "--effort", effort,
             "--output-format", "stream-json", "--verbose",
@@ -1399,13 +1414,10 @@ def deepseek_log_lines(round_text):
     两种要补：
 
         非 success    → `failed`（报告没写）
-        工具调用被拒  → 报告在 + 有错误行 = `suspect`，退 3「干完了但要人看一眼」。
-                        **这是「零工作量的成功」的第二道防线**：第一道是
-                        `--dangerously-skip-permissions`，万一它失效，
-                        这里让那一轮变红而不是静默判成功。
+        工具调用被拒  → 诊断留在日志里；无报告时也进入 failed.detail。
+                        有报告时按共享 judge 的规则不计入 A，不再据此判 suspect。
 
-    **代价要写明：** 除这两种由本函数产生的行之外，deepseek 侧的 `errors` 恒为空，
-    所以「codex 中途已恢复的工具错误」那类 `suspect` 在 deepseek 侧**结构性不可达**。
+    这两种补行都是 A，不产生 B；有报告时只看 B 的规则两侧共用，不按 runner 分支。
     """
     event = _last_result_event(round_text)
     if event is None:
@@ -1448,9 +1460,8 @@ def finish_deepseek_round(round_text, report_path, log_path):
             # 残片**原样写出、不带尾换行**（那是刻意的，残片是「被杀在半路」的
             # 现场证据），而 `_last_result_event` 的注释写着「进程被 SIGINT 杀掉时
             # 最后一行必然是残的」，**SIGINT 正是 stop / interrupt-and-resume 的
-            # 正常路径**。粘住之后的后果是这个工具立项要杀的那一类：一轮所有工具
-            # 调用都被拒、报告里明写「我写不进去」，判据报 success 退 0——
-            # 而补错误行正是「零工作量的成功」两道防线里的第二道。
+            # 正常路径**。粘住之后分类器拿不到错误行，无报告时 failed.detail
+            # 会丢掉工具被拒的诊断；有报告时 A 不影响结论，但诊断仍须留在日志里。
             # **不判断「末尾在不在行首」**：那没有可靠的现场判据（另一个进程可能
             # 正在追加），而多一个空行的代价是零、判断错的代价是整条判据失明。
             log.write(("\n" + "\n".join(lines) + "\n").encode())

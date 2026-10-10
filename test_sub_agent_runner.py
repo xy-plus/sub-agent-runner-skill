@@ -395,6 +395,13 @@ class TestRuntimeErrorLines(unittest.TestCase):
     def test_codex_core_session不是良性_它是最该报的那类(self):
         self.assertEqual(len(ca.runtime_error_lines(ERR_TRACING_UNKNOWN)), 1)
 
+    def test_缩进的三种错误形式都是转述输出(self):
+        # strip() 会把别的任务的 status 明细冒充成本任务的错误；ANSI 不改变缩进。
+        for indent in ("  ", "\t"):
+            for line in (ERR_USER_LAYER_REAL, ERR_TRACING_UNKNOWN, ERR_FATAL):
+                with self.subTest(indent=indent, line=line):
+                    self.assertEqual(ca.runtime_error_lines(indent + line + "  \n"), [])
+
     def test_子进程输出和brief原文不算运行时ERROR(self):
         noise = "\n".join([
             "error[E0599]: no method named `cols_at` found for struct `Arc<Broker>`",
@@ -819,6 +826,70 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "success")
         self.assertEqual(v.detail[0], "干完了，见分支 feat/x")
 
+    def test_报告在且Rust测试转述Error仍然success(self):
+        # 原样取自 qd-live-service-impl-1010.log:7704–7710（2026-10-10）。
+        # 把形式 C 无条件留在有报告分支，会把先红后绿的正常交付判成 suspect。
+        self.report.write_text("干完了，测试全绿\n")
+        text = (
+            "thread 'live_rejects_sixteen_raw_retention_days_before_writing' (1106865) "
+            "panicked at tests/live_service.rs:78:5:\n"
+            "Error: 实时服务第二轮尚待接入 LiveFeed、pipeline 与 LiveSink\n"
+            "\n"
+            "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+            "test live_rejects_sixteen_raw_retention_days_before_writing ... FAILED\n"
+        )
+        v = self._judge(text)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["干完了，测试全绿"])
+
+    def test_报告在且顶格形式A仍然success(self):
+        # 前三项取自现网日志的 unittest、pip、pytest 输出；按文字白名单会漏掉其他 A。
+        self.report.write_text("干完了，测试全绿\n")
+        cases = (
+            ("unittest", "ERROR: test_it_names_the_pyvenv_cfg_flag_when_that_is_what_it_measured "
+             "(test_shared_tools.PythonEnv.test_it_names_the_pyvenv_cfg_flag_when_that_is_what_it_measured)"),
+            ("pip", "ERROR: Cannot install quant-engine 0.1.0 (from /home/xy/quant-workspace/"
+             "quant-engine/.worktree/product-scale-name/target/wheels/quant_engine-0.1.0-cp312-cp312-linux_x86_64.whl) "
+             "and quant-engine 0.1.0 (from /home/xy/quant-workspace/quant-engine/.worktree/product-scale-name/"
+             "target/wheels/quant_engine-0.1.0-cp312-cp312-manylinux_2_34_x86_64.whl) "
+             "because these package versions have conflicting dependencies."),
+            ("pytest", "ERROR: found no collectors for /home/xy/quant-workspace/quant-strategy/"
+             ".worktrees/cma-search/python/tests/test_search_cma_trajectory.py::"
+             "test_resume_finishes_a_partially_recorded_generation_before_checking_budget"),
+            ("额度", ERR_USER_LAYER_REAL),
+            ("WARN", "WARN: temporary service failure"),
+        )
+        for name, text in cases:
+            with self.subTest(source=name):
+                v = self._judge(text + "\n")
+                self.assertEqual(v.state, "success")
+                self.assertEqual(ca.EXIT[v.state], 0)
+                self.assertEqual(v.detail, ["干完了，测试全绿"])
+
+    def test_报告在且缩进状态明细仍然success(self):
+        self.report.write_text("干完了\n")
+        text = (
+            "  ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
+            "settings/usage to purchase more credits or try again at Sep 26th, 2026 5:47 PM.\n"
+            "  2026-09-20T00:57:43.733642Z ERROR codex_core::session: "
+            "failed to record rollout items: thread 01a0bc31-2c06-79b1-af79-c8973d66eb64 not found\n"
+        )
+        v = self._judge(text)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["干完了"])
+
+    def test_报告在且转述A和C不能盖掉顶格B(self):
+        self.report.write_text("干完了\n")
+        error = ("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                 "Failed to create session: thread-store conflict")
+        v = self._judge("Error: 实时服务第二轮尚待接入 LiveFeed、pipeline 与 LiveSink\n"
+                        "ERROR: unexpected session failure\n" + error + "\n")
+        self.assertEqual(v.state, "suspect")
+        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.detail, [error])
+
     def test_预览最多几行_长报告不刷屏(self):
         self.report.write_text("\n".join(f"第 {i} 行" for i in range(50)))
         v = self._judge()
@@ -827,15 +898,24 @@ class TestJudge(unittest.TestCase):
 
     def test_报告在但本轮日志有未分类错误是suspect(self):
         self.report.write_text("干完了")
-        v = self._judge("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
-                        "Failed to create session: thread-store conflict\n")
+        error = ("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
+                 "Failed to create session: thread-store conflict")
+        v = self._judge(error + "\n")
         self.assertEqual(v.state, "suspect")
-        self.assertEqual(len(v.detail), 1)
+        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.detail, [error])
 
     def test_撞上写锁_reason要点名(self):
-        v = self._judge(ERR_FATAL + "\n")
-        self.assertEqual(v.state, "failed")
-        self.assertIn("锁", v.reason)
+        for report_text in (None, "", " \n"):
+            with self.subTest(report_text=report_text):
+                if report_text is not None:
+                    self.report.write_text(report_text)
+                v = self._judge(ERR_FATAL + "\n")
+                self.assertEqual(v.state, "failed")
+                self.assertEqual(ca.EXIT[v.state], 1)
+                self.assertIn("写锁", v.reason)
+                self.assertIn("只能新起一个任务", v.reason)
+                self.assertEqual(v.detail, [ERR_FATAL])
 
     def test_清报告之后旧内容不会被当成本轮产物(self):
         # codex 只在正常收尾时写 -o、启动时不 truncate。不清掉的话，一次秒死于
@@ -1972,9 +2052,8 @@ class TestDeepseekRunner(_HomeSandbox):
         注释写着「实测进程被 SIGINT 杀掉时最后一行必然是残的」——
         **SIGINT 正是 `stop` / `interrupt-and-resume` 的正常路径**，不是边角情况。
 
-        后果是这个工具立项要杀的那一类：一轮所有工具调用都被拒、报告里明写
-        「我写不进去」，而判据报 **success 退 0**。补错误行本来是「零工作量的
-        成功」两道防线里的**第二道**，粘住之后它一点都不剩。
+        粘住之后分类器拿不到错误行，无报告时 failed.detail 就会丢掉工具被拒的原因。
+        有报告时按共享判据忽略 A；日志里的原始诊断仍须保留。
 
         同一份文件里 `interrupt_agent` 和写轮次分隔符**都**做了无条件前置换行，
         理由逐字相同（「接在半行后面的痕迹，判据当场认不出」）。这里照它们办。
@@ -1988,8 +2067,14 @@ class TestDeepseekRunner(_HomeSandbox):
         errs = ca.runtime_error_lines(text)
         self.assertEqual(len(errs), 1, f"补的行没落在行首，^ERROR: 匹配不上：{text!r}")
         v = ca.judge(ca.Round(rp, text))
-        self.assertEqual(v.state, "suspect")
-        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["我写不进去"])
+        ca.clear_report(rp)
+        v = ca.judge(ca.Round(rp, text))
+        self.assertEqual(v.state, "failed")
+        self.assertEqual(ca.EXIT[v.state], 1)
+        self.assertIn("Write", "".join(v.detail))
 
     def test_补行之前无条件加换行_轮末干净时多出的空行无害(self):
         # 无条件前置换行，和 interrupt_agent／轮次分隔符同一条做法：
@@ -2013,9 +2098,8 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertIn("error_during_execution", "\n".join(lines))
         self.assertEqual(ca.runtime_error_lines("\n".join(lines)), lines)
 
-    def test_工具被拒时也补一行_于是judge给suspect(self):
-        # 报告在（它确实收尾了）+ 有错误行 → suspect → 退 3「要人看一眼」。
-        # 用的是现有状态机，零新分支。
+    def test_工具被拒时补的A行按报告条件计入判据(self):
+        # 共享 judge 对有报告的 A 给 success；无报告时仍把这条诊断交给调用方。
         rp, lp = self.home / "r.md", self.home / "t.log"
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.DENIED, rp, lp)
@@ -2023,8 +2107,14 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertTrue(any("被拒" in l for l in lines))
         self.assertIn("Write", "".join(lines))
         v = ca.judge(ca.Round(rp, "\n".join(lines)))
-        self.assertEqual(v.state, "suspect")
-        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["我写不进去"])
+        ca.clear_report(rp)
+        v = ca.judge(ca.Round(rp, "\n".join(lines)))
+        self.assertEqual(v.state, "failed")
+        self.assertEqual(ca.EXIT[v.state], 1)
+        self.assertIn("Write", "".join(v.detail))
 
     def test_打断的那一轮judge给interrupted_和codex侧逐字一致(self):
         rp, lp = self.home / "r.md", self.home / "t.log"
@@ -2497,19 +2587,26 @@ class TestDeepseekWiring(_HomeSandbox):
         self.assertTrue(ca._log_path(d, "t").read_bytes().endswith(残片),
                         "残片没原样留在末尾——「这一轮被杀在半路」的现场证据丢了")
 
-    def test_轮末有残片时补的错误行照样被judge看见(self):
+    def test_轮末有残片时补的错误行照样被分类器看见(self):
         """**C1 的端到端落点。** 纯函数那条钉的是「补的行落在行首」，
         这条钉的是整条链在**真实形状**下的结论。
 
-        真实形状就是这个：`_tee_lines` 的残片不带尾换行，而 SIGINT 是
-        `stop` / `interrupt-and-resume` 的正常路径——两者叠起来，
-        「工具调用全被拒」这一轮会被报成 success 退 0。
+        真实形状就是这个：`_tee_lines` 的残片不带尾换行，补的诊断必须能被分类器识别。
+        有报告时 A 不影响结论；没有报告时它仍须出现在 failed.detail。
         """
         残片 = b'{"type":"zzz-\xe5\x8d\x8a\xe8\xa1\x8c","subtyp'
         d, _, _, round_ = self._run([self.INIT, self.DENIED], trailing=残片)
+        errors = ca.runtime_error_lines(round_.text)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Write", "".join(errors))
         v = ca.judge(round_)
-        self.assertEqual(v.state, "suspect", f"本轮文本：{round_.text!r}")
-        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.state, "success", f"本轮文本：{round_.text!r}")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["我写不进去"])
+        ca.clear_report(round_.report_path)
+        v = ca.judge(round_)
+        self.assertEqual(v.state, "failed")
+        self.assertEqual(ca.EXIT[v.state], 1)
         self.assertIn("Write", "".join(v.detail))
 
     def test_codex那条tee路径一个字节没改_同样的行原样留着(self):
@@ -2550,16 +2647,21 @@ class TestDeepseekWiring(_HomeSandbox):
         self.assertEqual(ca.judge(round_).state, "interrupted")
         self.assertEqual(ca.EXIT[ca.judge(round_).state], 130)
 
-    # ── ⑥ 权限受阻真的变红 ─────────────────────────────────────────
-    def test_工具被拒时日志有ERROR行_而且judge看得见(self):
+    # ── ⑥ 权限诊断留在本轮日志 ──────────────────────────────────────
+    def test_工具被拒时日志有ERROR行_无报告时judge看得见(self):
         # **ERROR 行必须落在本轮边界之内**，否则补了等于没补。
         d, _, _, round_ = self._run([self.INIT, self.DENIED])
         self.assertTrue(ca._report_path(d, "t").exists(), "它确实收尾了，报告该在")
         self.assertIn("ERROR: ", ca._log_path(d, "t").read_text())
         self.assertIn("ERROR: ", round_.text, "补的行落在本轮边界之外，judge 看不见")
         v = ca.judge(round_)
-        self.assertEqual(v.state, "suspect")
-        self.assertEqual(ca.EXIT[v.state], 3)
+        self.assertEqual(v.state, "success")
+        self.assertEqual(ca.EXIT[v.state], 0)
+        self.assertEqual(v.detail, ["我写不进去"])
+        ca.clear_report(round_.report_path)
+        v = ca.judge(round_)
+        self.assertEqual(v.state, "failed")
+        self.assertEqual(ca.EXIT[v.state], 1)
         self.assertIn("Write", "".join(v.detail))
 
     def test_一切正常时日志里不许多出ERROR行(self):
@@ -4178,7 +4280,7 @@ class TestAutoAccountPick(_HomeSandbox):
         报告写到 **argv 里 `-o` 指的那个路径**，和真的 codex 一样——
         `run_codex` 在 spawn 之前才刚把它删掉，写在这里才验得到清报告那一步。
         **文本里有错误行就不写报告**：`cmd_run` 只在 `failed` 那一支上才去记
-        限流，而「有报告 + 有错误行」判的是 suspect，走不到那里。
+        限流；有报告时 A 不计入，所以假进程须还原额度错误发生在写报告前的情形。
         """
         def one(argv, *a, **kwargs):
             self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
@@ -4886,8 +4988,9 @@ class TestStatusIsSplittable(_HomeSandbox):
     def test_明细行有缩进_数据行没有(self):
         d = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
+        # 有报告时 C 是转述输出；用未知 target 的 B 保持 suspect，继续验证格式。
         ca._log_path(d, "t").write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00")
-                                        + "\n" + ERR_FATAL + "\n")
+                                        + "\n" + ERR_TRACING_UNKNOWN + "\n")
         ca._report_path(d, "t").write_text("干完了\n")
         screen = io.StringIO()
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
