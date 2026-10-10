@@ -395,7 +395,7 @@ class TestRuntimeErrorLines(unittest.TestCase):
     def test_codex_core_session不是良性_它是最该报的那类(self):
         self.assertEqual(len(ca.runtime_error_lines(ERR_TRACING_UNKNOWN)), 1)
 
-    def test_缩进的三种错误形式都是转述输出(self):
+    def test_indented_errors_are_ignored(self):
         # strip() 会把别的任务的 status 明细冒充成本任务的错误；ANSI 不改变缩进。
         for indent in ("  ", "\t"):
             for line in (ERR_USER_LAYER_REAL, ERR_TRACING_UNKNOWN, ERR_FATAL):
@@ -826,7 +826,7 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(v.state, "success")
         self.assertEqual(v.detail[0], "干完了，见分支 feat/x")
 
-    def test_报告在且Rust测试转述Error仍然success(self):
+    def test_report_with_rust_error_output_is_success(self):
         # 原样取自 qd-live-service-impl-1010.log:7704–7710（2026-10-10）。
         # 把形式 C 无条件留在有报告分支，会把先红后绿的正常交付判成 suspect。
         self.report.write_text("干完了，测试全绿\n")
@@ -843,7 +843,7 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(ca.EXIT[v.state], 0)
         self.assertEqual(v.detail, ["干完了，测试全绿"])
 
-    def test_报告在且顶格形式A仍然success(self):
+    def test_report_with_user_error_lines_is_success(self):
         # 前三项取自现网日志的 unittest、pip、pytest 输出；按文字白名单会漏掉其他 A。
         self.report.write_text("干完了，测试全绿\n")
         cases = (
@@ -867,7 +867,7 @@ class TestJudge(unittest.TestCase):
                 self.assertEqual(ca.EXIT[v.state], 0)
                 self.assertEqual(v.detail, ["干完了，测试全绿"])
 
-    def test_报告在且缩进状态明细仍然success(self):
+    def test_report_with_indented_status_details_is_success(self):
         self.report.write_text("干完了\n")
         text = (
             "  ERROR: You’ve hit your usage limit. Visit https://chatgpt.com/codex/"
@@ -880,7 +880,7 @@ class TestJudge(unittest.TestCase):
         self.assertEqual(ca.EXIT[v.state], 0)
         self.assertEqual(v.detail, ["干完了"])
 
-    def test_报告在且转述A和C不能盖掉顶格B(self):
+    def test_report_with_mixed_error_forms_keeps_tracing_error(self):
         self.report.write_text("干完了\n")
         error = ("2026-09-17T14:35:32.578919Z ERROR codex_core::session: "
                  "Failed to create session: thread-store conflict")
@@ -2041,7 +2041,7 @@ class TestDeepseekRunner(_HomeSandbox):
         rp, lp = self.home / "r.md", self.home / "t.log"
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.DENIED, rp, lp)
-        self.assertTrue(rp.exists())
+        self.assertFalse(rp.exists())
         self.assertIn("ERROR: ", lp.read_text())
 
     def test_补的错误行必须落在行首_轮末是残片时也一样(self):
@@ -2053,7 +2053,6 @@ class TestDeepseekRunner(_HomeSandbox):
         **SIGINT 正是 `stop` / `interrupt-and-resume` 的正常路径**，不是边角情况。
 
         粘住之后分类器拿不到错误行，无报告时 failed.detail 就会丢掉工具被拒的原因。
-        有报告时按共享判据忽略 A；日志里的原始诊断仍须保留。
 
         同一份文件里 `interrupt_agent` 和写轮次分隔符**都**做了无条件前置换行，
         理由逐字相同（「接在半行后面的痕迹，判据当场认不出」）。这里照它们办。
@@ -2067,14 +2066,8 @@ class TestDeepseekRunner(_HomeSandbox):
         errs = ca.runtime_error_lines(text)
         self.assertEqual(len(errs), 1, f"补的行没落在行首，^ERROR: 匹配不上：{text!r}")
         v = ca.judge(ca.Round(rp, text))
-        self.assertEqual(v.state, "success")
-        self.assertEqual(ca.EXIT[v.state], 0)
-        self.assertEqual(v.detail, ["我写不进去"])
-        ca.clear_report(rp)
-        v = ca.judge(ca.Round(rp, text))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
-        self.assertIn("Write", "".join(v.detail))
 
     def test_补行之前无条件加换行_轮末干净时多出的空行无害(self):
         # 无条件前置换行，和 interrupt_agent／轮次分隔符同一条做法：
@@ -2098,8 +2091,8 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertIn("error_during_execution", "\n".join(lines))
         self.assertEqual(ca.runtime_error_lines("\n".join(lines)), lines)
 
-    def test_工具被拒时补的A行按报告条件计入判据(self):
-        # 共享 judge 对有报告的 A 给 success；无报告时仍把这条诊断交给调用方。
+    def test_denied_tools_fail_without_a_report(self):
+        # 结构化拒绝阻止适配器写报告，诊断仍由共享 judge 交给调用方。
         rp, lp = self.home / "r.md", self.home / "t.log"
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.DENIED, rp, lp)
@@ -2107,14 +2100,8 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertTrue(any("被拒" in l for l in lines))
         self.assertIn("Write", "".join(lines))
         v = ca.judge(ca.Round(rp, "\n".join(lines)))
-        self.assertEqual(v.state, "success")
-        self.assertEqual(ca.EXIT[v.state], 0)
-        self.assertEqual(v.detail, ["我写不进去"])
-        ca.clear_report(rp)
-        v = ca.judge(ca.Round(rp, "\n".join(lines)))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
-        self.assertIn("Write", "".join(v.detail))
 
     def test_打断的那一轮judge给interrupted_和codex侧逐字一致(self):
         rp, lp = self.home / "r.md", self.home / "t.log"
@@ -2587,12 +2574,12 @@ class TestDeepseekWiring(_HomeSandbox):
         self.assertTrue(ca._log_path(d, "t").read_bytes().endswith(残片),
                         "残片没原样留在末尾——「这一轮被杀在半路」的现场证据丢了")
 
-    def test_轮末有残片时补的错误行照样被分类器看见(self):
+    def test_denied_tools_with_partial_line_keep_failure_details(self):
         """**C1 的端到端落点。** 纯函数那条钉的是「补的行落在行首」，
         这条钉的是整条链在**真实形状**下的结论。
 
         真实形状就是这个：`_tee_lines` 的残片不带尾换行，补的诊断必须能被分类器识别。
-        有报告时 A 不影响结论；没有报告时它仍须出现在 failed.detail。
+        工具调用被拒时不写报告，诊断仍须出现在 failed.detail。
         """
         残片 = b'{"type":"zzz-\xe5\x8d\x8a\xe8\xa1\x8c","subtyp'
         d, _, _, round_ = self._run([self.INIT, self.DENIED], trailing=残片)
@@ -2600,9 +2587,8 @@ class TestDeepseekWiring(_HomeSandbox):
         self.assertEqual(len(errors), 1)
         self.assertIn("Write", "".join(errors))
         v = ca.judge(round_)
-        self.assertEqual(v.state, "success", f"本轮文本：{round_.text!r}")
-        self.assertEqual(ca.EXIT[v.state], 0)
-        self.assertEqual(v.detail, ["我写不进去"])
+        self.assertEqual(v.state, "failed", f"本轮文本：{round_.text!r}")
+        self.assertEqual(ca.EXIT[v.state], 1)
         ca.clear_report(round_.report_path)
         v = ca.judge(round_)
         self.assertEqual(v.state, "failed")
@@ -2648,21 +2634,15 @@ class TestDeepseekWiring(_HomeSandbox):
         self.assertEqual(ca.EXIT[ca.judge(round_).state], 130)
 
     # ── ⑥ 权限诊断留在本轮日志 ──────────────────────────────────────
-    def test_工具被拒时日志有ERROR行_无报告时judge看得见(self):
+    def test_denied_tool_error_stays_in_current_round(self):
         # **ERROR 行必须落在本轮边界之内**，否则补了等于没补。
         d, _, _, round_ = self._run([self.INIT, self.DENIED])
-        self.assertTrue(ca._report_path(d, "t").exists(), "它确实收尾了，报告该在")
+        self.assertFalse(ca._report_path(d, "t").exists(), "工具被拒时不能生成成功报告")
         self.assertIn("ERROR: ", ca._log_path(d, "t").read_text())
         self.assertIn("ERROR: ", round_.text, "补的行落在本轮边界之外，judge 看不见")
         v = ca.judge(round_)
-        self.assertEqual(v.state, "success")
-        self.assertEqual(ca.EXIT[v.state], 0)
-        self.assertEqual(v.detail, ["我写不进去"])
-        ca.clear_report(round_.report_path)
-        v = ca.judge(round_)
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
-        self.assertIn("Write", "".join(v.detail))
 
     def test_一切正常时日志里不许多出ERROR行(self):
         d, _, _, round_ = self._run([self.INIT, self.OK])

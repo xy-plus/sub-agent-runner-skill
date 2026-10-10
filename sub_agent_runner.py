@@ -355,20 +355,13 @@ def interrupt_agent(pid, log_path, cause):
         pass
 
 
-# codex 自己的错误有三种锚定形式（2026-09-19 对 106 份真实日志全量统计），
+# codex 自己的错误有三种锚定形式，
 # 都是顶格输出；缩进的 status 明细等转述内容不能去掉行首空白后冒充它们：
-#   A 用户层   `ERROR: Reconnecting... 2/5`                  行首是 ERROR:／WARN:   23 行
-#   B tracing `<ISO 时间戳> ERROR codex_core::session: …`     行首是时间戳，带 target 92 行
-#   C 致命候选 `Error: thread/resume: … active writer`        行首是大写 Error:       5 行
+#   A 用户层   `ERROR: Reconnecting... 2/5`                  行首是 ERROR:／WARN:
+#   B tracing `<ISO 时间戳> ERROR codex_core::session: …`     行首是时间戳，带 target
+#   C 致命候选 `Error: thread/resume: … active writer`        行首是大写 Error:
 # 形式 C 首字母是大写 E，`^ERROR:` 大小写敏感、匹配不到它——而它恰恰是「会话被
-# 锁死」那条最该报的错，但只有本轮没有非空报告时才计入判据（见 judge）。
-# 2026-10-10 全量日志复核：旧规则识别的 30 行 C 全在日志中间，后面还有 codex
-# 继续工作的输出，来自 Rust anyhow、cargo 测试 panic、caddy 等子进程或状态回显。
-# codex 只在正常收尾时写 -o 报告；顶层致命错误会在收尾前退出，两者不会同时出现。
-# 同日实现重判另发现 18 份有报告的任务仅因顶格 A（unittest、pip、pytest）判 3：
-# A 与工具输出按文字分不开。有报告时的 A、C 是转述或已恢复的瞬时错误，
-# 不说明交付有问题；因此有报告时只按 B（时间戳 + 内部 target）判 suspect。
-# 没有非空报告时仍收 A、B、C，保留额度、写锁等失败原因；B 的良性名单不变。
+# 锁死」那条最该报的错。
 # 日志里还混着 brief 原文和 codex 转述的子进程输出（cargo 的 error[E0599]、
 # pytest 的 `E   KeyError`、markdown 的 `## Warning Signs`），
 # 所以绝不能用裸 grep ERROR —— 会大面积误报。
@@ -454,7 +447,7 @@ def runtime_error_lines(round_text):
     """本轮顶格的错误候选行（已滤掉良性 target 与良性用户层消息）。
 
     行首空白保留：缩进行是子进程或别的任务的状态明细，不分类；行尾空白照旧去掉。
-    返回的 A、C 尚未结合报告判断；judge 无报告时保留全部候选，有报告时只保留 B。
+    返回的 A、C 尚未结合报告判断。
 
     **本轮的边界由调用方划好再传进来**，本函数不再自己切——切法有两种
     （拥有者用偏移、观察者用最后一轮），藏在这里面就只剩「猜」一种。
@@ -830,8 +823,6 @@ def judge(round):
 
     codex 的退出码不可信：中途已恢复的工具 ERROR（apply_patch 被拒后重打成功）
     也会把退出码染成 1。所以判据只看产物和日志，不看退出码。
-    没有非空报告时收 A、B、C；有报告说明正常收尾，A、C 是已恢复的瞬时错误或
-    转述输出，只保留顶格、非良性 target 的结构化形式 B 作为 suspect 的证据。
     """
     report_path, round_text = round.report_path, round.text
     errors = runtime_error_lines(round_text)
@@ -1414,10 +1405,7 @@ def deepseek_log_lines(round_text):
     两种要补：
 
         非 success    → `failed`（报告没写）
-        工具调用被拒  → 诊断留在日志里；无报告时也进入 failed.detail。
-                        有报告时按共享 judge 的规则不计入 A，不再据此判 suspect。
-
-    这两种补行都是 A，不产生 B；有报告时只看 B 的规则两侧共用，不按 runner 分支。
+        工具调用被拒  → `failed`（报告不写，诊断进入 detail）
     """
     event = _last_result_event(round_text)
     if event is None:
@@ -1438,7 +1426,7 @@ def finish_deepseek_round(round_text, report_path, log_path):
     """把本轮的产物摆成 `judge` 认识的形状。**这是 deepseek 侧唯一的收尾入口。**
 
     两件事焊在一起，调用方没有「只写报告、忘了补错误行」这种写法：
-      ① **只在真 success 时**把 `result` 写进报告文件
+      ① **只在 success 且没有工具调用被拒时**把 `result` 写进报告文件
       ② 把 `deepseek_log_lines` 那几行追加进日志
 
     ① 是 `judge` 一行不改的全部原因：现有那条「报告没出现＝没正常收尾」原样生效，
@@ -1449,7 +1437,8 @@ def finish_deepseek_round(round_text, report_path, log_path):
     `judge` 看不见——那就等于没补。
     """
     event = _last_result_event(round_text)
-    if event is not None and event.get("subtype") == "success":
+    if (event is not None and event.get("subtype") == "success"
+            and not event.get("permission_denials")):
         report_path.write_text(event.get("result") or "")
     lines = deepseek_log_lines(round_text)
     if lines:
@@ -1461,7 +1450,7 @@ def finish_deepseek_round(round_text, report_path, log_path):
             # 现场证据），而 `_last_result_event` 的注释写着「进程被 SIGINT 杀掉时
             # 最后一行必然是残的」，**SIGINT 正是 stop / interrupt-and-resume 的
             # 正常路径**。粘住之后分类器拿不到错误行，无报告时 failed.detail
-            # 会丢掉工具被拒的诊断；有报告时 A 不影响结论，但诊断仍须留在日志里。
+            # 会丢掉工具被拒的诊断。
             # **不判断「末尾在不在行首」**：那没有可靠的现场判据（另一个进程可能
             # 正在追加），而多一个空行的代价是零、判断错的代价是整条判据失明。
             log.write(("\n" + "\n".join(lines) + "\n").encode())
