@@ -2006,7 +2006,7 @@ def _wait_previous_round_ends(runner, home, task, timeout, poll_interval):
 
 
 def run_codex(kind, home, task, meta, make_argv):
-    """唯一的 spawn 入口。**返回一个 `Round`**：报告路径 + 本轮日志文本、同会话历史
+    """唯一的 spawn 入口。**返回一个 `Round`**：报告路径 + 本轮日志文本
     （codex 退出那一刻的快照）。
 
     开跑前必须做的三件事全在这里，调用方不需要记住顺序：

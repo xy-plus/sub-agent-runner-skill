@@ -706,94 +706,13 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             return mock.DEFAULT
         return spawn
 
-    def _logged_round(self, home, kind, text, report_text):
-        # 只替换外部 spawn；边界、清报告与 Round 回传都用真的 run_codex。
-        meta = _full_meta("t", session_id="s1", dir=str(self.workdir), effort="max")
-        with _no_codex() as popen:
-            popen.side_effect = self._spawner(home, report_text, text)
-            return ca.run_codex(kind, home, "t", meta, lambda r: ["codex"])
-
-    def test_orphan_succeeds_on_first_run_and_resume(self):
-        # 压缩上下文后的迟到输出不能说明失败；首次、重报与新 id 都归良性。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        first = ca.judge(self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n"))
-        self.assertEqual(first.state, "success")
-        self.assertEqual(ca.EXIT[first.state], 0)
-        self.assertEqual(first.detail, ["干完了"])
-        for kind in ("resume", "interrupt-and-resume"):
-            with self.subTest(kind=kind):
-                text = (ERR_ORPHAN_REPEAT + "\n" + ERR_ORPHAN_OTHER.replace("ERROR", "WARN")
-                        + "\n  " + ERR_ORPHAN_REAL + "\n\t" + ERR_ORPHAN_REPEAT + "\n")
-                verdict = ca.judge(self._logged_round(home, kind, text, "干完了\n"))
-                self.assertEqual(verdict.state, "success")
-                self.assertEqual(ca.EXIT[verdict.state], 0)
-                self.assertEqual(verdict.detail, ["干完了"])
-
-    def test_orphan_does_not_hide_other_tracing_errors(self):
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        util_error = "2026-10-10T16:05:02.000000Z ERROR codex_core::util: unexpected tool failure"
-        database_error = "2026-10-10T16:05:03.000000Z ERROR codex_state::sqlite: SQLite database is corrupt"
-        text = (ERR_ORPHAN_REAL + "\n" + util_error + "\n" + database_error + "\n"
-                + ERR_ORPHAN_OTHER + "\n" + database_error + "\n")
-        verdict = ca.judge(self._logged_round(
-            home, "run", text, "干完了\n"))
-        self.assertEqual(verdict.state, "suspect")
-        self.assertEqual(ca.EXIT[verdict.state], 3)
-        self.assertEqual(verdict.detail, [util_error, database_error, database_error])
-
-    def test_orphan_requires_exact_target_and_complete_message(self):
-        # 整个 target 或消息子串放行会吞真错误；空 id、空白分隔的附加文字不能获豁免。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        candidates = (
-            ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::session"),
-            ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::util::worker"),
-            ERR_ORPHAN_REPEAT.replace("Orphan", "Observed Orphan"),
-            ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ":",
-            ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ": ",
-            ERR_ORPHAN_REPEAT + " extra text",
-            ERR_ORPHAN_REPEAT + "\textra text",
-        )
-        for level in ("ERROR", "WARN"):
-            for candidate in candidates:
-                candidate = candidate.replace("ERROR", level)
-                with self.subTest(candidate=candidate):
-                    text = ERR_ORPHAN_REAL + "\n" + candidate + "\n"
-                    self.assertEqual(ca.runtime_error_lines(text), [candidate.rstrip()])
-                    verdict = ca.judge(self._logged_round(home, "run", text, "干完了\n"))
-                    self.assertEqual(verdict.state, "suspect")
-                    self.assertEqual(ca.EXIT[verdict.state], 3)
-                    self.assertEqual(verdict.detail, [candidate.rstrip()])
-
-    def test_orphan_without_report_keeps_state_and_reason(self):
-        # 分类处只删除孤儿；没有报告仍不算正常收尾，INT、额度和写锁优先级不变。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        cases = (
-            ("reported control", "干完了\n", "", "success", "正常收尾", ["干完了"]),
-            ("missing", None, "", "failed", "报告缺失或为空＝没正常收尾", []),
-            ("empty", "", "", "failed", "报告缺失或为空＝没正常收尾", []),
-            ("blank", " \n", "", "failed", "报告缺失或为空＝没正常收尾", []),
-            ("interrupted", "", ca.INTERRUPT_MARK + "\n", "interrupted", "resume",
-             []),
-            ("usage limit", " \n", ERR_USER_LAYER_REAL + "\n", "failed", "额度上限",
-             [ERR_USER_LAYER_REAL]),
-            ("writer lock", None, ERR_FATAL + "\n", "failed", "写锁",
-             [ERR_FATAL]),
-        )
-        for name, report, suffix, state, reason, detail in cases:
-            with self.subTest(round=name):
-                text = ERR_ORPHAN_REAL + "\n" + ERR_ORPHAN_REPEAT + "\n" + suffix
-                verdict = ca.judge(self._logged_round(
-                    home, "run", text, report))
-                self.assertEqual(verdict.state, state)
-                self.assertIn(reason, verdict.reason)
-                self.assertEqual(verdict.detail, detail)
-
     def test_status_and_resume_owner_agree_on_first_orphan(self):
         # 只替换外部 spawn；首次孤儿在真实拥有者与观察者入口都应返回 0。
         home = ca.ensure_isolation(ca.CODEX, "default")
         resume_args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
-        self._logged_round(home, "run", "正常收尾\n", "干完了\n")
+        ca.write_meta(home, "t", _full_meta("t", session_id="s1",
+                                          dir=str(self.workdir), effort="max"))
         real_judge = ca.judge
         owner, observer = [], []
 
@@ -905,6 +824,64 @@ class TestJudge(unittest.TestCase):
 
     def _judge(self, round_text="正常收尾\n"):
         return ca.judge(ca.Round(self.report, round_text))
+
+    def test_orphan_does_not_hide_other_tracing_errors(self):
+        self.report.write_text("干完了\n")
+        util_error = "2026-10-10T16:05:02.000000Z ERROR codex_core::util: unexpected tool failure"
+        database_error = "2026-10-10T16:05:03.000000Z ERROR codex_state::sqlite: SQLite database is corrupt"
+        text = (ERR_ORPHAN_REAL + "\n" + util_error + "\n" + database_error + "\n"
+                + ERR_ORPHAN_OTHER + "\n" + database_error + "\n")
+        verdict = self._judge(text)
+        self.assertEqual(verdict.state, "suspect")
+        self.assertEqual(ca.EXIT[verdict.state], 3)
+        self.assertEqual(verdict.detail, [util_error, database_error, database_error])
+
+    def test_orphan_requires_exact_target_and_complete_message(self):
+        # 整个 target 或消息子串放行会吞真错误；空 id、空白分隔的附加文字不能获豁免。
+        self.report.write_text("干完了\n")
+        candidates = (
+            ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::session"),
+            ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::util::worker"),
+            ERR_ORPHAN_REPEAT.replace("Orphan", "Observed Orphan"),
+            ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ":",
+            ERR_ORPHAN_REPEAT + " extra text",
+            ERR_ORPHAN_REPEAT + "\textra text",
+        )
+        for level in ("ERROR", "WARN"):
+            for candidate in candidates:
+                candidate = candidate.replace("ERROR", level)
+                with self.subTest(candidate=candidate):
+                    text = ERR_ORPHAN_REAL + "\n" + candidate + "\n"
+                    self.assertEqual(ca.runtime_error_lines(text), [candidate.rstrip()])
+                    verdict = self._judge(text)
+                    self.assertEqual(verdict.state, "suspect")
+                    self.assertEqual(ca.EXIT[verdict.state], 3)
+                    self.assertEqual(verdict.detail, [candidate.rstrip()])
+
+    def test_orphan_without_report_keeps_state_and_reason(self):
+        # 分类处只删除孤儿；没有报告仍不算正常收尾，INT、额度和写锁优先级不变。
+        cases = (
+            ("missing", None, "", "failed", "报告缺失或为空＝没正常收尾", []),
+            ("empty", "", "", "failed", "报告缺失或为空＝没正常收尾", []),
+            ("blank", " \n", "", "failed", "报告缺失或为空＝没正常收尾", []),
+            ("interrupted", "", ca.INTERRUPT_MARK + "\n", "interrupted", "resume",
+             []),
+            ("usage limit", " \n", ERR_USER_LAYER_REAL + "\n", "failed", "额度上限",
+             [ERR_USER_LAYER_REAL]),
+            ("writer lock", None, ERR_FATAL + "\n", "failed", "写锁",
+             [ERR_FATAL]),
+        )
+        for name, report, suffix, state, reason, detail in cases:
+            with self.subTest(round=name):
+                if report is None:
+                    self.report.unlink(missing_ok=True)
+                else:
+                    self.report.write_text(report)
+                text = ERR_ORPHAN_REAL + "\n" + ERR_ORPHAN_REPEAT + "\n" + suffix
+                verdict = self._judge(text)
+                self.assertEqual(verdict.state, state)
+                self.assertIn(reason, verdict.reason)
+                self.assertEqual(verdict.detail, detail)
 
     def test_报告缺失是failed(self):
         v = self._judge()
