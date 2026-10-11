@@ -454,7 +454,19 @@ def _round_texts(history, text):
     for mark in _ROUND_LINE.finditer(history):
         if mark.group().startswith(ROUND_MARK + "run "):
             session_start = mark.end()
-    return text, history[session_start:]
+    # Codex 在 user 到随后 codex 标记之间原样回显说明，顶格诊断也只是引用。
+    # 每轮分别排除这一段历史；本轮文本原样保留，无报告的判据与明细不受影响。
+    history_lines = []
+    in_brief = False
+    for line in history[session_start:].splitlines(keepends=True):
+        marker = line.rstrip("\r\n")
+        if _ROUND_LINE.fullmatch(marker) or marker == "codex":
+            in_brief = False
+        elif marker == "user":
+            in_brief = True
+        if not in_brief:
+            history_lines.append(line)
+    return text, "".join(history_lines)
 
 
 def runtime_error_lines(round_text):

@@ -344,6 +344,17 @@ class _HomeSandbox(unittest.TestCase):
         for q in reversed(self.patches):
             q.stop()
 
+    def _spawner(self, d, report_text, log_extra):
+        """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
+        def spawn(*a, **k):
+            if report_text is not None:
+                (d / "reports" / "t.md").write_text(report_text)
+            if log_extra:
+                with open(d / "logs" / "t.log", "a") as f:
+                    f.write(log_extra + "\n")
+            return mock.DEFAULT
+        return spawn
+
 
 class TestModuleCompilesClean(unittest.TestCase):
     """源码编译不许产生任何警告。
@@ -693,20 +704,11 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             return mock.DEFAULT
         return spawn
 
-    def _spawn_output(self, home, text, report_text):
-        def spawn(*a, **k):
-            with open(ca._log_path(home, "t"), "ab") as log:
-                log.write(text.encode())
-            if report_text is not None:
-                ca._report_path(home, "t").write_text(report_text)
-            return mock.DEFAULT
-        return spawn
-
     def _logged_round(self, home, kind, text, report_text):
         # 只替换外部 spawn；边界、清报告与 Round 回传都用真的 run_codex。
         meta = _full_meta("t", session_id="s1", dir=str(self.workdir), effort="max")
         with _no_codex() as popen:
-            popen.side_effect = self._spawn_output(home, text, report_text)
+            popen.side_effect = self._spawner(home, report_text, text)
             return ca.run_codex(kind, home, "t", meta, lambda r: ["codex"])
 
     def test_resume_repeated_orphan_succeeds_after_first_suspect(self):
@@ -759,7 +761,10 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             ("classified", ERR_ORPHAN_REAL, "success"),
             ("classified warning", ERR_ORPHAN_REAL.replace("ERROR", "WARN"), "success"),
             ("indented status", "    " + ERR_ORPHAN_REAL, "suspect"),
-            ("brief echo", "brief: " + ERR_ORPHAN_REPEAT, "suspect"),
+            ("brief echo", "user\n说明里只是引用：\n" + ERR_ORPHAN_REAL
+             + "\n\ncodex\n分析完成。", "suspect"),
+            ("runtime after brief", "user\n引用另一个 id：\n" + ERR_ORPHAN_OTHER
+             + "\n\ncodex\n" + ERR_ORPHAN_REAL, "success"),
             ("source echo", '    47  error = "' + ERR_ORPHAN_REPEAT + '"', "suspect"),
             ("user error", "ERROR: Orphan custom tool call output for call id: "
              "call_1ad908a7e9fe426cb3f2ac071d276d43", "suspect"),
@@ -816,30 +821,45 @@ class TestRoundBoundaryWiring(_HomeSandbox):
                 self.assertIn(reason, verdict.reason)
                 self.assertEqual(verdict.detail, detail)
 
-    def test_status_and_resume_owner_agree_on_old_orphans(self):
+    def test_status_and_resume_owner_agree_on_orphan_history(self):
+        # brief 中的顶格引用不是历史错误；首次真实报错在两个入口都必须返回 3。
         home = ca.ensure_isolation(ca.CODEX, "default")
-        self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
         resume_args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
-        owner, observer = [], []
         real_judge = ca.judge
+        cases = (
+            ("runtime history", (ERR_ORPHAN_REAL + "\n",), 0, "success", ["干完了"]),
+            ("run brief echo", ("user\n说明里只是引用：\n" + ERR_ORPHAN_REAL
+             + "\n\ncodex\n分析完成。\n",), 3, "suspect", [ERR_ORPHAN_REPEAT]),
+            ("resume brief echo", ("正常收尾\n", "user\n说明里只是引用：\n"
+             + ERR_ORPHAN_REAL + "\n\ncodex\n分析完成。\n"),
+             3, "suspect", [ERR_ORPHAN_REPEAT]),
+        )
+        for name, historical_rounds, expected_rc, expected_state, expected_detail in cases:
+            with self.subTest(history=name):
+                for index, text in enumerate(historical_rounds):
+                    self._logged_round(home, "run" if index == 0 else "resume",
+                                       text, "干完了\n")
+                owner, observer = [], []
 
-        def observe(rd):
-            verdict = real_judge(rd)
-            observer.append(verdict)
-            return verdict
+                def observe(rd):
+                    verdict = real_judge(rd)
+                    observer.append(verdict)
+                    return verdict
 
-        with _no_codex() as popen, \
-             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
-             mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: owner.append(v)), \
-             contextlib.redirect_stdout(io.StringIO()):
-            popen.side_effect = self._spawn_output(home, ERR_ORPHAN_REPEAT + "\n", "干完了\n")
-            owner_rc = ca.cmd_resume(resume_args)
-            with mock.patch.object(ca, "judge", side_effect=observe):
-                observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
-        self.assertEqual([owner_rc, observer_rc], [0, 0])
-        self.assertEqual(owner, observer)
-        self.assertEqual(owner[0].detail, ["干完了"])
+                with _no_codex() as popen, \
+                     mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
+                     mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: owner.append(v)), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    popen.side_effect = self._spawner(
+                        home, "干完了\n", ERR_ORPHAN_REPEAT + "\n")
+                    owner_rc = ca.cmd_resume(resume_args)
+                    with mock.patch.object(ca, "judge", side_effect=observe):
+                        observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+                self.assertEqual([owner_rc, observer_rc], [expected_rc, expected_rc])
+                self.assertEqual(owner, observer)
+                self.assertEqual(owner[0].state, expected_state)
+                self.assertEqual(owner[0].detail, expected_detail)
 
     def test_owner_history_excludes_current_and_later_rounds(self):
         # 读全日志建历史会吞本轮新 Y，或被后来追加的新 run 重置已有 X。
@@ -5244,17 +5264,6 @@ class TestExitCodeContract(_HomeSandbox):
     def _resume_args(self):
         return ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
-
-    def _spawner(self, d, report_text, log_extra):
-        """假装 codex 跑了一轮：spawn 的那一刻决定它留下什么产物。"""
-        def spawn(*a, **k):
-            if report_text is not None:
-                (d / "reports" / "t.md").write_text(report_text)
-            if log_extra:
-                with open(d / "logs" / "t.log", "a") as f:
-                    f.write(log_extra + "\n")
-            return mock.DEFAULT
-        return spawn
 
     def _run(self, report_text, log_extra=""):
         d = ca.ensure_isolation(ca.CODEX, "default")
