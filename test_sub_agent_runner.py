@@ -400,8 +400,10 @@ class TestRuntimeErrorLines(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertIn("already has an active writer", got[0])
 
-    def test_良性target被过滤(self):
-        for benign in (ERR_TRACING, ERR_TRACING_ROUTER, ERR_TRACING_WS):
+    def test_良性结构化日志被过滤(self):
+        for benign in (ERR_TRACING, ERR_TRACING_ROUTER, ERR_TRACING_WS,
+                       ERR_ORPHAN_REAL, ERR_ORPHAN_REPEAT, ERR_ORPHAN_OTHER,
+                       ERR_ORPHAN_REAL.replace("ERROR", "WARN")):
             with self.subTest(line=benign[:60]):
                 self.assertEqual(ca.runtime_error_lines(benign), [])
 
@@ -417,7 +419,7 @@ class TestRuntimeErrorLines(unittest.TestCase):
     def test_indented_errors_are_ignored(self):
         # strip() 会把别的任务的 status 明细冒充成本任务的错误；ANSI 不改变缩进。
         for indent in ("  ", "\t"):
-            for line in (ERR_USER_LAYER_REAL, ERR_TRACING_UNKNOWN, ERR_FATAL):
+            for line in (ERR_USER_LAYER_REAL, ERR_TRACING_UNKNOWN, ERR_FATAL, ERR_ORPHAN_REAL):
                 with self.subTest(indent=indent, line=line):
                     self.assertEqual(ca.runtime_error_lines(indent + line + "  \n"), [])
 
@@ -445,17 +447,17 @@ class TestReadLastRound(unittest.TestCase):
         log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
                         + ERR_FATAL + "\n"
                         + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n干净收尾\n")
-        self.assertEqual(ca.runtime_error_lines(ca.read_last_round(log)[0]), [])
+        self.assertEqual(ca.runtime_error_lines(ca.read_last_round(log)), [])
 
     def test_本轮自己的错误照样认(self):
         log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n干净\n"
                         + ca.round_separator("resume", "t", "2026-09-19T11:00:00") + "\n"
                         + ERR_FATAL + "\n")
-        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log)[0])), 1)
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
 
     def test_没有分隔符时返回全文_老日志和半路接手都还能判(self):
         log = self._log(ERR_FATAL + "\n")
-        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log)[0])), 1)
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
 
     def test_混进来的ROUND_MARK源码行不许被当成新一轮的开始(self):
         # status 是外部观察者，它只能看最后一轮。子串搜索会把日志里转述的那行
@@ -465,7 +467,7 @@ class TestReadLastRound(unittest.TestCase):
         self.assertIn(ca.ROUND_MARK, 源码行, "前提不成立：样本行里没有分隔符前缀")
         log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
                         + ca.INTERRUPT_MARK + "\n" + 源码行 + "\n")
-        self.assertTrue(ca.has_interrupt_mark(ca.read_last_round(log)[0]),
+        self.assertTrue(ca.has_interrupt_mark(ca.read_last_round(log)),
                         "最后一轮被那行源码切断了，打断标记被甩掉")
 
     def test_打断标记不能被当成新一轮的开始(self):
@@ -474,7 +476,7 @@ class TestReadLastRound(unittest.TestCase):
         self.assertFalse(ca.INTERRUPT_MARK.startswith(ca.ROUND_MARK))
         log = self._log(ca.round_separator("run", "t", "2026-09-19T10:00:00") + "\n"
                         + ERR_FATAL + "\n" + ca.INTERRUPT_MARK + "\n")
-        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log)[0])), 1)
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(log))), 1)
 
 
 class TestRoundBoundary(unittest.TestCase):
@@ -532,7 +534,7 @@ class TestRoundBoundary(unittest.TestCase):
 
         self.assertEqual(ca.judge(rd).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotEqual(ca.judge(ca.Round(report, *ca.read_last_round(log))).state,
+        self.assertNotEqual(ca.judge(ca.Round(report, ca.read_last_round(log))).state,
                             "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
@@ -618,7 +620,7 @@ class TestRoundBoundary(unittest.TestCase):
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
             ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        self.assertNotIn(尾巴, ca.read_last_round(log)[0],
+        self.assertNotIn(尾巴, ca.read_last_round(log),
                          "分隔符没落在行首，上一轮的尾巴被算进了这一轮")
 
     def test_切的是字节不是字符_中文日志不许错位(self):
@@ -659,23 +661,23 @@ class TestRoundBoundary(unittest.TestCase):
         坏分隔符 = ca.round_separator("interrupt and resume", "t", "2026-09-19T00:00:01")
         p.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
                      + ERR_FATAL + "\n" + 坏分隔符 + "\n干净收尾\n")
-        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(p)[0])), 1,
+        self.assertEqual(len(ca.runtime_error_lines(ca.read_last_round(p))), 1,
                          "前提变了：带空格的分隔符居然被认出来了，那 kind 就不用是枚举了")
 
     def test_日志还没有时读回空串_不许抛(self):
         d = self._home()
         missing = ca._log_path(d, "从来没写过")
         self.assertFalse(missing.exists(), "前提不成立：这个文件居然存在")
-        self.assertEqual(ca.read_round(missing, 0)[0], "")
-        self.assertEqual(ca.read_last_round(missing)[0], "")
+        self.assertEqual(ca.read_round(missing, 0), "")
+        self.assertEqual(ca.read_last_round(missing), "")
 
     def test_半截多字节字符不许把读取打崩(self):
         # codex 被 INT 打断时可能只写出半截字节，裸 decode 会把判据整个打崩
         d = self._home()
         log = ca._log_path(d, "t")
         log.write_bytes(b"\xff\xfe" + "正常收尾".encode())
-        self.assertIn("正常收尾", ca.read_last_round(log)[0])
-        self.assertIn("正常收尾", ca.read_round(log, 0)[0])
+        self.assertIn("正常收尾", ca.read_last_round(log))
+        self.assertIn("正常收尾", ca.read_round(log, 0))
 
 
 class TestRoundBoundaryWiring(_HomeSandbox):
@@ -711,166 +713,108 @@ class TestRoundBoundaryWiring(_HomeSandbox):
             popen.side_effect = self._spawner(home, report_text, text)
             return ca.run_codex(kind, home, "t", meta, lambda r: ["codex"])
 
-    def test_resume_repeated_orphan_succeeds_after_first_suspect(self):
-        # 不按历史 id 去重会一直 suspect；把本轮也当历史则会漏掉首次。
+    def test_orphan_succeeds_on_first_run_and_resume(self):
+        # 压缩上下文后的迟到输出不能说明失败；首次、重报与新 id 都归良性。
         home = ca.ensure_isolation(ca.CODEX, "default")
         first = ca.judge(self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n"))
-        self.assertEqual(first.state, "suspect")
-        self.assertEqual(ca.EXIT[first.state], 3)
-        repeated = ca.judge(self._logged_round(
-            home, "resume", ERR_ORPHAN_REPEAT + "\n", "干完了\n"))
-        self.assertEqual(repeated.state, "success")
-        self.assertEqual(ca.EXIT[repeated.state], 0)
-        self.assertEqual(repeated.detail, ["干完了"])
+        self.assertEqual(first.state, "success")
+        self.assertEqual(ca.EXIT[first.state], 0)
+        self.assertEqual(first.detail, ["干完了"])
+        for kind in ("resume", "interrupt-and-resume"):
+            with self.subTest(kind=kind):
+                text = (ERR_ORPHAN_REPEAT + "\n" + ERR_ORPHAN_OTHER.replace("ERROR", "WARN")
+                        + "\n  " + ERR_ORPHAN_REAL + "\n\t" + ERR_ORPHAN_REPEAT + "\n")
+                verdict = ca.judge(self._logged_round(home, kind, text, "干完了\n"))
+                self.assertEqual(verdict.state, "success")
+                self.assertEqual(ca.EXIT[verdict.state], 0)
+                self.assertEqual(verdict.detail, ["干完了"])
 
-    def test_resume_new_orphan_remains_suspect(self):
-        # 整个 target 放行会吞新 id；只过滤旧 id 后 detail 必须只剩新 id。
+    def test_orphan_does_not_hide_other_tracing_errors(self):
         home = ca.ensure_isolation(ca.CODEX, "default")
-        self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
+        util_error = "2026-10-10T16:05:02.000000Z ERROR codex_core::util: unexpected tool failure"
+        database_error = "2026-10-10T16:05:03.000000Z ERROR codex_state::sqlite: SQLite database is corrupt"
+        text = (ERR_ORPHAN_REAL + "\n" + util_error + "\n" + database_error + "\n"
+                + ERR_ORPHAN_OTHER + "\n" + database_error + "\n")
         verdict = ca.judge(self._logged_round(
-            home, "resume", ERR_ORPHAN_REPEAT + "\n" + ERR_ORPHAN_OTHER + "\n", "干完了\n"))
+            home, "run", text, "干完了\n"))
         self.assertEqual(verdict.state, "suspect")
         self.assertEqual(ca.EXIT[verdict.state], 3)
-        self.assertEqual(verdict.detail, [ERR_ORPHAN_OTHER])
+        self.assertEqual(verdict.detail, [util_error, database_error, database_error])
 
-    def test_resume_other_tracing_error_remains_suspect(self):
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
-        error = "2026-10-10T16:05:02.000000Z ERROR codex_core::state: SQLite database is corrupt"
-        verdict = ca.judge(self._logged_round(
-            home, "resume", ERR_ORPHAN_REPEAT + "\n" + error + "\n", "干完了\n"))
-        self.assertEqual(verdict.state, "suspect")
-        self.assertEqual(ca.EXIT[verdict.state], 3)
-        self.assertEqual(verdict.detail, [error])
-
-    def test_reused_task_run_starts_new_orphan_history(self):
-        # 从任务日志开头收历史会把同名新 run 的首次丢失也放行。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
-        repeated = ca.judge(self._logged_round(
-            home, "interrupt-and-resume", ERR_ORPHAN_REPEAT + "\n", "干完了\n"))
-        new_session = ca.judge(self._logged_round(
-            home, "run", ERR_ORPHAN_REPEAT + "\n", "干完了\n"))
-        self.assertEqual([repeated.state, new_session.state], ["success", "suspect"])
-        self.assertEqual(new_session.detail, [ERR_ORPHAN_REPEAT])
-
-    def test_orphan_history_requires_classified_complete_messages(self):
-        # 全文抓 id 会信任缩进、brief、源码；只抓子串会信任别的 target 或消息。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        cases = (
-            ("classified", ERR_ORPHAN_REAL, "success"),
-            ("classified warning", ERR_ORPHAN_REAL.replace("ERROR", "WARN"), "success"),
-            ("indented status", "    " + ERR_ORPHAN_REAL, "suspect"),
-            ("brief echo", "user\n说明里只是引用：\n" + ERR_ORPHAN_REAL
-             + "\n\ncodex\n分析完成。", "suspect"),
-            ("runtime after brief", "user\n引用另一个 id：\n" + ERR_ORPHAN_OTHER
-             + "\n\ncodex\n" + ERR_ORPHAN_REAL, "success"),
-            ("source echo", '    47  error = "' + ERR_ORPHAN_REPEAT + '"', "suspect"),
-            ("user error", "ERROR: Orphan custom tool call output for call id: "
-             "call_1ad908a7e9fe426cb3f2ac071d276d43", "suspect"),
-            ("other target", ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::session"),
-             "suspect"),
-            ("other message", ERR_ORPHAN_REPEAT.replace("Orphan", "Observed Orphan"), "suspect"),
-            ("empty id", ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ": ", "suspect"),
-            ("extra message text", ERR_ORPHAN_REPEAT + " extra text", "suspect"),
-        )
-        for name, history, expected in cases:
-            with self.subTest(history=name):
-                self._logged_round(home, "run", history + "\n", "干完了\n")
-                verdict = ca.judge(self._logged_round(
-                    home, "resume", ERR_ORPHAN_REPEAT + "\n", "干完了\n"))
-                self.assertEqual(verdict.state, expected)
-                self.assertEqual(verdict.detail, ["干完了"] if expected == "success"
-                                 else [ERR_ORPHAN_REPEAT])
-
-    def test_repeated_id_does_not_hide_other_messages(self):
+    def test_orphan_requires_exact_target_and_complete_message(self):
+        # 整个 target 或消息子串放行会吞真错误；空 id、空白分隔的附加文字不能获豁免。
         home = ca.ensure_isolation(ca.CODEX, "default")
         candidates = (
             ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::session"),
+            ERR_ORPHAN_REPEAT.replace("codex_core::util", "codex_core::util::worker"),
             ERR_ORPHAN_REPEAT.replace("Orphan", "Observed Orphan"),
             ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ":",
+            ERR_ORPHAN_REPEAT.rsplit(": ", 1)[0] + ": ",
             ERR_ORPHAN_REPEAT + " extra text",
+            ERR_ORPHAN_REPEAT + "\textra text",
         )
-        for candidate in candidates:
-            with self.subTest(candidate=candidate):
-                self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
-                verdict = ca.judge(self._logged_round(
-                    home, "resume", ERR_ORPHAN_REPEAT + "\n" + candidate + "\n", "干完了\n"))
-                self.assertEqual(verdict.state, "suspect")
-                self.assertEqual(verdict.detail, [candidate])
+        for level in ("ERROR", "WARN"):
+            for candidate in candidates:
+                candidate = candidate.replace("ERROR", level)
+                with self.subTest(candidate=candidate):
+                    text = ERR_ORPHAN_REAL + "\n" + candidate + "\n"
+                    self.assertEqual(ca.runtime_error_lines(text), [candidate.rstrip()])
+                    verdict = ca.judge(self._logged_round(home, "run", text, "干完了\n"))
+                    self.assertEqual(verdict.state, "suspect")
+                    self.assertEqual(ca.EXIT[verdict.state], 3)
+                    self.assertEqual(verdict.detail, [candidate.rstrip()])
 
-    def test_no_report_keeps_repeats_and_existing_priority(self):
-        # 有报告的对照必须去重；无报告的同一行必须仍进 detail，原因优先级不变。
+    def test_orphan_without_report_keeps_state_and_reason(self):
+        # 分类处只删除孤儿；没有报告仍不算正常收尾，INT、额度和写锁优先级不变。
         home = ca.ensure_isolation(ca.CODEX, "default")
         cases = (
             ("reported control", "干完了\n", "", "success", "正常收尾", ["干完了"]),
-            ("missing", None, "", "failed", "报告缺失", [ERR_ORPHAN_REPEAT]),
+            ("missing", None, "", "failed", "报告缺失或为空＝没正常收尾", []),
+            ("empty", "", "", "failed", "报告缺失或为空＝没正常收尾", []),
+            ("blank", " \n", "", "failed", "报告缺失或为空＝没正常收尾", []),
             ("interrupted", "", ca.INTERRUPT_MARK + "\n", "interrupted", "resume",
-             [ERR_ORPHAN_REPEAT]),
+             []),
             ("usage limit", " \n", ERR_USER_LAYER_REAL + "\n", "failed", "额度上限",
-             [ERR_ORPHAN_REPEAT, ERR_USER_LAYER_REAL]),
+             [ERR_USER_LAYER_REAL]),
             ("writer lock", None, ERR_FATAL + "\n", "failed", "写锁",
-             [ERR_ORPHAN_REPEAT, ERR_FATAL]),
+             [ERR_FATAL]),
         )
         for name, report, suffix, state, reason, detail in cases:
             with self.subTest(round=name):
-                self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
+                text = ERR_ORPHAN_REAL + "\n" + ERR_ORPHAN_REPEAT + "\n" + suffix
                 verdict = ca.judge(self._logged_round(
-                    home, "resume", ERR_ORPHAN_REPEAT + "\n" + suffix, report))
+                    home, "run", text, report))
                 self.assertEqual(verdict.state, state)
                 self.assertIn(reason, verdict.reason)
                 self.assertEqual(verdict.detail, detail)
 
-    def test_status_and_resume_owner_agree_on_orphan_history(self):
-        # brief 中的顶格引用不是历史错误；首次真实报错在两个入口都必须返回 3。
+    def test_status_and_resume_owner_agree_on_first_orphan(self):
+        # 只替换外部 spawn；首次孤儿在真实拥有者与观察者入口都应返回 0。
         home = ca.ensure_isolation(ca.CODEX, "default")
         resume_args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+        self._logged_round(home, "run", "正常收尾\n", "干完了\n")
         real_judge = ca.judge
-        cases = (
-            ("runtime history", (ERR_ORPHAN_REAL + "\n",), 0, "success", ["干完了"]),
-            ("run brief echo", ("user\n说明里只是引用：\n" + ERR_ORPHAN_REAL
-             + "\n\ncodex\n分析完成。\n",), 3, "suspect", [ERR_ORPHAN_REPEAT]),
-            ("resume brief echo", ("正常收尾\n", "user\n说明里只是引用：\n"
-             + ERR_ORPHAN_REAL + "\n\ncodex\n分析完成。\n"),
-             3, "suspect", [ERR_ORPHAN_REPEAT]),
-        )
-        for name, historical_rounds, expected_rc, expected_state, expected_detail in cases:
-            with self.subTest(history=name):
-                for index, text in enumerate(historical_rounds):
-                    self._logged_round(home, "run" if index == 0 else "resume",
-                                       text, "干完了\n")
-                owner, observer = [], []
+        owner, observer = [], []
 
-                def observe(rd):
-                    verdict = real_judge(rd)
-                    observer.append(verdict)
-                    return verdict
+        def observe(rd):
+            verdict = real_judge(rd)
+            observer.append(verdict)
+            return verdict
 
-                with _no_codex() as popen, \
-                     mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
-                     mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: owner.append(v)), \
-                     contextlib.redirect_stdout(io.StringIO()):
-                    popen.side_effect = self._spawner(
-                        home, "干完了\n", ERR_ORPHAN_REPEAT + "\n")
-                    owner_rc = ca.cmd_resume(resume_args)
-                    with mock.patch.object(ca, "judge", side_effect=observe):
-                        observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
-                self.assertEqual([owner_rc, observer_rc], [expected_rc, expected_rc])
-                self.assertEqual(owner, observer)
-                self.assertEqual(owner[0].state, expected_state)
-                self.assertEqual(owner[0].detail, expected_detail)
-
-    def test_owner_history_excludes_current_and_later_rounds(self):
-        # 读全日志建历史会吞本轮新 Y，或被后来追加的新 run 重置已有 X。
-        home = ca.ensure_isolation(ca.CODEX, "default")
-        self._logged_round(home, "run", ERR_ORPHAN_REAL + "\n", "干完了\n")
-        text = (ERR_ORPHAN_REPEAT + "\n" + ERR_ORPHAN_OTHER + "\n"
-                + ca.round_separator("run", "t", "2026-10-10T16:06:00") + "\n"
-                + ERR_ORPHAN_OTHER + "\n")
-        verdict = ca.judge(self._logged_round(home, "resume", text, "干完了\n"))
-        self.assertEqual(verdict.state, "suspect")
-        self.assertEqual(verdict.detail, [ERR_ORPHAN_OTHER])
+        with _no_codex() as popen, \
+             mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
+             mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: owner.append(v)), \
+             contextlib.redirect_stdout(io.StringIO()):
+            popen.side_effect = self._spawner(
+                home, "干完了\n", ERR_ORPHAN_REAL + "\n" + ERR_ORPHAN_OTHER + "\n")
+            owner_rc = ca.cmd_resume(resume_args)
+            with mock.patch.object(ca, "judge", side_effect=observe):
+                observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+        self.assertEqual([owner_rc, observer_rc], [0, 0])
+        self.assertEqual(owner, observer)
+        self.assertEqual(owner[0].state, "success")
+        self.assertEqual(owner[0].detail, ["干完了"])
 
     def test_run收尾用的是run_codex回传的本轮文本(self):
         d = ca.ensure_isolation(ca.CODEX, "default")
@@ -960,7 +904,7 @@ class TestJudge(unittest.TestCase):
         self.report = self.d / "t.md"
 
     def _judge(self, round_text="正常收尾\n"):
-        return ca.judge(ca.Round(self.report, round_text, ""))
+        return ca.judge(ca.Round(self.report, round_text))
 
     def test_报告缺失是failed(self):
         v = self._judge()
@@ -1242,7 +1186,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
 
     def test_有打断标记且无报告时状态是interrupted(self):
-        v = ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n", ""))
+        v = ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n"))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
@@ -1261,7 +1205,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
                 ("报告缺失", "什么都没有\n"),
                 ("报告缺失且有杂错误", "ERROR: boom\n" + ERR_TRACING_UNKNOWN + "\n")):
             with self.subTest(情形=name):
-                v = ca.judge(ca.Round(self.report, text, ""))
+                v = ca.judge(ca.Round(self.report, text))
                 self.assertEqual(v.state, "failed", "前提不成立：这条根本不是 failed")
                 self.assertEqual(v.detail, ca.runtime_error_lines(text))
 
@@ -1284,7 +1228,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for name, evidence, 处置 in (("额度上限", ERR_USER_LAYER_REAL, "换账号"),
                                      ("写锁", ERR_FATAL, "新起一个任务")):
             with self.subTest(情形=name):
-                v = ca.judge(ca.Round(self.report, evidence + "\n", ""))
+                v = ca.judge(ca.Round(self.report, evidence + "\n"))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
                 # reason 必须钉住：`failed` 这个状态还有一条「报告缺失」的兜底，
@@ -1304,7 +1248,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
                              "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
-        v = ca.judge(ca.Round(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n", ""))
+        v = ca.judge(ca.Round(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n"))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])
@@ -1906,7 +1850,7 @@ class TestOnDiskContract(_HomeSandbox):
             "----- codex-sub-agent 本轮被 INT 打断，上下文保留，可 resume ----- [stop]\n")
         q = pathlib.Path(tempfile.mkdtemp()) / "t.log"
         q.write_text(旧日志)
-        本轮 = ca.read_last_round(q)[0]
+        本轮 = ca.read_last_round(q)
         self.assertIn("本轮的输出", 本轮)
         self.assertNotIn("上一轮的错误", 本轮, "轮次边界认不出了——前几轮的错误全算进这一轮")
         self.assertTrue(ca.has_interrupt_mark(本轮),
@@ -2252,7 +2196,7 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertIn(残片, text, "前提不成立：残片被抹掉了，那这条测的就不是「粘住」")
         errs = ca.runtime_error_lines(text)
         self.assertEqual(len(errs), 1, f"补的行没落在行首，^ERROR: 匹配不上：{text!r}")
-        v = ca.judge(ca.Round(rp, text, ""))
+        v = ca.judge(ca.Round(rp, text))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -2286,7 +2230,7 @@ class TestDeepseekRunner(_HomeSandbox):
         lines = ca.deepseek_log_lines(self.DENIED)
         self.assertTrue(any("被拒" in l for l in lines))
         self.assertIn("Write", "".join(lines))
-        v = ca.judge(ca.Round(rp, "\n".join(lines), ""))
+        v = ca.judge(ca.Round(rp, "\n".join(lines)))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -2295,7 +2239,7 @@ class TestDeepseekRunner(_HomeSandbox):
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.INT, rp, lp)
         text = "\n".join([self.INT, ca.INTERRUPT_MARK, lp.read_text()])
-        v = ca.judge(ca.Round(rp, text, ""))
+        v = ca.judge(ca.Round(rp, text))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 130)
 
@@ -2303,7 +2247,7 @@ class TestDeepseekRunner(_HomeSandbox):
         rp, lp = self.home / "r.md", self.home / "t.log"
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.OK, rp, lp)
-        self.assertEqual(ca.judge(ca.Round(rp, self.OK, "")).state, "success")
+        self.assertEqual(ca.judge(ca.Round(rp, self.OK)).state, "success")
 
     def test_JSONL本身一条都不该被judge当成错误行(self):
         # 这是「非补不可」的根据：judge 的 detail 来自 runtime_error_lines，
@@ -2341,7 +2285,7 @@ class TestDeepseekRunner(_HomeSandbox):
         ca.finish_deepseek_round('{"type":"result","subtype":"success","result":"",'
                                  '"permission_denials":[]}', rp, lp)
         self.assertEqual(rp.read_text(), "")
-        self.assertEqual(ca.judge(ca.Round(rp, "", "")).state, "failed")
+        self.assertEqual(ca.judge(ca.Round(rp, "")).state, "failed")
 
     def test_PID反查的进程名按runner取(self):
         # 实测读 /proc/<pid>/comm：claude-deepseek 是 exec 掉的 bash 包装，

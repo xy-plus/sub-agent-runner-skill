@@ -369,8 +369,8 @@ _ERR_USER = re.compile(r"^(?:ERROR|WARN):\s+(.*)")
 _ERR_TRACING = re.compile(r"^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s+(?:ERROR|WARN)\s+(\S+?):\s")
 _ERR_FATAL = re.compile(r"^Error:\s")          # 形式 C，由 judge 按本轮报告决定是否计入
 
-# 形式 B 按 module target 分类，不按自由文本——文本会变，target 不会。
-# 白名单之外一律计入判据，**包括 codex_core::session\***（会话建不起来正是最该报的）。
+# 形式 B 主要按 module target 分类；孤儿诊断只放过精确 target 下的完整消息。
+# 其余诊断在白名单之外一律计入，**包括 codex_core::session\***（会话建不起来正是最该报的）。
 _BENIGN_TARGETS = (
     "codex_models_manager::",                      # 模型列表刷新超时，不影响本次运行
     "codex_api::endpoint::responses_websocket",    # 连接抖动，codex 自己会重连
@@ -395,7 +395,7 @@ def strip_ansi(text):
 
 
 def read_round(log_path, start_offset):
-    """成对读出本轮文本与同会话历史；本轮是 `[start_offset, 下个 ROUND_MARK)`。
+    """读出本轮文本；本轮是 `[start_offset, 下个 ROUND_MARK)`。
 
     `start_offset` 是 `run_codex` 写完本轮分隔符之后记下的**字节**偏移，
     是 codex 还没起跑之前就拿到的事实，**后来的任何一轮都不可能把它致盲**。
@@ -417,60 +417,41 @@ def read_round(log_path, start_offset):
     整行匹配而不是子串搜索：日志里转述到那行源码就会在那里被误切（见 _ROUND_LINE）。
     """
     if not log_path.exists():
-        return "", ""
+        return ""
     with open(log_path, "rb") as f:
-        history = f.read(start_offset)
+        f.seek(start_offset)
         raw = f.read()
-    return _round_texts(strip_ansi(history.decode("utf-8", "replace")),
-                        strip_ansi(raw.decode("utf-8", "replace")))
+    return _round_texts(strip_ansi(raw.decode("utf-8", "replace")))
 
 
 def read_last_round(log_path):
-    """最后一轮与同会话历史。**只给外部观察者用**（`status`）——它手里没有偏移。
+    """最后一轮的文本。**只给外部观察者用**（`status`）——它手里没有偏移。
 
     这是它诚实的上界：它本来就只能看到最后一轮，说不出更多。
     本轮的拥有者（cmd_run / _resume_round）绝不该用它：拥有者手里有事实，
     用这个就等于把事实换回推测。
     """
     if not log_path.exists():
-        return "", ""
+        return ""
     text = strip_ansi(log_path.read_text(errors="replace"))
     # 整行匹配、取最后一个（理由同 read_round）
     last = None
     for m in _ROUND_LINE.finditer(text):
         last = m
     start = 0 if last is None else last.end() + 1  # 分隔符之后的换行也属于起点之前
-    return _round_texts(text[:start], text[start:])
+    return _round_texts(text[start:])
 
 
-def _round_texts(history, text):
-    # 两个读者共用会话边界：prefix 包含本轮分隔符，所以新 run 的历史为空；
-    # resume / interrupt-and-resume 只继承最近一次 run 之后、本轮起点之前的文本。
-    # 右边仍截到下轮分隔符，后来追加的轮次既不能进本轮，也不能进入历史。
+def _round_texts(text):
+    # 右边截到下轮分隔符，后来追加的轮次不能进入本轮。
     next_round = _ROUND_LINE.search(text)
     if next_round is not None:
         text = text[:next_round.start()]
-    session_start = 0
-    for mark in _ROUND_LINE.finditer(history):
-        if mark.group().startswith(ROUND_MARK + "run "):
-            session_start = mark.end()
-    # Codex 在 user 到随后 codex 标记之间原样回显说明，顶格诊断也只是引用。
-    # 每轮分别排除这一段历史；本轮文本原样保留，无报告的判据与明细不受影响。
-    history_lines = []
-    in_brief = False
-    for line in history[session_start:].splitlines(keepends=True):
-        marker = line.rstrip("\r\n")
-        if _ROUND_LINE.fullmatch(marker) or marker == "codex":
-            in_brief = False
-        elif marker == "user":
-            in_brief = True
-        if not in_brief:
-            history_lines.append(line)
-    return text, "".join(history_lines)
+    return text
 
 
 def runtime_error_lines(round_text):
-    """本轮顶格的错误候选行（已滤掉良性 target 与良性用户层消息）。
+    """本轮顶格的错误候选行（已滤掉良性 target、孤儿诊断与良性用户层消息）。
 
     行首空白保留：缩进行是子进程或别的任务的状态明细，不分类；行尾空白照旧去掉。
     返回的 A、C 尚未结合报告判断。
@@ -495,6 +476,12 @@ def runtime_error_lines(round_text):
             continue
         m = _ERR_TRACING.match(line)
         if m:
+            # 上下文压缩丢掉调用后，迟到输出会成为孤儿；这句不能说明本轮失败。
+            # 只放过准确 target、完整消息与非空单个 id，不能吞掉同 target 的其他错误。
+            if (m.group(1) == "codex_core::util"
+                    and re.fullmatch(r"Orphan custom tool call output for call id: \S+",
+                                     line[m.end():])):
+                continue
             if not m.group(1).startswith(_BENIGN_TARGETS):
                 hits.append(line)
             continue
@@ -502,15 +489,6 @@ def runtime_error_lines(round_text):
         if m and not m.group(1).startswith(_BENIGN_USER):
             hits.append(line)
     return hits
-
-
-def _orphan_call_id(error_line):
-    tracing = _ERR_TRACING.match(error_line)
-    if tracing is None or tracing.group(1) != "codex_core::util":
-        return None
-    message = re.fullmatch(r"Orphan custom tool call output for call id: (\S+)",
-                           error_line[tracing.end():])
-    return None if message is None else message.group(1)
 
 
 def hit_usage_limit(error_lines):
@@ -817,7 +795,7 @@ def clear_report(report_path):
 
 
 class Round(NamedTuple):
-    """一轮的报告文件路径 + 成对的本轮文本、同会话历史。**不拆开传。**
+    """一轮的报告文件路径 + 本轮文本。**不拆开传。**
 
     拆开传时 `run_codex` 声称消灭掉的那类「必须记得对齐」只是上移了一层：
     它的 docstring 写着「报告路径由本函数拥有……这三条在结构上就违反不了了」，
@@ -826,12 +804,10 @@ class Round(NamedTuple):
     去判这个任务的报告，不报错，只给一个假结论。
     成对之后，「哪份报告配哪段文本」在拥有者那条路上写不错：`run_codex` 自己
     把两样一起交出来。外部观察者（status）没有本轮文本可用，只能显式构造
-    `Round(report, *read_last_round(log))`——显式，所以看得见它在用推测。
-    历史由同一次读取、同一个起点切出，不收调用方另拼的豁免 id，也不缺省为空。
+    `Round(report, read_last_round(log))`——显式，所以看得见它在用推测。
     """
     report_path: object   # pathlib.Path
     text: str             # 本轮的日志文本（已 strip_ansi、已切好边界）
-    history_text: str      # 同会话、本轮起点之前的日志文本（已 strip_ansi）
 
 
 class Verdict(NamedTuple):
@@ -841,10 +817,10 @@ class Verdict(NamedTuple):
 
 
 def judge(round):
-    """唯一的成败判据——看产物、本轮日志及同会话历史。`run`／`resume` 收尾和 `status`
+    """唯一的成败判据——看产物与本轮日志。`run`／`resume` 收尾和 `status`
     共用它，避免两处判据漂移。
 
-    收的是一个 `Round`（报告路径 + 本轮文本、历史）而不是分开的参数：它们必须配套，
+    收的是一个 `Round`（报告路径 + 本轮文本）而不是分开的参数：它们必须配套，
     而拆开传时配错是**静默算对**的。理由写在 `Round` 上。
 
     **本轮的日志文本由调用方划好再传进来**，判据自己不划边界。划边界的两种人
@@ -905,14 +881,8 @@ def judge(round):
         return Verdict("failed", "报告缺失或为空＝没正常收尾", errors)
 
     # 有非空报告只留 B：A 与工具输出按文字分不开，A、C 都可能是转述或已恢复的错误。
-    # 没报告那一支保留完整 errors 与额度、写锁原因；B 已由 runtime_error_lines 滤过良性 target。
-    # 孤儿调用只在本会话首次报出的那轮计入：历史也必须先经过相同错误分类，
-    # 缩进明细、brief 与源码回显不建立旧 id；其他 target、消息及不完整 id 照旧计入。
-    # 只在有报告的这一支去重，无报告的状态优先级和完整错误明细保持不变。
-    historical_ids = {call_id for line in runtime_error_lines(round.history_text)
-                      if (call_id := _orphan_call_id(line)) is not None}
-    errors = [line for line in errors
-              if _ERR_TRACING.match(line) and _orphan_call_id(line) not in historical_ids]
+    # 没报告那一支保留完整 errors 与额度、写锁原因；B 已由 runtime_error_lines 滤过良性诊断。
+    errors = [line for line in errors if _ERR_TRACING.match(line)]
     if errors:
         # 说「子代理」不说「codex」：deepseek 走到这一支时它就是假话。
         # **「`judge` 一行不改」挡的是「在 judge 里按 runner 分支」，不是禁止修
@@ -2205,16 +2175,16 @@ def run_codex(kind, home, task, meta, make_argv):
     # codex 那侧没有对应的一步：报告由 codex 自己写（`-o`），错误行本来就在它的
     # 输出里。这条不对称是两个 agent 的输出形态造成的，不是设计选择。
     if runner == DEEPSEEK:
-        finish_deepseek_round(read_round(_log_path(home, task), start_offset)[0],
+        finish_deepseek_round(read_round(_log_path(home, task), start_offset),
                               report, _log_path(home, task))
 
-    # 回传**报告路径 + 成对的本轮文本、历史**，而不是偏移。
+    # 回传**报告路径 + 本轮文本**，而不是偏移。
     # 偏移是可以被悄悄丢掉的：调用方忘了接，唯一还能拿到本轮文本的路就是
     # read_last_round——正好是这次要修的那个 bug。文本丢不掉，它就是 judge 的参数。
     # 成对回传是因为报告路径本来就归本函数所有（见上），调用方再算一遍同一个
     # 路径就又冒出一条「必须记得对齐」；而配错是静默算对的（理由见 Round）。
     # 副带好处：快照在 codex 退出那一刻取走，比「调用方稍后自己读」窗口更小。
-    return Round(report, *read_round(_log_path(home, task), start_offset))
+    return Round(report, read_round(_log_path(home, task), start_offset))
 
 
 def _tee_until_exit(proc, log, home, task, meta):
@@ -2580,7 +2550,7 @@ def cmd_status(args):
         # 不在跑时它是外部观察者：手里没有本轮文本，只能看最后一轮，也只该看
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
-                   else judge(Round(report, *read_last_round(log))))
+                   else judge(Round(report, read_last_round(log))))
         print(status_row(meta, verdict))
         for line in verdict.detail:
             # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
@@ -2748,7 +2718,7 @@ def cmd_interrupt_and_resume(args):
         # 上下文全丢，正是本命令要防的事。
         # 用已有的痕迹判，不加新实体。外部观察者只能看最后一轮，而它要问的
         # 恰好就是最后一轮的事。
-        if has_interrupt_mark(read_last_round(log)[0]):
+        if has_interrupt_mark(read_last_round(log)):
             print(f"[sub-agent-runner] {args.task} 本轮已经打断过（pid={pid} 还在收尾），"
                   f"只等它退出，不再发第二发 INT")
         else:
