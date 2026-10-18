@@ -40,10 +40,10 @@ DeepSeek 接入说明以 claude-switch 的 `claude_switch/deepseek.py` 文档字
 **同一个任务名不能换 runner**：会话、报告、日志都在原来那一侧，换个任务名。
 
 **新任务先用 `--runner codex`**（用户要求，2026-10-03）。
-codex 任务以额度上限失败时，无论是 `run`、`resume` 还是 `interrupt-and-resume`，
-还有没撞过上限的 codex 账号，就用 `--account auto` 换号接着跑；
 每个 codex 账号都实际撞过上限、还没到恢复时间时，**不等恢复，换个任务名用
 `--runner deepseek` 顶上**（用户要求，2026-10-18）。
+续跑（`resume`、`interrupt-and-resume`）撞上限时不记恢复时间：要换号就重跑 `run`
+并写明还没试过的账号名，`--account auto` 可能挑回同一个号。
 
 判断只看各账号实际撞上限的情况，不把任何一句提示语当作所有账号都用尽的证明：
 「没有恢复得更早的账号」在解析不出恢复时间时也会出现，续跑路径也不会打印它。
