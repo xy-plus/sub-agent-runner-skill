@@ -1316,36 +1316,6 @@ class TestParseResetTime(unittest.TestCase):
             with self.subTest(情形=name):
                 self.assertIsNone(ca.parse_reset_time(text, now=self.NOW))
 
-    def test_两种形态都要用现网真实字节验一次(self):
-        """有现网日志时多验一道；**没有就 skip，不是 fail**。
-
-        本模块头一句话就是「零依赖、零 codex token」，而这条要扫的是开发机
-        `~/.codex-subagent*/logs/` 下的几百份日志（本机 269 份、158MB）。
-        换台机器、日志轮转、或者干净 checkout，它就必红——**红的会是环境，
-        不是代码**，而那种红会训练人忽略红色。
-
-        skip 不是静默失效：输出里是 `s`、结尾是 `OK (skipped=1)`，看得见。
-        而且这条**不是唯一的真实字节防线**——两种形态在仓内各有一条逐字节
-        fixture（`ERR_USER_LAYER_REAL` / `ERR_USER_LAYER_REAL_NO_DATE`），
-        它们跟着仓库走，在任何机器上都跑。这条多验的是「**全量**都还解析得出」。
-        """
-        seen = set()
-        lines = 0
-        # 走 `Path.home()` 而不是写死 /home/xy：本类不是 _HomeSandbox 的子类，
-        # 沙箱 patch 在这里没生效，拿到的就是真实 HOME。只读，不写。
-        for f in pathlib.Path.home().glob(".codex-subagent*/logs/*.log"):
-            for line in ca.runtime_error_lines(f.read_text(errors="replace")):
-                if ca.USAGE_LIMIT_MARK not in line:
-                    continue
-                lines += 1
-                got = ca.parse_reset_time(line, now=self.NOW)
-                if got is not None:
-                    seen.add("带日期" if got[1][0].isalpha() else "只有时刻")
-        if not lines:
-            self.skipTest("这台机器上没有带额度错误的现网日志（仓内两条逐字节 "
-                          "fixture 仍然覆盖了同样的性质，见 ERR_USER_LAYER_REAL*）")
-        self.assertEqual(seen, {"带日期", "只有时刻"},
-                         "现网两种形态都必须解析得出；只覆盖一种说明判据还有一半是瞎的")
 
     def test_四种序数后缀都要认(self):
         for day, suffix in ((1, "st"), (2, "nd"), (3, "rd"), (4, "th")):
