@@ -6901,7 +6901,8 @@ class TestBackgroundEndCall(_HomeSandbox):
 
     def test_真实runner扫描前预检或参数拒绝也进通知(self):
         # wait 确保真实 runner 已退出，echo 又把原命令的退出码变成 0；此时只有
-        # 调用结论能带回拒绝。所有分支均在启动代理之前退 2，且继承模块 PATH 防线。
+        # 调用结论能带回拒绝码 2，不能把它转成任务失败码 1。所有分支均在启动
+        # 代理之前退 2，且继承模块 PATH 防线。
         run = ["run", "--task", "t", "--runner", "codex", "--account", "default",
                "--dir", str(self.home), "--brief", str(self.home / "missing.md"),
                "--effort", "max", "--no-skill"]
@@ -6919,12 +6920,27 @@ class TestBackgroundEndCall(_HomeSandbox):
                 command = shlex.join([sys.executable, ca.__file__, *argv])
                 body = command + " > /dev/null 2>&1 & wait; echo dispatched"
                 code, output = self._finish(self._start(body, call_id, True))
-                self.assertEqual(code, 1, output)
+                self.assertEqual(code, 2, output)
                 self.assertIn("dispatched", output)
                 self.assertIn(reason, output)
                 self.assertNotIn("等它们跑完", output)
                 self.assertNotIn("end-call 出错", output)
                 self.assertFalse(ca.bash_call_directory(call_id).exists())
+
+    def test_拒绝与失败同级时2优先_只有失败仍为1(self):
+        for first, second, expected in ((2, 1, 2), (1, 2, 2), (1, 1, 1)):
+            with self.subTest(first=first, second=second):
+                call_id = f"results-{first}-{second}"
+                first_task, second_task = call_id + "-first", call_id + "-second"
+                self._release(first_task)
+                self._release(second_task)
+                body = (self._command(first_task, first) + " & wait; "
+                        + self._command(second_task, second) + " & wait; echo dispatched")
+                code, output = self._finish(self._start(body, call_id, True))
+                self.assertEqual(code, expected, output)
+                self.assertIn(f"{first_task}: fixture verdict {first}", output)
+                self.assertIn(f"{second_task}: fixture verdict {second}", output)
+                self.assertNotIn("等它们跑完", output)
 
     def test_一个已失败另一个仍活着_两个结论都汇总(self):
         self._release("fast")
@@ -6994,14 +7010,17 @@ class TestBackgroundEndCall(_HomeSandbox):
             self.assertIn(f"{task}: fixture verdict {code}", output)
             self.assertNotIn("等它们跑完", output)
 
-    def test_原命令非零优先_任务失败结论照样打印(self):
-        body = self._command("runnerfailed", 1) + " & " + self._ready("runnerfailed", "started") + "; exit 3"
-        process = self._start(body, "original-error", True)
-        self._read_until(process, "等它们跑完")
-        self._release("runnerfailed")
-        code, output = self._finish(process)
-        self.assertEqual(code, 3, output)
-        self.assertIn("runnerfailed: fixture verdict 1", output)
+    def test_原命令非零优先_失败或拒绝结论照样打印(self):
+        for task_code in (1, 2):
+            with self.subTest(task_code=task_code):
+                task = f"runner-error-{task_code}"
+                body = self._command(task, task_code) + " & " + self._ready(task, "started") + "; exit 3"
+                process = self._start(body, "original-error-" + str(task_code), True)
+                self._read_until(process, "等它们跑完")
+                self._release(task)
+                code, output = self._finish(process)
+                self.assertEqual(code, 3, output)
+                self.assertIn(f"{task}: fixture verdict {task_code}", output)
 
     def test_被等待的替身强杀没结论_按失败计(self):
         process = self._start(self._command("killed", 0) + " & " + self._ready("killed", "started"),

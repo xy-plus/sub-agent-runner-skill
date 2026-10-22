@@ -137,29 +137,30 @@ def end_call(original_code):
     refused = (directory / "refused").exists()
     if refused:
         print(runner.FOREGROUND_REFUSAL)
-    worst, seen = "success", set()
-    states_by_code = {code: state for state, code in runner._STATES}
-    # 2 是参数/预检拒绝，不是任务状态；调用汇总按失败计，原命令非零仍照旧优先。
-    states_by_code[runner.USAGE_ERROR] = "failed"
+    worst_code, seen = runner.EXIT["success"], set()
+    codes_by_severity = [code for _, code in runner._STATES]
+    # 2 与 failed 同级，放在 1 后使同级时 2 优先。保留结论原码，不能把参数
+    # 拒绝的 2 反查成 failed 的标准码 1：两者要求调用方采取的动作不同。
+    codes_by_severity.insert(codes_by_severity.index(runner.EXIT["failed"]) + 1, runner.USAGE_ERROR)
     # 必须等完再读全部记录，包括扫描前就已失败退出的任务。正确直接派活也会
     # 多打印一行结论；接受重复，避免另加「是否已经呈现」的状态或启动登记。
     for path in sorted(directory.glob("*.done")):
         result = json.loads(path.read_text())
         code = result["exit_code"]
         print(f"{result['verdict']}（退出码 {code}）")
-        worst = runner._worse(worst, states_by_code[code])
+        worst_code = max(worst_code, code, key=codes_by_severity.index)
         seen.add(int(path.stem))
     for pid, (task, _) in waited.items():
         if pid not in seen:
             print(f"[sub-agent-runner] {task}：没留下结论（退出码按 1 计）")
-            worst = runner._worse(worst, "failed")
+            worst_code = max(worst_code, runner.EXIT["failed"], key=codes_by_severity.index)
     if directory.is_dir():
         shutil.rmtree(directory)
     if original_code != 0:
         # 例如独立一句 "$(runner ...)"：内部拒绝为 2，外层空命令为 127。
         # 保留外层的 127，不能为了统一拒绝码把原命令自己的错误抹掉。
         return original_code
-    return runner.USAGE_ERROR if refused else runner.EXIT[worst]
+    return runner.USAGE_ERROR if refused else worst_code
 
 
 def main():
