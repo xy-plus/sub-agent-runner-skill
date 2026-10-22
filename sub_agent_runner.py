@@ -2290,7 +2290,7 @@ def _tee_until_exit(proc, log, home, task, meta):
         nonlocal line_number, limit_read
         # 按完整行分类，ANSI、UTF-8 和错误字样都可跨 read1 块。只留首个候选的
         # 身份与时刻；其余行的时间没有消费者，不建逐行时间表。
-        text = strip_ansi(data.decode("utf-8", "replace"))
+        text = data.decode("utf-8", "replace")
         number = usage_limit_line_number(text)
         if number is not None:
             limit_read = (line_number + number, datetime.datetime.now())

@@ -4230,14 +4230,15 @@ class TestRunnerCLI(_HomeSandbox):
         self.assertEqual(popen.call_args.args[0][0], ca.DEEPSEEK_BIN)
 
     def test_同名任务不许跨runner复用(self):
-        # find_meta 撞见两份会拒，而跨 runner 没有迁移路径（--account auto 只在
-        # codex 的账号之间搬）。当场拒，别让这个状态建起来。
+        # 只有 --account auto 可以跨 runner 换家；显式 DeepSeek 遇到 Codex
+        # 同名任务仍拒绝，不能创建第二份元数据。
         codex_home = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(codex_home, "t", ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ()))
         with self.assertRaises(ca.Rejected) as got:
             ca.cmd_run(self._args("deepseek", None, "max"))
         self.assertIn("runner", got.exception.message)
         self.assertTrue(ca.meta_path(codex_home, "t").exists(), "被拒的调用不许动旧元数据")
+        self.assertEqual(ca.find_meta("t")[0], codex_home)
 
     def test_撞额度上限那一支只对codex(self):
         """deepseek 没有账号维度，`accounts_by_availability()` / `write_usage_limit`
@@ -6360,13 +6361,6 @@ class TestTaskMigration(_HomeSandbox):
         self.assertTrue(ca.meta_path(self.codex, "t").exists())
         self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
         self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
-        self.assertEqual(ca.find_meta("t")[0], self.codex)
-
-    def test_显式DeepSeek遇到Codex同名任务照旧拒绝(self):
-        args = self._args()
-        args.runner, args.account = "deepseek", None
-        with self.assertRaises(ca.Rejected):
-            ca.cmd_run(args)
         self.assertEqual(ca.find_meta("t")[0], self.codex)
 
     def test_写新和挪回都失败后_各入口拒用不一致的目录(self):
