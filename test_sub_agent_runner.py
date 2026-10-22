@@ -101,6 +101,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -202,12 +203,33 @@ def setUpModule():
         f"前提不成立：/proc/{GONE_PID} 居然存在。换一个必定不存在的 pid，"
         f"否则一批「上一轮早停了」的测试会静默测到另一条分支上。")
 
+    # Popen 插桩只在本解释器里有效。子进程跑真 runner 时会重新 import Python，
+    # 因而还要让它继承 PATH 替身；两个代理共用同一份调用记录，不能只让假程序
+    # 退非零（runner 的正常失败测试可能把那个非零当成预期结果而悄悄变绿）。
+    global _AGENT_GUARD, _AGENT_CALLS
+    _AGENT_GUARD = tempfile.TemporaryDirectory(prefix="sub-agent-runner-test-")
+    unittest.addModuleCleanup(_AGENT_GUARD.cleanup)
+    binaries = pathlib.Path(_AGENT_GUARD.name)
+    _AGENT_CALLS = binaries / "agent-calls.jsonl"
+    for name in _REAL_AGENT_BINS:
+        binary = binaries / name
+        binary.write_text(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"command = [{name!r}, *sys.argv[1:]]\n"
+            f"with open({str(_AGENT_CALLS)!r}, 'a') as log:\n"
+            "    log.write(json.dumps(command, ensure_ascii=False) + '\\n')\n"
+            "print('测试禁止启动真实代理：' + repr(command), file=sys.stderr)\n"
+            "sys.exit(99)\n")
+        binary.chmod(0o755)
+    os.environ["PATH"] = str(binaries) + os.pathsep + os.environ["PATH"]
+
     def no_real_agent(self, args, *a, **kw):
         argv0 = args[0] if isinstance(args, (list, tuple)) else args
         assert argv0 not in _REAL_AGENT_BINS, (
             f"这条测试把真的 {argv0} 叫起来了：{args!r}。少包了一层 _no_codex。")
         return _REAL_POPEN_INIT(self, args, *a, **kw)
-    # **它刻意不还原**（没有 tearDownModule，也没有 addModuleCleanup）：
+    # **Popen 插桩刻意不还原**；tearDownModule 只核对子进程的调用记录：
     # 泄漏半径是**整个测试进程的余生**，同进程里后来 import 的任何模块调
     # `Popen(["codex", ...])` 都会被它挡住。现在不可达——本仓只有这一个测试
     # 模块，只 import 一次。
@@ -215,6 +237,12 @@ def setUpModule():
     # 抓的**，所以插桩永远只有一层。实测 50 次 importlib.reload + setUpModule
     # 会叠成 RecursionError——真要多次 reload 本模块，先把这条前提想清楚。
     subprocess.Popen.__init__ = no_real_agent
+
+
+def tearDownModule():
+    if _AGENT_CALLS.exists():
+        raise AssertionError("子进程测试试图启动真实代理（已由 PATH 替身挡住）：\n"
+                             + _AGENT_CALLS.read_text())
 
 
 @contextlib.contextmanager
@@ -6477,3 +6505,35 @@ class TestMetadataReaders(_HomeSandbox):
         self.assertEqual(code, 2)
         self.assertIn("good", output["text"])
         self.assertIn("t.json", output["text"] + errors.getvalue())
+
+
+class TestChildProcessAgentGuard(unittest.TestCase):
+    def test_子进程误起代理被PATH替身挡住_模块收尾必须失败并点名命令(self):
+        # 缺少 PATH 防线时，下游仍是无害替身：红灯阶段也绝不能调用真代理。
+        # 删除子进程拦截或收尾检查，都会让这条测试失败。
+        for binary in ("codex", "claude-deepseek"):
+            with self.subTest(binary=binary), tempfile.TemporaryDirectory() as temporary:
+                root = pathlib.Path(temporary)
+                escaped = root / "escaped"
+                downstream = root / binary
+                downstream.write_text("#!/bin/sh\n: > " + shlex.quote(str(escaped)) + "\nexit 0\n")
+                downstream.chmod(0o755)
+                child = "import subprocess; subprocess.run(" + repr([binary, "--guard-probe"]) + ", check=True)"
+                driver = (
+                    "import subprocess,sys,unittest\n"
+                    "import test_sub_agent_runner as tests\n"
+                    "class Probe(unittest.TestCase):\n"
+                    "    def runTest(self):\n"
+                    f"        subprocess.run([sys.executable, '-c', {child!r}], check=False)\n"
+                    "Probe.__module__ = tests.__name__\n"
+                    "result = unittest.TextTestRunner().run(unittest.TestSuite([Probe()]))\n"
+                    "sys.exit(0 if result.wasSuccessful() else 1)\n")
+                result = subprocess.run(
+                    [sys.executable, "-c", driver], text=True, capture_output=True, timeout=10,
+                    env=dict(os.environ, PATH=str(root) + os.pathsep + os.defpath),
+                    cwd=pathlib.Path(ca.__file__).parent)
+                self.assertFalse(escaped.exists(), "子进程绕过了 PATH 防线")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("tearDownModule", result.stderr)
+                self.assertIn(binary, result.stderr)
+                self.assertIn("--guard-probe", result.stderr)

@@ -76,5 +76,7 @@ python3 -m unittest test_sub_agent_runner -v
 `test_sub_agent_runner.py` 的模块 docstring 是维护者入口，那里记着这个仓库
 在「空测试」上栽过的八种形态和它们的解药。
 
-**测试一次都不会真起 codex 或 claude**（`setUpModule` 有条断言挡着，漏包 mock 当场喊）。
+**测试一次都不会真起 codex 或 claude**：`setUpModule` 拦截本进程的启动，并在 PATH
+最前面放置临时替身，让 Python、Bash 等子进程也继承防线。替身记下命令后以非零
+退出；模块收尾发现记录就令测试失败，防止误调用被正常的失败用例吞掉。
 加第三个 runner 时那份可执行名清单要跟着加，否则那条护栏对它是空的。
