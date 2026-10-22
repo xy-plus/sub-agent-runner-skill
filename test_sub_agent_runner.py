@@ -205,8 +205,12 @@ def setUpModule():
 
     # 测试不能继承运行它的真实 Bash 调用标记：前台会误拒派活，后台会污染
     # 真实调用的结论。移除环境变量也覆盖子进程；护栏用例自己显式设置标记。
-    global _INHERITED_BASH_CALL_MARKER
-    _INHERITED_BASH_CALL_MARKER = os.environ.pop(ca.BASH_CALL_ENV, None)
+    inherited_marker = os.environ.pop(ca.BASH_CALL_ENV, None)
+    # setUpModule 失败时会跳过 tearDownModule，但已登记的模块清理仍会执行。
+    if inherited_marker is None:
+        unittest.addModuleCleanup(os.environ.pop, ca.BASH_CALL_ENV, None)
+    else:
+        unittest.addModuleCleanup(os.environ.__setitem__, ca.BASH_CALL_ENV, inherited_marker)
 
     # Popen 插桩只在本解释器里有效。子进程跑真 runner 时会重新 import Python，
     # 因而还要让它继承 PATH 替身；两个代理共用同一份调用记录，不能只让假程序
@@ -245,10 +249,6 @@ def setUpModule():
 
 
 def tearDownModule():
-    if _INHERITED_BASH_CALL_MARKER is None:
-        os.environ.pop(ca.BASH_CALL_ENV, None)
-    else:
-        os.environ[ca.BASH_CALL_ENV] = _INHERITED_BASH_CALL_MARKER
     if _AGENT_CALLS.exists():
         raise AssertionError("子进程测试试图启动真实代理（已由 PATH 替身挡住）：\n"
                              + _AGENT_CALLS.read_text())
@@ -6560,7 +6560,8 @@ class TestModuleBashCallIsolation(_HomeSandbox):
         driver = (
             "import json,os,pathlib,sys,unittest\n"
             "import test_sub_agent_runner as tests\n"
-            "suite = unittest.defaultTestLoader.loadTestsFromTestCase(tests.TestAutoAccountPick)\n"
+            "suite = unittest.defaultTestLoader.loadTestsFromName(\n"
+            "    'TestAutoAccountPick.test_全满时改派DeepSeek_元数据和status都用实际执行者', tests)\n"
             "result = unittest.TextTestRunner().run(suite)\n"
             "pathlib.Path(sys.argv[1]).write_text(json.dumps(os.environ.get(tests.ca.BASH_CALL_ENV)))\n"
             "sys.exit(0 if result.wasSuccessful() else 1)\n")
