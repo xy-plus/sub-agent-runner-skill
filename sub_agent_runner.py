@@ -2493,32 +2493,28 @@ def cmd_run(args):
                    + "\n先跑 `codex-acct login <账号>`。")
         limits = active_account_limits(candidates, datetime.datetime.now())
         if len(limits) == len(candidates):
-            runner, account = DEEPSEEK, None
-            print("[sub-agent-runner] " + "、".join(
-                f"{name} 至 {reset:%Y-%m-%d %H:%M}" for name, reset in limits)
-                + "，这一轮交给 DeepSeek")
-        else:
-            account = candidates[0]
+            reject("codex 号都在限流期内，auto 模式拒绝分配：\n"
+                   + "\n".join(f"  {name} 至 {reset:%Y-%m-%d %H:%M}" for name, reset in limits))
+        account = candidates[0]
     else:
         account = args.account
 
-    # 显式选择不搬任务；auto 可跨账号、跨 runner，复用同一段迁移代码。
+    # 同名任务不能换 runner；auto 只在 codex 账号之间搬元数据。
     home = isolation_home(runner, account)
-    if old_meta is not None and args.account != AUTO:
+    if old_meta is not None:
         if old_meta["runner"] != runner:
             reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
-                   "非 auto 的同名任务不能换 runner，换个任务名。")
-        if old_home != home:
+                   "同名任务不能换 runner，换个任务名。")
+        if old_home != home and args.account != AUTO:
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
 
-    # 所有会拒绝的检查必须在动文件之前。旧 agent 按旧 runner 查，新家按本轮的
-    # runner 查；agent 已停但旧 writer 还在排管道时，也不能搬走它还会写回的元数据。
+    # 所有会拒绝的检查必须在动文件之前；agent 已停但旧 writer 还在排管道时，
+    # 也不能搬走它还会写回的元数据。
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
-    homes = [(home, runner)] if old_home in (None, home) else [
-        (old_home, old_meta["runner"]), (home, runner)]
-    for candidate_home, candidate_runner in homes:
-        if find_task_agent_pid(candidate_runner, candidate_home, args.task) is not None:
+    homes = [home] if old_home in (None, home) else [old_home, home]
+    for candidate_home in homes:
+        if find_task_agent_pid(runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `sub-agent-runner stop {args.task}`")
     if old_home is not None and old_home != home and _previous_writer_alive(old_home, args.task):
@@ -2549,8 +2545,8 @@ def cmd_run(args):
                            f" {old_home}。把文件挪回 {old_path} 后重试。")
                 reject(f"任务 {args.task} 写新内容失败（{error}），已挪回 {old_path}，"
                        "原内容未变。")
-            print(f"[sub-agent-runner] 任务 {args.task} 原本在 {old_meta['runner']}"
-                  f"（账号 {old_meta['account']}），本次改用 {runner}（账号 {account}）："
+            print(f"[sub-agent-runner] 任务 {args.task} 原本在账号 {old_meta['account']}，"
+                  f"本次改用账号 {account}："
                   f"元数据搬过来，旧家的报告和日志留在 {old_home} 原处不动。")
             # 新内容由本进程写入；run_codex 的 _previous_writer_alive 判自己已停，
             # 不会等自己。旧家已在上面确认 writer 与 agent 都结束。
@@ -2594,7 +2590,7 @@ def record_usage_limit(home, meta, this_round, verdict, continuing):
     limits = active_account_limits(candidates, datetime.datetime.now())
     account = meta["account"]
     if candidates and len(limits) == len(candidates):
-        whats_next = "codex 号都在限流期内，重跑这条命令（--account auto）会交给 DeepSeek"
+        whats_next = "codex 号都在限流期内，重跑这条命令（--account auto）会被拒"
     elif candidates and candidates[0] != account:
         whats_next = f"下次 --account {AUTO} 会先试 {candidates[0]}"
     else:

@@ -3540,10 +3540,10 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「deepseek 不收 --account」这条契约没了")
         self.assertRegex(skill, r"`deepseek`[^\n]*只有 `max`",
                          "「deepseek 的 effort 只有 max」这条契约没了")
-        self.assertRegex(skill, r"非 auto[^\n]*同一个任务名不能换 runner",
-                         "显式跨 runner 仍需换任务名")
-        self.assertRegex(skill, r"--account auto`[^\n]*选中的那一侧",
-                         "auto 同名任务会跟随实际选择的执行者")
+        self.assertRegex(skill, r"任何模式下[^\n]*同一个任务名不能换 runner",
+                         "跨 runner 在任何模式下都需换任务名")
+        self.assertRegex(skill, r"--account auto`[^\n]*只在 codex 账号之间搬同名任务",
+                         "auto 只能在 codex 账号之间搬同名任务")
         # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
         # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
         # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
@@ -3551,8 +3551,8 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「auto 是默认写法」这条没了")
         self.assertRegex(skill, r"撞上额度上限\*\*不会自动重跑\*\*",
                          "「撞上限不自动重跑」这条没了——调用方会以为树是干净的")
-        self.assertRegex(skill, r"重跑这条命令[^\n]*DeepSeek",
-                         "重发 auto 命令是换号及全满兜底的入口")
+        self.assertRegex(skill, r"重跑这条命令[^\n]*重新选号",
+                         "重发 auto 命令只重新选号")
         self.assertRegex(skill, r"写它的名字[^\n]*\*\*不换号\*\*",
                          "「写死账号名就不换号」这条没了——两种模式的差别没人守")
         self.assertRegex(skill, r"\*\*`auto` 不是调度器\*\*",
@@ -4383,17 +4383,12 @@ class TestAutoAccountPick(_HomeSandbox):
         限流；有报告时 A 不计入，所以假进程须还原额度错误发生在写报告前的情形。
         """
         def one(argv, *a, **kwargs):
-            if argv[0] == "claude-deepseek":
-                self.spawned.append("deepseek")
-                output = json.dumps({"type": "result", "subtype": "success",
-                                     "is_error": False, "result": "干完了\n"}) + "\n"
-            else:
-                self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
-                output = text
-            if argv[0] == "codex" and not ca.runtime_error_lines(text):
+            self.assertEqual(argv[0], "codex", "Codex 派活不能启动其他 runner")
+            self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
+            if not ca.runtime_error_lines(text):
                 pathlib.Path(argv[argv.index("-o") + 1]).write_text("干完了\n")
             proc = mock.MagicMock()
-            proc.stdout.read1.side_effect = [output.encode(), b""]
+            proc.stdout.read1.side_effect = [text.encode(), b""]
             proc.wait.return_value = 1
             return proc
         popen.side_effect = one
@@ -4407,20 +4402,49 @@ class TestAutoAccountPick(_HomeSandbox):
 
     # ── 挑号 ────────────────────────────────────────────────────────────
 
-    def test_全满时改派DeepSeek_元数据和status都用实际执行者(self):
+    def test_全满时拒绝_列出恢复时间且不改任务状态或启动代理(self):
         for account, year in (("default", 2099), ("acct2", 2098), ("acct3", 2097)):
             self._limit(account, datetime.datetime(year, 1, 1))
-        self.assertEqual(self._run(ca.AUTO, self.FINE), 0)
-        self.assertEqual(self.spawned, ["deepseek"])
-        home, meta = ca.find_meta("t")
-        self.assertEqual(home, self.home / ".claude-subagent")
-        self.assertEqual((meta["runner"], meta["account"]), ("deepseek", None))
-        self.assertIn("这一轮交给 DeepSeek", self.printed)
-        for year in (2097, 2098, 2099):
-            self.assertIn(str(year), self.printed)
-        with _capture_stdout() as printed:
-            self.assertEqual(ca.cmd_status(ca.build_parser().parse_args(["status", "t"])), 0)
-        self.assertEqual(printed["text"].split()[1], "deepseek")
+        old_home = ca.isolation_home(ca.CODEX, "acct3")
+        ca.write_meta(old_home, "t", _full_meta("t", account="acct3"))
+        (old_home / "reports" / "t.md").write_text("old report")
+        (old_home / "logs" / "t.log").write_text("old log")
+        before = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
+                  for path in self.home.rglob("*")}
+
+        for task in ("new-task", "t"):
+            with self.subTest(task=task):
+                with self.assertRaises(ca.Rejected) as got:
+                    self._run(ca.AUTO, self.FINE, task=task)
+                self.assertEqual(got.exception.code, 2)
+                for limit in ("default 至 2099-01-01 00:00", "acct2 至 2098-01-01 00:00",
+                              "acct3 至 2097-01-01 00:00"):
+                    self.assertIn(limit, got.exception.message)
+                after = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
+                         for path in self.home.rglob("*")}
+                self.assertEqual(after, before, "拒绝不许增删或修改任务文件及隔离目录")
+                self.assertEqual(self.spawned, [], "全满拒绝不许启动任何代理")
+
+    def test_同名DeepSeek任务在auto和显式账号下都拒绝且状态不变(self):
+        old_home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        old_meta = _full_meta("t", runner="deepseek", account=None, dir=str(self.workdir))
+        ca.write_meta(old_home, "t", old_meta)
+        (old_home / "reports" / "t.md").write_text("old report")
+        (old_home / "logs" / "t.log").write_text("old log")
+        before = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
+                  for path in self.home.rglob("*")}
+
+        for account in ("default", "acct2", "acct3", "auto"):
+            with self.subTest(account=account):
+                with self.assertRaises(ca.Rejected) as got:
+                    self._run(account, self.FINE)
+                self.assertEqual(got.exception.code, 2)
+                self.assertIn("runner", got.exception.message)
+                self.assertEqual(ca.find_meta("t"), (old_home, old_meta))
+                after = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
+                         for path in self.home.rglob("*")}
+                self.assertEqual(after, before)
+                self.assertEqual(self.spawned, [], "跨 runner 同名拒绝不许启动任何代理")
 
     def test_未满时无记录坏记录过期记录都能选Codex(self):
         for state in ("missing", "broken", "expired"):
@@ -4444,7 +4468,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(self._run("acct3", self.FINE), 0)
         self.assertEqual(self.spawned, ["acct3"])
 
-    def test_最后一个账号撞限后提示重发auto交给DeepSeek(self):
+    def test_最后一个账号撞限后提示重发auto会被拒(self):
         for account in ("default", "acct3"):
             self._limit(account, datetime.datetime(2099, 1, 1))
         line = self.LIMIT_LINE.replace("Sep 25th, 2026", "Sep 25th, 2099")
@@ -4452,7 +4476,8 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(self.spawned, ["acct2"])
         self.assertIn("codex 号都在限流期内", self.printed)
         self.assertIn("重跑这条命令", self.printed)
-        self.assertIn("交给 DeepSeek", self.printed)
+        self.assertIn("会被拒", self.printed)
+        self.assertNotIn("DeepSeek", self.printed)
 
     def test_auto挑恢复时间最早的那个_并且只启动一次codex(self):
         # 「只启动一次」是 v4 的形状本身：没有循环，撞上限也不再换号重跑。
@@ -6244,7 +6269,7 @@ class TestQuotaReadTime(_HomeSandbox):
                     (datetime.datetime(2026, 10, 22, 5, 1), b"")])
                 self.assertEqual(ca.read_usage_limit(self.task_home),
                                  datetime.datetime(2026, 10, 22, 6))
-                self.assertIn("交给 DeepSeek", output)
+                self.assertIn("重跑这条命令（--account auto）会被拒", output)
                 self.assertIn("run", output)
                 self.assertIn("新会话", output)
 
@@ -6254,16 +6279,19 @@ class TestTaskMigration(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.codex = ca.ensure_isolation(ca.CODEX, "default")
-        self.deepseek = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.old_home = ca.ensure_isolation(ca.CODEX, "default")
+        account_dir = self.home / ".codex-accounts" / "acct2"
+        account_dir.mkdir(parents=True)
+        (account_dir / "auth.json").write_text("{}")
+        self.new_home = ca.ensure_isolation(ca.CODEX, "acct2")
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
         self.brief.write_text("干活")
         self.old_meta = _full_meta("t", dir=str(self.workdir),
                                    session_id="01a0b408-f718-7ff3-8123-d5202551acba")
-        ca.write_meta(self.codex, "t", self.old_meta)
-        ca.write_usage_limit(self.codex, datetime.datetime(2099, 1, 1), "fixture")
+        ca.write_meta(self.old_home, "t", self.old_meta)
+        ca.write_usage_limit(self.old_home, datetime.datetime(2099, 1, 1), "fixture")
 
     def _args(self):
         return ca.build_parser().parse_args([
@@ -6274,11 +6302,8 @@ class TestTaskMigration(_HomeSandbox):
     def _run(self):
         def spawn(argv, **kwargs):
             proc = mock.MagicMock()
-            if argv[0] == "codex":
-                pathlib.Path(argv[argv.index("-o") + 1]).write_text("done")
-                raw = b"done\n"
-            else:
-                raw = b'{"type":"result","subtype":"success","is_error":false,"result":"done"}\n'
+            pathlib.Path(argv[argv.index("-o") + 1]).write_text("done")
+            raw = b"done\n"
             proc.stdout = io.BytesIO(raw)
             return proc
 
@@ -6286,77 +6311,78 @@ class TestTaskMigration(_HomeSandbox):
             code = ca.cmd_run(self._args())
         return code, output["text"]
 
-    def test_auto在两侧往返_旧产物保留_status显示新执行者(self):
-        (self.codex / "logs" / "t.log").write_text("old log")
-        (self.codex / "reports" / "t.md").write_text("old report")
+    def test_auto在账号间往返_旧产物保留_status显示新账号(self):
+        (self.old_home / "logs" / "t.log").write_text("old log")
+        (self.old_home / "reports" / "t.md").write_text("old report")
         self.assertEqual(self._run()[0], 0)
         home, meta = ca.find_meta("t")
         self.assertEqual((home, meta["runner"], meta["account"]),
-                         (self.deepseek, "deepseek", None))
-        self.assertFalse(ca.meta_path(self.codex, "t").exists())
+                         (self.new_home, "codex", "acct2"))
+        self.assertFalse(ca.meta_path(self.old_home, "t").exists())
         self.assertEqual(len(ca.all_metas()), 1)
-        self.assertEqual((self.codex / "logs" / "t.log").read_text(), "old log")
-        self.assertEqual((self.codex / "reports" / "t.md").read_text(), "old report")
+        self.assertEqual((self.old_home / "logs" / "t.log").read_text(), "old log")
+        self.assertEqual((self.old_home / "reports" / "t.md").read_text(), "old report")
         with _capture_stdout() as output:
             self.assertEqual(ca.cmd_status(argparse.Namespace(task="t")), 0)
-        self.assertEqual(output["text"].split()[1], "deepseek")
-        deepseek_log = (self.deepseek / "logs" / "t.log").read_bytes()
-        ca.usage_limit_path(self.codex).unlink()
+        self.assertEqual(output["text"].split()[1], "codex:acct2")
+        new_log = (self.new_home / "logs" / "t.log").read_bytes()
+        ca.usage_limit_path(self.old_home).unlink()
+        ca.write_usage_limit(self.new_home, datetime.datetime(2099, 1, 1), "fixture")
         try:
             self.assertEqual(self._run()[0], 0)
         except ca.Rejected as error:
-            self.fail("auto 应能从 DeepSeek 换回 Codex：" + error.message)
+            self.fail("auto 应能从 acct2 换回 default：" + error.message)
         home, meta = ca.find_meta("t")
         self.assertEqual((home, meta["runner"], meta["account"]),
-                         (self.codex, "codex", "default"))
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
-        self.assertEqual((self.deepseek / "logs" / "t.log").read_bytes(), deepseek_log)
+                         (self.old_home, "codex", "default"))
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
+        self.assertEqual((self.new_home / "logs" / "t.log").read_bytes(), new_log)
 
     def test_brief校验在换家之前_旧元数据一个字节不动(self):
         self.brief.write_text("不得使用任何 skill")
-        before = ca.meta_path(self.codex, "t").read_bytes()
+        before = ca.meta_path(self.old_home, "t").read_bytes()
         with self.assertRaises(ca.Rejected):
             self._run()
-        self.assertTrue(ca.meta_path(self.codex, "t").exists())
-        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
+        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
 
-    def test_旧家agent按旧runner查_还在跑就拒绝且不换家(self):
+    def test_旧家agent还在跑就拒绝且不换家(self):
         def agent(runner, home, task):
-            return 4242 if (runner, home) == ("codex", self.codex) else None
+            return 4242 if (runner, home) == ("codex", self.old_home) else None
 
         with mock.patch.object(ca, "find_task_agent_pid", agent):
             with self.assertRaises(ca.Rejected) as got:
                 self._run()
         self.assertIn("还在跑", got.exception.message)
-        self.assertTrue(ca.meta_path(self.codex, "t").exists())
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
 
     def test_旧writer尚未结束就拒绝且不换家(self):
         self.old_meta.update(_live_writer(self))
-        ca.write_meta(self.codex, "t", self.old_meta)
-        before = ca.meta_path(self.codex, "t").read_bytes()
+        ca.write_meta(self.old_home, "t", self.old_meta)
+        before = ca.meta_path(self.old_home, "t").read_bytes()
         with self.assertRaises(ca.Rejected) as got:
             self._run()
         self.assertRegex(got.exception.message, "writer|收尾")
-        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
 
     def test_rename失败时原文件不变_不启动代理(self):
-        before = ca.meta_path(self.codex, "t").read_bytes()
+        before = ca.meta_path(self.old_home, "t").read_bytes()
         with mock.patch.object(ca.os, "rename", side_effect=OSError("rename failed")):
             with self.assertRaises(ca.Rejected) as got:
                 self._run()
         self.assertIn("rename", got.exception.message)
-        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
 
     def test_写新内容失败时挪回旧家且内容不变(self):
-        before = ca.meta_path(self.codex, "t").read_bytes()
+        before = ca.meta_path(self.old_home, "t").read_bytes()
         replace = ca.os.replace
 
         def fail_new(src, dst):
-            if dst == ca.meta_path(self.deepseek, "t"):
+            if dst == ca.meta_path(self.new_home, "t"):
                 raise OSError("new write failed")
             return replace(src, dst)
 
@@ -6367,16 +6393,16 @@ class TestTaskMigration(_HomeSandbox):
                 self.assertIsInstance(error, ca.Rejected, "写失败要给出可操作的拒绝说明")
             else:
                 self.fail("新内容写失败却继续派活")
-        self.assertTrue(ca.meta_path(self.codex, "t").exists())
-        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
-        self.assertEqual(ca.find_meta("t")[0], self.codex)
+        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
+        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
+        self.assertEqual(ca.find_meta("t")[0], self.old_home)
 
     def test_写新和挪回都失败后_各入口拒用不一致的目录(self):
         rename = ca.os.rename
 
         def fail_rollback(src, dst):
-            if dst == ca.meta_path(self.codex, "t"):
+            if dst == ca.meta_path(self.old_home, "t"):
                 raise OSError("rollback failed")
             return rename(src, dst)
 
@@ -6387,9 +6413,9 @@ class TestTaskMigration(_HomeSandbox):
                     self._run()
             except OSError:
                 self.fail("迁移失败未给出元数据位置与恢复说明")
-        self.assertIn(str(ca.meta_path(self.deepseek, "t")), got.exception.message)
-        self.assertFalse(ca.meta_path(self.codex, "t").exists())
-        self.assertTrue(ca.meta_path(self.deepseek, "t").exists())
+        self.assertIn(str(ca.meta_path(self.new_home, "t")), got.exception.message)
+        self.assertFalse(ca.meta_path(self.old_home, "t").exists())
+        self.assertTrue(ca.meta_path(self.new_home, "t").exists())
         for command in ("status", "resume", "interrupt-and-resume", "stop", "run"):
             with self.subTest(command=command), \
                     mock.patch.object(ca, "find_task_agent_pid", side_effect=AssertionError("用了错误的家")):
@@ -6398,18 +6424,21 @@ class TestTaskMigration(_HomeSandbox):
                                       ["--brief", str(self.brief), "--effort", "max", "--no-skill"]))
                 with self.assertRaises(ca.Rejected) as got:
                     args.func(args)
-                self.assertIn(str(self.codex / "tasks"), got.exception.message)
-                self.assertIn(str(self.deepseek / "tasks"), got.exception.message)
+                self.assertIn(str(self.old_home / "tasks"), got.exception.message)
+                self.assertIn(str(self.new_home / "tasks"), got.exception.message)
                 self.assertRegex(got.exception.message, "挪回|移回")
 
 
 class TestMetadataReaders(_HomeSandbox):
     def setUp(self):
         super().setUp()
-        self.codex = ca.ensure_isolation(ca.CODEX, "default")
-        self.deepseek = ca.ensure_isolation(ca.DEEPSEEK, None)
-        self.codex_meta = _full_meta("t")
-        self.deepseek_meta = _full_meta("t", runner="deepseek", account=None)
+        self.default_home = ca.ensure_isolation(ca.CODEX, "default")
+        account_dir = self.home / ".codex-accounts" / "acct2"
+        account_dir.mkdir(parents=True)
+        (account_dir / "auth.json").write_text("{}")
+        self.acct2_home = ca.ensure_isolation(ca.CODEX, "acct2")
+        self.default_meta = _full_meta("t")
+        self.acct2_meta = _full_meta("t", account="acct2")
 
     def _move(self, old, new, meta):
         os.rename(ca.meta_path(old, "t"), ca.meta_path(new, "t"))
@@ -6422,16 +6451,16 @@ class TestMetadataReaders(_HomeSandbox):
         self.assertEqual(roots.call_count, 2)
 
     def test_读取旧家后rename_重扫不能误判两份(self):
-        ca.write_meta(self.codex, "t", self.codex_meta)
+        ca.write_meta(self.default_home, "t", self.default_meta)
         load = ca._load_meta
         moved = False
 
         def load_and_move(path):
             nonlocal moved
             meta = load(path)
-            if path == ca.meta_path(self.codex, "t") and not moved:
+            if path == ca.meta_path(self.default_home, "t") and not moved:
                 moved = True
-                self._move(self.codex, self.deepseek, self.deepseek_meta)
+                self._move(self.default_home, self.acct2_home, self.acct2_meta)
             return meta
 
         with mock.patch.object(ca, "_load_meta", load_and_move):
@@ -6439,14 +6468,14 @@ class TestMetadataReaders(_HomeSandbox):
                 found = ca.find_meta("t")
             except ca.Rejected as error:
                 self.fail(error.message)
-        self.assertEqual(found, (self.deepseek, self.deepseek_meta))
+        self.assertEqual(found, (self.acct2_home, self.acct2_meta))
 
-    def test_读完DeepSeek旧家后换到Codex_resume不重建旧元数据(self):
+    def test_读完acct2旧家后换到default_resume不重建旧元数据(self):
         # 新家在扫描顺序中更早，读完旧家后再搬走，就不会在本轮扫出两份。
         # 注入的只是迁移时刻；rename、写新内容、续跑和元数据落盘都走真实代码。
-        for meta in (self.deepseek_meta, self.codex_meta):
+        for meta in (self.acct2_meta, self.default_meta):
             meta.update(dir=str(self.home), session_id="01a0b408-f718-7ff3-8123-d5202551acba")
-        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
         brief = self.home / "brief.md"
         brief.write_text("继续干活")
         args = ca.build_parser().parse_args([
@@ -6457,23 +6486,24 @@ class TestMetadataReaders(_HomeSandbox):
         def load_and_move(path):
             nonlocal moved
             meta = load(path)
-            if path == ca.meta_path(self.deepseek, "t") and not moved:
+            if path == ca.meta_path(self.acct2_home, "t") and not moved:
                 moved = True
-                self._move(self.deepseek, self.codex, self.codex_meta)
+                self._move(self.acct2_home, self.default_home, self.default_meta)
             return meta
 
         with mock.patch.object(ca, "_load_meta", load_and_move), \
                 _fake_agent_proc(b"done\n") as agent, _capture_stdout():
             self.assertEqual(ca.cmd_resume(args), 1)
-        self.assertFalse(ca.meta_path(self.deepseek, "t").exists(), "续跑重建了已搬走的旧家")
-        self.assertEqual(agent.call_args.args[0][0], "codex", "续跑启动了旧执行者")
+        self.assertFalse(ca.meta_path(self.acct2_home, "t").exists(), "续跑重建了已搬走的旧家")
+        self.assertEqual(agent.call_args.kwargs["env"]["CODEX_HOME"], str(self.default_home),
+                         "续跑仍用了旧账号的隔离环境")
         paths = [path for home in ca.isolation_roots() for path in (home / "tasks").glob("t.json")]
-        self.assertEqual(paths, [ca.meta_path(self.codex, "t")])
-        self.assertEqual(ca.find_meta("t")[1]["runner"], "codex")
+        self.assertEqual(paths, [ca.meta_path(self.default_home, "t")])
+        self.assertEqual(ca.find_meta("t")[1]["account"], "default")
 
     def test_读取后原位置内容已变_重扫取新内容(self):
-        ca.write_meta(self.codex, "t", self.codex_meta)
-        current = dict(self.codex_meta, started_at="2026-10-22T12:00:00")
+        ca.write_meta(self.default_home, "t", self.default_meta)
+        current = dict(self.default_meta, started_at="2026-10-22T12:00:00")
         load = ca._load_meta
         changed = False
 
@@ -6482,37 +6512,37 @@ class TestMetadataReaders(_HomeSandbox):
             meta = load(path)
             if not changed:
                 changed = True
-                ca.write_meta(self.codex, "t", current)
+                ca.write_meta(self.default_home, "t", current)
             return meta
 
         with mock.patch.object(ca, "_load_meta", load_and_change):
-            self.assertEqual(ca.find_meta("t"), (self.codex, current))
+            self.assertEqual(ca.find_meta("t"), (self.default_home, current))
 
     def test_读新家前rename_瞬时零份立即重扫(self):
-        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
         exists = pathlib.Path.exists
         moved = False
 
         def move_before_old_exists(path):
             nonlocal moved
-            if path == ca.meta_path(self.deepseek, "t") and not moved:
+            if path == ca.meta_path(self.acct2_home, "t") and not moved:
                 moved = True
-                self._move(self.deepseek, self.codex, self.codex_meta)
+                self._move(self.acct2_home, self.default_home, self.default_meta)
             return exists(path)
 
         with mock.patch.object(pathlib.Path, "exists", move_before_old_exists):
-            self.assertEqual(ca.find_meta("t"), (self.codex, self.codex_meta))
+            self.assertEqual(ca.find_meta("t"), (self.default_home, self.default_meta))
 
     def test_exists和read之间rename_不能抛裸文件不存在(self):
-        ca.write_meta(self.codex, "t", self.codex_meta)
+        ca.write_meta(self.default_home, "t", self.default_meta)
         load = ca._load_meta
         moved = False
 
         def move_before_read(path):
             nonlocal moved
-            if path == ca.meta_path(self.codex, "t") and not moved:
+            if path == ca.meta_path(self.default_home, "t") and not moved:
                 moved = True
-                self._move(self.codex, self.deepseek, self.deepseek_meta)
+                self._move(self.default_home, self.acct2_home, self.acct2_meta)
             return load(path)
 
         with mock.patch.object(ca, "_load_meta", move_before_read):
@@ -6520,29 +6550,29 @@ class TestMetadataReaders(_HomeSandbox):
                 found = ca.find_meta("t")
             except (FileNotFoundError, ca.Rejected) as error:
                 self.fail(str(error))
-        self.assertEqual(found, (self.deepseek, self.deepseek_meta))
+        self.assertEqual(found, (self.acct2_home, self.acct2_meta))
 
     def test_rename到新家但未写完_等待内容与位置一致(self):
-        ca.write_meta(self.codex, "t", self.codex_meta)
-        os.rename(ca.meta_path(self.codex, "t"), ca.meta_path(self.deepseek, "t"))
+        ca.write_meta(self.default_home, "t", self.default_meta)
+        os.rename(ca.meta_path(self.default_home, "t"), ca.meta_path(self.acct2_home, "t"))
 
         def finish():
             time.sleep(0.15)
-            ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+            ca.write_meta(self.acct2_home, "t", self.acct2_meta)
 
         writer = threading.Thread(target=finish)
         writer.start()
         self.addCleanup(writer.join)
-        self.assertEqual(ca.find_meta("t"), (self.deepseek, self.deepseek_meta))
+        self.assertEqual(ca.find_meta("t"), (self.acct2_home, self.acct2_meta))
 
     def test_持续多份列出路径与内容所指的家_其他任务仍显示(self):
-        ca.write_meta(self.codex, "t", self.codex_meta)
-        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
-        ca.write_meta(self.codex, "good", _full_meta("good"))
-        (self.codex / "reports" / "good.md").write_text("finished")
+        ca.write_meta(self.default_home, "t", self.default_meta)
+        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
+        ca.write_meta(self.default_home, "good", _full_meta("good"))
+        (self.default_home / "reports" / "good.md").write_text("finished")
         with self.assertRaises(ca.Rejected) as got:
             ca.find_meta("t")
-        for path in (self.codex / "tasks" / "t.json", self.deepseek / "tasks" / "t.json"):
+        for path in (self.default_home / "tasks" / "t.json", self.acct2_home / "tasks" / "t.json"):
             self.assertIn(str(path), got.exception.message)
         self.assertRegex(got.exception.message, "删掉|删除")
         with _capture_stdout() as output, contextlib.redirect_stderr(io.StringIO()) as errors:
@@ -6561,7 +6591,7 @@ class TestModuleBashCallIsolation(_HomeSandbox):
             "import json,os,pathlib,sys,unittest\n"
             "import test_sub_agent_runner as tests\n"
             "suite = unittest.defaultTestLoader.loadTestsFromName(\n"
-            "    'TestAutoAccountPick.test_全满时改派DeepSeek_元数据和status都用实际执行者', tests)\n"
+            "    'TestAutoAccountPick.test_auto挑恢复时间最早的那个_并且只启动一次codex', tests)\n"
             "result = unittest.TextTestRunner().run(suite)\n"
             "pathlib.Path(sys.argv[1]).write_text(json.dumps(os.environ.get(tests.ca.BASH_CALL_ENV)))\n"
             "sys.exit(0 if result.wasSuccessful() else 1)\n")
