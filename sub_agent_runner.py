@@ -2244,10 +2244,7 @@ def _tee_until_exit(proc, log, home, task, meta):
             lines, buffer = split_complete_lines(buffer)
             if lines:
                 observe(b"\n".join(lines) + b"\n")
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
-        log.write(chunk)
-        log.flush()
+        _write_both(log, chunk)
         if session_id is None and len(head) < _HEAD_LIMIT:
             head += chunk
             session_id = extract_session_id(head.decode("utf-8", "replace"))
