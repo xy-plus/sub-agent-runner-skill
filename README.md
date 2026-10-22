@@ -109,6 +109,8 @@ hook error，护栏不起作用；已经开着的会话可能要重启才能拿�
 python3 -m unittest test_sub_agent_runner -v
 ```
 
+测试期间会暂时移除继承的 Bash 调用标记，结束时恢复；护栏用例自行设置标记。
+
 设计上的取舍和踩过的坑都写在代码注释里，贴在防住它的那行旁边——
 `test_sub_agent_runner.py` 的模块 docstring 是维护者入口，那里记着这个仓库
 在「空测试」上栽过的八种形态和它们的解药。

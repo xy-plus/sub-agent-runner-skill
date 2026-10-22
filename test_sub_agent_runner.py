@@ -203,6 +203,11 @@ def setUpModule():
         f"前提不成立：/proc/{GONE_PID} 居然存在。换一个必定不存在的 pid，"
         f"否则一批「上一轮早停了」的测试会静默测到另一条分支上。")
 
+    # 测试不能继承运行它的真实 Bash 调用标记：前台会误拒派活，后台会污染
+    # 真实调用的结论。移除环境变量也覆盖子进程；护栏用例自己显式设置标记。
+    global _INHERITED_BASH_CALL_MARKER
+    _INHERITED_BASH_CALL_MARKER = os.environ.pop(ca.BASH_CALL_ENV, None)
+
     # Popen 插桩只在本解释器里有效。子进程跑真 runner 时会重新 import Python，
     # 因而还要让它继承 PATH 替身；两个代理共用同一份调用记录，不能只让假程序
     # 退非零（runner 的正常失败测试可能把那个非零当成预期结果而悄悄变绿）。
@@ -229,8 +234,8 @@ def setUpModule():
         assert argv0 not in _REAL_AGENT_BINS, (
             f"这条测试把真的 {argv0} 叫起来了：{args!r}。少包了一层 _no_codex。")
         return _REAL_POPEN_INIT(self, args, *a, **kw)
-    # **Popen 插桩刻意不还原**；tearDownModule 只核对子进程的调用记录：
-    # 泄漏半径是**整个测试进程的余生**，同进程里后来 import 的任何模块调
+    # **Popen 插桩刻意不还原**：泄漏半径是**整个测试进程的余生**，
+    # 同进程里后来 import 的任何模块调
     # `Popen(["codex", ...])` 都会被它挡住。现在不可达——本仓只有这一个测试
     # 模块，只 import 一次。
     # **安全性唯一的地基是上面那行 `_REAL_POPEN_INIT` 在模块顶层、import 那一刻
@@ -240,6 +245,10 @@ def setUpModule():
 
 
 def tearDownModule():
+    if _INHERITED_BASH_CALL_MARKER is None:
+        os.environ.pop(ca.BASH_CALL_ENV, None)
+    else:
+        os.environ[ca.BASH_CALL_ENV] = _INHERITED_BASH_CALL_MARKER
     if _AGENT_CALLS.exists():
         raise AssertionError("子进程测试试图启动真实代理（已由 PATH 替身挡住）：\n"
                              + _AGENT_CALLS.read_text())
@@ -6544,6 +6553,32 @@ class TestMetadataReaders(_HomeSandbox):
         self.assertEqual(code, 2)
         self.assertIn("good", output["text"])
         self.assertIn("t.json", output["text"] + errors.getvalue())
+
+
+class TestModuleBashCallIsolation(_HomeSandbox):
+    def test_继承前后台标记时派活测试通过且不写外部调用目录_结束恢复原值(self):
+        driver = (
+            "import json,os,pathlib,sys,unittest\n"
+            "import test_sub_agent_runner as tests\n"
+            "suite = unittest.defaultTestLoader.loadTestsFromTestCase(tests.TestAutoAccountPick)\n"
+            "result = unittest.TextTestRunner().run(suite)\n"
+            "pathlib.Path(sys.argv[1]).write_text(json.dumps(os.environ.get(tests.ca.BASH_CALL_ENV)))\n"
+            "sys.exit(0 if result.wasSuccessful() else 1)\n")
+        for mode in ("foreground", "background"):
+            with self.subTest(mode=mode):
+                runtime = self.home / (mode + "-runtime")
+                runtime.mkdir()
+                restored = self.home / (mode + "-restored.json")
+                marker = mode + ":x"
+                env = dict(os.environ, XDG_RUNTIME_DIR=str(runtime))
+                env[ca.BASH_CALL_ENV] = marker
+                result = subprocess.run(
+                    [sys.executable, "-c", driver, str(restored)],
+                    cwd=pathlib.Path(ca.__file__).parent, env=env,
+                    text=True, capture_output=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(list(runtime.iterdir()), [], "测试写入了外部 Bash 调用目录")
+                self.assertEqual(json.loads(restored.read_text()), marker, "模块结束没有恢复原标记")
 
 
 class TestChildProcessAgentGuard(unittest.TestCase):
