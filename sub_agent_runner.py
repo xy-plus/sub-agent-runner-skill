@@ -8,12 +8,12 @@
 那一段的开头）：大部分在 `run_codex` 和它派生出来的那几个函数里，另三个是
 `isolation_home`／`ensure_isolation`／`find_task_agent_pid`——它们不问「怎么跑」，
 只按 runner 取事实。
-**命令入口里只有 `cmd_run` 带 runner 分支**：选 argv builder、「撞额度上限」那一支
-限 codex（那两件事本来就只属于调用入口——builder 要用刚铸好的 session id，而
-账号／限流记录是 codex 独有的概念），外加它第一行调的那两条硬拒绝
-（`_reject_bad_runner_combo`——两条各自只对某一个 runner 成立）。
-`status`／`resume`／`stop`／`interrupt-and-resume` 里一处都没有：它们从元数据取
-runner，再交给 `find_task_agent_pid` 和 `_resume_round`。
+`cmd_run` 选择执行者与 argv builder，auto 在全部有登录态的 codex 号都有限流记录
+且未到期时改派 DeepSeek。run 和续跑共用 `record_usage_limit`，只记账与提示，
+不在轮内接力。status/resume/stop 从唯一且归属一致的元数据查实际执行者。
+
+后台事实由 `background_guard.py mark-call` 传入；三个启动入口运行时拒绝前台。
+shell 退出时 end-call 等待本次调用脱离的 runner 并收齐结论，不另造通知通道。
 
 调用方只给任务信息（派给谁／干什么／在哪干／多难），命令组装、隔离、存活判定、
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
@@ -248,6 +248,8 @@ def require_background_call():
 
 
 def write_bash_call_result(task, code, verdict_line):
+    # PID 区分一次调用内不同任务的完成记录。先写再退出，end-call 等完才读取，
+    # 不需要再登记启动身份，也不需要重跑 status 猜本轮判据。
     call = bash_call()
     if call is not None and call[0] == "background":
         try:
@@ -312,12 +314,10 @@ def interrupt_agent(pid, log_path, cause):
     原来只是名字在说谎。
 
     `cause` ∈ {"stop", "interrupt-and-resume", "外部信号转发"}，**必填**，
-    追在痕迹行尾。三条路的含义完全不同：前两条是有人**故意**停它；第三条在
-    `run_in_background` 下**根本不该发生**——它出现就等于前台误跑被 2 分钟
-    超时杀掉了。不带来源的话，日志里只剩一句「被打断了」，下一个人读不出
-    「你当时用错了启动方式」。
-    这是把「一条编不进去的软约定（必须用 run_in_background）被违反了」变成
-    **日志里可读的诊断**。`INTERRUPT_MARK` 仍是稳定前缀，`_MARK_LINE` 的
+    追在痕迹行尾。前两条是经工具显式停止；第三条是包装器收到外部信号，可能
+    来自取消后台调用，也可能是未注册护栏时前台误跑被超时杀掉。来源让后续调用
+    能分清动作从哪里来。护栏没有替代信号转发：取消调用时仍要保住 agent 的会话。
+    `INTERRUPT_MARK` 仍是稳定前缀，`_MARK_LINE` 的
     `(\\s\\[.*\\])?$` 把来源收掉，判据不受影响。
 
     拆开放就会漏，而且**已经漏过一次**：`cmd_stop` 用裸 `os.kill` 打给 codex，
@@ -326,8 +326,7 @@ def interrupt_agent(pid, log_path, cause):
     包装器收尾判 `failed —— 报告缺失或为空＝没正常收尾`（退出码 1）、
     日志里 INTERRUPT_MARK 计数 **0**。而 agent 看到 failed 会从头重跑，
     把保着的上下文和 token 一起扔掉。
-    前台误跑被 2 分钟超时杀掉时同理：那正是「run_in_background 编不进去」
-    那条缓解措施最需要说话的时刻。
+    未注册护栏时前台误跑被超时杀掉也同理，痕迹仍要能让判据识别打断。
 
     **只发 INT，永不 TERM**：SIGTERM 会让 thread 永久锁死，之后 resume 永远报
     thread-store conflict，等多久都不释放，上下文全丢。
@@ -552,9 +551,8 @@ def hit_usage_limit(error_lines):
     ——那 3 份正是本项目自己的审查任务日志，**这个数字会随着我们每谈论一次额度
     判据而继续涨**，而它本身就是论据：污染源不是意外，是这个功能的日常。
     对整轮文本做子串匹配，那些行会被判成额度问题——而在 `cmd_run` 里，
-    那意味着给一个**健康账号**写下限流记录。配上「不做过期清理」和
-    「纯按 reset_at 排序」，一条 2099 年的假记录会让它**永远排最后**，
-    auto 再也不会先试它。
+    那意味着给一个健康账号写下假限流记录。它会被排到后面，其他账号也有未到期
+    记录时还会错误改派 DeepSeek，因此不能把普通文本中的同字样当作额度依据。
 
     **规矩：判据一旦成为控制依据，证据就必须来自已经分类过的错误行。**
     同一条规矩在本文件有第二个实例——`judge` 里的 `THREAD_LOCK_MARK`。它比这条
@@ -564,8 +562,8 @@ def hit_usage_limit(error_lines):
     当时全套 313 条测试毫无反应（见 `TestJudge.test_只是提到额度字样_不算撞上限`）。
     「测试绿」不等于「这条约束有人守」——动这一行之前先问：改坏了谁会红。
 
-    **`judge` 和 `cmd_run` 共用这一个谓词。** 两处各写一套必然漂移，
-    而判据漂移正是本工具反复在修的那类 bug。`cmd_run` 不自己再扫一遍，
+    **`judge` 和 `record_usage_limit` 共用这一个谓词。** 两处各写一套必然漂移，
+    而判据漂移正是本工具反复在修的那类 bug。记账不自己再扫一遍作判据，
     它喂的是 `verdict.detail`——failed 态下那就是本轮已分类的错误行
     （三个 `Verdict("failed", …)` 构造点全传 `errors`，有测试守着这条契约：
     `test_failed态的detail恒等于本轮已分类的错误行`）。这样两边看的是
@@ -744,14 +742,14 @@ def _usage_limit_tmp(home, pid):
 
 
 def write_usage_limit(home, reset_at, raw):
-    """记下这个账号什么时候恢复。**只在 `parse_reset_time` 成功时调用。**
+    """记下这个账号什么时候恢复。只在解析得到非 None 的日期时间时调用。
 
     `raw` 是审计线索：解析错了（时区、OpenAI 改文案）一眼看得出，不用翻日志。
-    **没有 `seen_at`**——唯一的读者是排序，排序只看 `reset_at`；
+    **没有 `seen_at`**——排序与全满改派都只消费 `reset_at`；
     没有消费者的字段一旦加进去就再也删不掉了。
 
-    **写不进去只提示、不抛，并返回 `False`。** 这条记录是优化不是前提：写失败
-    最多让下次排账号顺序时少一条依据，而抛出去会把本轮的收尾整个打断。
+    **写不进去只提示、不抛，并返回 `False`。** 写失败时下次 auto 少一条限流依据，
+    仍会照试；抛出去却会把本轮结论与收尾整个打断。
     吞在这里而不是留给调用方包 try：调用方每多一个就要记得包一层，
     而「必须记得」正是这个工具存在的理由本身。
     吞掉但**出声**——静默失效是这个仓库反复在修的那类病。
@@ -786,7 +784,7 @@ def read_usage_limit(home):
       带时区的 `reset_at`  `accounts_by_availability` 里要拿它和 `datetime.min`
                            （朴素）比，实测 `TypeError: can't compare offset-naive
                            and offset-aware datetimes`，一个手写坏的状态文件
-                           把整条 auto 命令打死。而按设计它最坏只该让顺序排差
+                           把整条 auto 命令打死。坏记录应当按无记录照试
       缺 `raw` / 类型不对   不是本函数写出来的东西。审计线索没了就查不出解析
                            错在哪，而这份记录的可信度本来就全靠它
     """
@@ -860,7 +858,7 @@ def clear_report(report_path):
 
 
 class Round(NamedTuple):
-    """一轮的报告文件路径 + 本轮文本。**不拆开传。**
+    """一轮的报告文件路径、本轮文本与错误行读取现场。**不拆开传。**
 
     拆开传时 `run_codex` 声称消灭掉的那类「必须记得对齐」只是上移了一层：
     它的 docstring 写着「报告路径由本函数拥有……这三条在结构上就违反不了了」，
@@ -869,7 +867,7 @@ class Round(NamedTuple):
     去判这个任务的报告，不报错，只给一个假结论。
     成对之后，「哪份报告配哪段文本」在拥有者那条路上写不错：`run_codex` 自己
     把两样一起交出来。外部观察者（status）没有本轮文本可用，只能显式构造
-    `Round(report, read_last_round(log))`——显式，所以看得见它在用推测。
+    `Round(report, read_last_round(log), None)`——显式，所以看得见它没有读取现场。
     """
     report_path: object   # pathlib.Path
     text: str             # 本轮的日志文本（已 strip_ansi、已切好边界）
@@ -1715,12 +1713,8 @@ def new_meta(task, runner, account, workdir, effort, skills):
 # 静默的：少一个字段，run 照常报成败，但那个任务从此 status/resume/stop 全
 # 够不着，工具还会建议「删掉它重新 run」——会话就此丢掉。
 #
-# **爆炸半径是「列表」，不是「那一个任务」**（2026-09-20 逐条实测）：
-#   all_metas()        一个坏 json 就整条拒绝 → 不带任务名的 `status` 一个任务
-#                      都列不出来，连好的那些一起陪葬
-#   find_meta("好的")   **不受牵连**——它只 stat/读那一个任务的 json
-#   find_meta("坏的")   拒绝，而这是对的：你点名要的就是那一份
-# 所以 `status <任务名>`／`resume`／`stop` 只对坏掉的那个任务失灵。
+# 缺字段的任务仍拒绝，不补隐式值。all_metas 现在逐任务保留 Rejected，status
+# 列出那一条的原因并继续显示其他任务；点名操作仍由 find_meta 直接拒绝。
 #
 # **往 REQUIRED_META_KEYS 加字段之前，先确认没有在跑的任务**：_load_meta 对缺
 # 字段的老元数据只会建议「删掉它重新 run」，而那等于丢会话。2026-09-19 加
@@ -2444,7 +2438,7 @@ def _print_verdict(task, verdict):
 
 def _reject_bad_runner_combo(args):
     """`--runner` 与 `--account` 的两条硬拒绝。**必须排在 `cmd_run`
-    任何状态变更之前**，所以它被抽成一个函数、由 `cmd_run` 第一行调用。
+    任何任务状态变更之前**；调用标记的前台拒绝先于这项参数检查。
 
     argparse 表达不了「A 必填当且仅当 B 是某值」，而写成文档约定正是仓库规范
     第 5 条要消灭的东西——所以这两条必须是代码。`--effort` 不在这里：两侧都只有
@@ -2471,8 +2465,7 @@ def _reject_bad_runner_combo(args):
 
 def cmd_run(args):
     require_background_call()
-    # **第一行就拒。** 排在 find_meta / ensure_isolation / new_meta 全部之前，
-    # 所以被拒的调用在盘上一个字节都不留。
+    # 参数组合检查仍排在任何任务状态变更之前；前台拒绝只会留下调用级标记。
     _reject_bad_runner_combo(args)
     runner = args.runner
     workdir = pathlib.Path(args.dir).expanduser().resolve()
@@ -2966,23 +2959,10 @@ def build_parser():
 def main():
     """入口。
 
-    **「必须用 `Bash(run_in_background: true)` 启动」这一条编不进硬约束**，
-    2026-09-19 实测过为什么：前台和后台两种方式下，本进程看到的环境**逐字节相同**
-    ——14 个 `CLAUDE_*` 变量、父进程、tty 状态全一样。没有任何信号能让本进程判断
-    自己是不是跑在 harness 的追踪之下，所以这条只能留在 SKILL.md 当软约定。
-
-    能做的是把它的**灾难性后果**消掉，那已经做了：前台跑被 2 分钟超时杀掉时，
-    包装器把收到的信号统一转成 INT 再转发（见 run_codex），codex 的上下文保住、
-    仍可 resume，日志里还留下一行带来源的打断标记（`[外部信号转发]`，见
-    interrupt_agent）告诉下一个人该 resume 而不是重跑。于是误用的代价从
-    「会话永久锁死、上下文全丢」降到「这一轮没拿到完成通知」——可恢复。
-
-    **这条路上别指望退出码。** 链路是「harness 超时 → TERM 打进程组 → codex
-    收不到 → 包装器转 INT → 留痕 → 判据 interrupted → 返回 130」，而此时
-    harness 已经超时了，它报的是超时，未必会去收那个 130。
-    退出码 130 是 `run_in_background` **正常路径**上的通道；前台误跑这条路上
-    真正可靠的是**日志里那行痕迹**（连带它的来源），以及之后任何一次 `status`
-    的复述。
+    没有 hook 标记时，runner 看不出 Bash 的前后台：实测父进程、tty、环境都相同。
+    现在全局 PreToolUse hook 传递 run_in_background 与调用编号，启动入口据此拒绝
+    前台；hook 未注册或坏了时照常运行，不增加放行票据。信号转发仍保护取消调用
+    及未启用护栏的路径：统一转 INT、留下痕迹，之后 status 可据此提示 resume。
 
     **这也是为什么本工具是 CLI 而不是 MCP server**（同一件事的另一面）。
     这套东西的价值有三条：① codex 干活 ② claude 不等、去干别的 ③ 干完自动通知。

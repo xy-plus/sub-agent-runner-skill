@@ -20,9 +20,10 @@ DeepSeek 的 token 和模型由 `claude-deepseek` 每次生成的私有档案经
 （干什么、在哪干、多难），其余由代码保证。写错的参数**当场拒跑**，
 而不是静默跑出一个「零工作量的成功」。
 
-撞上账号额度上限也归它管：`--account auto` 会自己挑一个没在限流的账号。撞上了**不自动
-重跑**——那一轮多半已经改过文件了——而是记下恢复时间并失败，**重跑同一条 `--account auto`
-就会换一个账号**（写死账号名的那种不会换）；失败信息里直接写明下次会先试哪一个。
+撞上账号额度上限也归它管：`--account auto` 会自己挑账号，所有有登录态的 codex
+号都在限流期内时，**这一轮自动交给 DeepSeek**。中途撞限仍以退出码 1 结束，
+**不自动重跑**，因为那一轮可能已改过文件。看过工作目录、必要时补好 brief 后，
+重发同一条命令即可重新选号或交给 DeepSeek；显式账号名仍只用该号。
 
 两侧共用同一套任务名、判据、报告和打断／续跑协议：`--runner` 决定派给谁，
 其余四条命令都从元数据查出来，不用再报一遍。
@@ -45,6 +46,42 @@ git clone <this repo> ~/.claude/skills/sub-agent-runner
 ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-agent-runner
 ```
 
+仓库须装在 `~/.claude/skills/sub-agent-runner`。然后把下面的 Bash hook 项合并到
+`~/.claude/settings.json` 的 `hooks.PreToolUse` 中，保留已有的其他配置：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/skills/sub-agent-runner/background_guard.py mark-call"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+在 Claude Code 里，用 `Bash(run_in_background: true)` 启动 `run`、`resume` 和
+`interrupt-and-resume`。护栏会拒绝前台派活并显示正确写法；后台调用中用 `&`、
+setsid、嵌套 shell 或循环脱离的 runner，会等到全部结束，把结论与退出码带进
+这次调用的一次完成通知。只提到 runner 的 grep、printf 等命令照常运行。
+
+这是防常见派活写法错误的护栏，以下四种刻意绕过不防：
+
+- 用 `env -i` 或 `env -u SUB_AGENT_RUNNER_BASH_CALL` 清掉标记。
+- 自设 EXIT trap 覆盖退出检查，或用 `exec` 换掉调用 shell。
+- 命令文字里没有 `sub-agent-runner` 或 `sub_agent_runner` 名字的间接派活。
+- 调用结束后才启动 runner。
+
+护栏未注册或脚本失效时，runner 照常运行。安装路径不对会让每次 Bash 调用显示
+hook error，护栏不起作用；已经开着的会话可能要重启才能拿到新注册的 hook。
+
 需要 Python 3，外加你要用的那个 runner 的可执行文件：
 [`codex`](https://github.com/openai/codex) CLI（`--runner codex`）／
 `claude-deepseek`（`--runner deepseek`）。零第三方依赖。
@@ -54,7 +91,7 @@ ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-a
 改的只是命令名和文件名——用户敲的是命令名，盘上的东西谁都不该动。
 
 同上：**改名／搬家时，旧命令的 symlink 必须同时废掉。** 只要旧命令还能跑，
-它就还在按老格式写元数据，而少一个字段的元数据会让整个 `status` 列表读不出来
+它就还在按老格式写元数据，而少字段的任务会在 `status` 中报错、无法续跑
 （见 `sub_agent_runner.py` 里 `REQUIRED_META_KEYS` 上方那段）。
 
 ## 怎么用

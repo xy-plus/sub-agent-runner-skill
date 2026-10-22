@@ -11,7 +11,7 @@ description: 把任务派给 codex 或 DeepSeek 子代理后台跑，省 claude 
 命令怎么拼、隔离目录怎么建、进程怎么判活、成败怎么判、信号怎么发，全部由
 `sub_agent_runner.py` 保证，本文件只讲**人／模型才能决定的事**。
 
-## 启动：一个任务 = 一次 `Bash(run_in_background: true)`
+## 启动：用 `Bash(run_in_background: true)`
 
 ```bash
 sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md --effort max --account auto --no-skill
@@ -20,9 +20,10 @@ sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brie
 
 带值参数**一个都别省**（`--account` 例外：它只有 `codex` 要，`deepseek` 给了反而被拒，
 见下表），外加 `--skill`/`--no-skill` 二选一，没有默认值。
-`run_in_background: true` 是唯一正确的启动方式——harness 追踪它、面板可监控、
+用 `Bash(run_in_background: true)` 启动——harness 追踪它、面板可监控、
 **完成时的通知里直接带成败结论**。
-绝不 `nohup … &`：detach 之后就只剩存活、没有通知。
+一次调用可以起多个任务，全部结束后通知一次。注册了护栏时，用 `&` 等方式脱离的
+任务也会等完再通知；未注册护栏时，脱离的任务跑完不会通知。
 
 ## 派给谁跑：`--runner`
 
@@ -37,16 +38,10 @@ DeepSeek 接入说明以 claude-switch 的 `claude_switch/deepseek.py` 文档字
 `status`／`resume`／`stop`／`interrupt-and-resume` **都不收 `--runner`**（从元数据查出来）。
 组合写错当场退 2 并说清为什么，**不会替你改正**。
 
-**同一个任务名不能换 runner**：会话、报告、日志都在原来那一侧，换个任务名。
+非 auto 调用时，**同一个任务名不能换 runner**，要显式换 runner 就换任务名。
+`--account auto` 会把同名任务换到选中的那一侧。
 
 **新任务先用 `--runner codex`**（用户要求，2026-10-03）。
-每个 codex 账号都实际撞过上限、还没到恢复时间时，**不等恢复，换个任务名用
-`--runner deepseek` 顶上**（用户要求，2026-10-18）。
-续跑（`resume`、`interrupt-and-resume`）撞上限时不记恢复时间：要换号就重跑 `run`
-并写明还没试过的账号名，`--account auto` 可能挑回同一个号。
-
-判断只看各账号实际撞上限的情况，不把任何一句提示语当作所有账号都用尽的证明：
-「没有恢复得更早的账号」在解析不出恢复时间时也会出现，续跑路径也不会打印它。
 
 ## 模型与 effort 都定死
 
@@ -61,6 +56,8 @@ sub-agent-runner resume <任务名> --brief follow.md --effort max --no-skill
 sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort max --no-skill
 sub-agent-runner stop <任务名>          # 上下文保留，之后还能 resume
 ```
+
+续跑接的是原来的会话；要换号或换 DeepSeek，用 `run` 重跑，开新会话，不带旧上下文。
 
 `status` 不带任务名时**一行一个任务**：前四列（任务名／派给谁跑／状态／退出码）都不含空格，
 第五段起是工作目录和一句人话；**缩进的行是明细，不是任务**。
@@ -78,9 +75,9 @@ sub-agent-runner stop <任务名>          # 上下文保留，之后还能 resu
 
 | 事 | 内容 |
 |---|---|
-| 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的子代理错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定，脚本作者不读本文档也认得）、`2` 参数写错或被护栏拒绝。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，「failed」这个词消不掉，能区分的只有那个数字 |
+| 退出码 | `0` success、`1` failed、`3` suspect（干完了，但本轮日志有未分类的子代理错误，要人看一眼）、`4` running、`130` interrupted（被打断，**接着续跑即可，不要重跑**——130 就是 Ctrl-C 那个既成约定）、`2` 参数写错或被护栏拒绝。通知先保留原命令自己的非零码；原命令为 0 时，前台被拒为 2，否则取本次调用各任务结论中最差的那个。**看数字，不看词**：完成通知对任何非零码都写 `failed with exit code N`，能区分的只有数字 |
 | brief | 只收**文件路径**，不收内联字符串。**skill 禁令那句话归工具所有，不要自己写进 brief**——写了当场拒跑 |
-| 账号 | **只有 `--runner codex` 有账号。** `--account auto` —— **默认就写这个**：工具自己挑一个没在限流的。撞上额度上限**不会自动重跑**——实测额度永远是在任务跑到一半用完的，那一轮多半已经改过文件了，重跑会落在一棵改了一半的树上。它会记下恢复时间并失败，**重跑这条命令就会自动换号**。**一个账号可以同时开多个子代理**，不用排队等前一个跑完——但 **`auto` 不是调度器**：同时起的两条 `auto` 看到的排序一模一样，会挑到同一个账号然后一起撞上限，要分散就各自写死账号名。要盯住某一个账号就写它的名字，那样撞上限只记录、**不换号** |
+| 账号 | **只有 `--runner codex` 有账号。** `--account auto` —— **默认就写这个**：工具自己挑账号，codex 号全满时交给 DeepSeek。撞上额度上限**不会自动重跑**，那一轮可能已经改过文件；**重跑这条命令**会重新选号，全满就交给 DeepSeek。重发前先看工作目录，必要时在 brief 里交代上一个代理留下的改动。**一个账号可以同时开多个子代理**，不用排队——但 **`auto` 不是调度器**：同时派活可能选到同一个账号，要分散就各自写死账号名。要盯住某个账号就写它的名字，那样撞上限只记录、**不换号** |
 | 给它 skill | **两侧写法完全一样。** `--skill <SKILL.md 的绝对路径>`，可重复；一个都不给就 `--no-skill`。**路径写错当场拒跑**，不会再静默跑出一个「零工作量的成功」。它给的是**许可**——工具会叫 codex 动手前先读一遍，但**什么时候按它办事仍要 brief 自己说**。不要往共享目录里放东西 |
 
 ## deepseek 这一侧的日志

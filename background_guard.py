@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Bash 护栏：传递调用事实，具体是否派活由 runner 运行时决定。"""
+"""Bash 护栏：传递调用事实，shell 退出时等脱离任务并收集结果。
+
+不能从 shell 文本同时判准派活与普通数据，也不能让 runner 自己判断被 &/setsid
+脱离了没有。只有这次调用的 shell 即将退出时，仍带着本次标记的真实 runner
+才是该等的对象。继续使用 Bash 后台完成通知，不新建通知器、祖先链或启动登记。
+"""
 import argparse
 import json
 import os
@@ -23,6 +28,9 @@ def mark_call(payload):
         return 0
     mode = "background" if tool_input.get("run_in_background") is True else "foreground"
     marker = shlex.quote(f"{mode}:{payload['tool_use_id']}")
+    # 在 source && eval && pwd 包裹的外层 shell 退出时检查；不能只把检查附到正文
+    # 后面，false 或 exit 会跳过它。用户接受清标记、覆盖 trap/exec、隐藏命令名及
+    # 调用结束后才启动的四种绕过，不为这些情况再叠第二套护栏。
     trap = ("trap 'rc=$?; G=\"$HOME/.claude/skills/sub-agent-runner/background_guard.py\"; "
             'if [ -x "$G" ]; then "$G" end-call "$rc"; exit $?; fi; exit $rc\' EXIT')
     updated = dict(tool_input, command=f"export {runner.BASH_CALL_ENV}={marker}\n{trap}\n{command}")
@@ -63,7 +71,11 @@ def python_script_index(argv):
 
 
 def find_call_runners(marker):
-    """/proc 只回答此刻还要等谁；已经退出者的成败由调用目录回答。"""
+    """/proc 只回答此刻还要等谁；已经退出者的成败由调用目录回答。
+
+    精确核对用户、Python 执行的脚本真实路径、启动子命令和完整环境标记。
+    相对脚本路径按目标进程的 cwd 解释，不能借用退出检查自己的 cwd。
+    """
     entry = os.fsencode(f"{runner.BASH_CALL_ENV}={marker}")
     found = {}
     for process in pathlib.Path("/proc").iterdir():
@@ -111,6 +123,8 @@ def end_call(original_code):
         names = "、".join(sorted({task for task, _ in waited.values()}))
         print(f"[sub-agent-runner] 这次调用里的 runner 被脱离了，等它们跑完：{names}")
     alive = dict(waited)
+    # setsid/嵌套 shell 的 runner 不是本进程的子进程，waitpid 够不着。复用 runner
+    # 的 stat 读取，同时核启动时刻；僵尸已退出，不必等它被自己的父进程回收。
     while alive:
         for pid, (_, start) in list(alive.items()):
             fields = runner._read_stat_fields(str(pid))
@@ -140,6 +154,8 @@ def end_call(original_code):
     if directory.is_dir():
         shutil.rmtree(directory)
     if original_code != 0:
+        # 例如独立一句 "$(runner ...)"：内部拒绝为 2，外层空命令为 127。
+        # 保留外层的 127，不能为了统一拒绝码把原命令自己的错误抹掉。
         return original_code
     return runner.USAGE_ERROR if refused else runner.EXIT[worst]
 

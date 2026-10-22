@@ -131,9 +131,8 @@ ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (htt
 # ——设计文档最初只写了带日期那一种，是普查把它挖出来的：29 份带额度错误的日志里，
 # 11 份是这个形状（共 22 行，占真实消息的 39%），来自 Plus 账号的 5 小时档。
 # **教训本身比数字值钱：形态清单要从现网语料里数出来，不能从一两条样本里想出来。**
-# 歧义（4:02 是今天还是明天）只在**读到这条消息的那一刻**存在，而消息说的是
-# "try again **at**"——未来，所以 `parse_reset_time` 取 >= now 的下一个该时刻。
-# 时钟只在那一处读一次，排序（`accounts_by_availability`）一次都不读。
+# 日期按实际采用错误行自己的读取时刻取最近一次；分钟精度与读取延迟可能让
+# 它刚过去，不能一律推成明天。排序函数本身不读时钟，全满改派在入口另作判断。
 # 逐字节拷自 /home/xy/.codex-subagent-acct3/logs/bn5m-engine-5min.log。
 ERR_USER_LAYER_REAL_NO_DATE = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:02 AM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
@@ -1268,8 +1267,7 @@ class TestParseResetTime(unittest.TestCase):
 
     第二种**只有时刻没有日期**，占真实消息的 39%。
 
-    `now` 一律显式传：这是本功能唯一读时钟的地方，隐式的 `datetime.now()`
-    会让「今天还是明天」随测试运行的时刻飘。
+    `now` 一律显式传错误行读取时刻；解析器不读时钟，不能偷用收尾时刻。
     """
 
     NOW = datetime.datetime(2026, 9, 22, 9, 0)
@@ -1287,8 +1285,7 @@ class TestParseResetTime(unittest.TestCase):
 
     def test_只有时刻没有日期的那种_换算成下一个该时刻(self):
         # 现网 11 份日志是这种（Plus 账号的 5 小时档）。
-        # 消息说的是 "try again AT"——未来，所以取 >= now 的下一个该时刻。
-        # 时钟只在这里读一次；排序一次都不读（见 accounts_by_availability）。
+        # 本例最近的候选在稍后；刚过去与午夜两侧另有用例，不能一律取下一次。
         got = ca.parse_reset_time("or try again at 11:10 AM.", now=self.NOW)
         self.assertEqual(got[0], datetime.datetime(2026, 9, 22, 11, 10), "同一天的晚些时候")
         self.assertEqual(got[1], "11:10 AM")
@@ -1391,14 +1388,13 @@ class TestParseResetTime(unittest.TestCase):
 
     def test_返回朴素时间_不编造时区(self):
         # 消息里没有时区，实测也推不出来。编一个出来就是撒谎；
-        # 这个值只当排序键，朴素时间足够。
+        # 日期来自原消息或可靠的读取时刻，不能另加没有证据的时区偏移。
         for text in ("try again at Sep 25th, 2026 5:04 PM", "try again at 5:04 PM"):
             with self.subTest(形态=text):
                 self.assertIsNone(ca.parse_reset_time(text, now=self.NOW)[0].tzinfo)
 
     def test_now必填_不许有隐式的当前时钟(self):
-        # 仓库规范第 6 条：不要缺省值。这是本功能唯一读时钟的地方，
-        # 给了缺省就会有人不传，于是「今天还是明天」随调用时刻飘而没人看得见。
+        # 给了隐式当前时间，就会有人漏传读取现场，让日期随收尾时刻漂移。
         with self.assertRaises(TypeError):
             ca.parse_reset_time("try again at 11:10 AM")
 
@@ -1664,7 +1660,7 @@ class TestAccountOrder(_HomeSandbox):
         self.assertNotIn("acct3", ca.accounts_by_availability())
 
     def test_有登录态的一个都不少(self):
-        # **本设计的核心约束。** 额度记录只排顺序，绝不把账号排除出候选。
+        # 排序保留全部有登录态候选；入口再判断是否全满并改派 DeepSeek。
         for account in ("default", "acct2", "acct3"):
             self._limit(account, datetime.datetime(2099, 1, 1))
         self.assertEqual(sorted(ca.accounts_by_availability()),
@@ -3493,7 +3489,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIn(f"sub-agent-runner {cmd}", skill)
         # 三件代码保证不了、只能靠调用方知道的事
-        self.assertIn("run_in_background", skill)   # 启动方式，工具自己判断不了
+        self.assertIn("run_in_background", skill)   # 后台完成通知的调用方式
         self.assertIn("brief", skill)               # brief 只收文件路径
         # 退出码是对外契约，钉的是**数字和状态名的配对**，不是「这个数字出现过」。
         # 只钉出现过的话，把表改成 `1` interrupted / `130` failed（五个数字一个
@@ -3535,8 +3531,10 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「deepseek 不收 --account」这条契约没了")
         self.assertRegex(skill, r"`deepseek`[^\n]*只有 `max`",
                          "「deepseek 的 effort 只有 max」这条契约没了")
-        self.assertRegex(skill, r"同一个任务名不能换 runner",
-                         "「跨 runner 要换任务名」这条没了——撞上了才知道，而那时已经被拒了")
+        self.assertRegex(skill, r"非 auto[^\n]*同一个任务名不能换 runner",
+                         "显式跨 runner 仍需换任务名")
+        self.assertRegex(skill, r"--account auto`[^\n]*选中的那一侧",
+                         "auto 同名任务会跟随实际选择的执行者")
         # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
         # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
         # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
@@ -3544,8 +3542,8 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「auto 是默认写法」这条没了")
         self.assertRegex(skill, r"撞上额度上限\*\*不会自动重跑\*\*",
                          "「撞上限不自动重跑」这条没了——调用方会以为树是干净的")
-        self.assertRegex(skill, r"重跑这条命令就会自动换号",
-                         "「重跑就换号」这条没了，调用方不知道下一步该干什么")
+        self.assertRegex(skill, r"重跑这条命令[^\n]*DeepSeek",
+                         "重发 auto 命令是换号及全满兜底的入口")
         self.assertRegex(skill, r"写它的名字[^\n]*\*\*不换号\*\*",
                          "「写死账号名就不换号」这条没了——两种模式的差别没人守")
         self.assertRegex(skill, r"\*\*`auto` 不是调度器\*\*",
@@ -4548,9 +4546,8 @@ class TestAutoAccountPick(_HomeSandbox):
         而整轮文本正是被污染的那个东西——上一行刚用已分类的错误行判「撞没撞上」，
         下一行就把这条规矩丢了，`search()` 取的是全文**第一个**匹配。
 
-        这条是 Critical 而不是「顺序差一格」：配上「不做过期清理」和「纯按
-        reset_at 排序」，一条 2099 年的假记录会让那个健康账号**永远排最后**，
-        auto 再也不会先试它。落盘的 `raw` 也会是那行 fixture，审计线索一起失效。
+        一条 2099 年的假记录会错误推迟该账号，甚至与其他记录一起触发 DeepSeek
+        改派。落盘的 raw 也会是那行 fixture，审计线索一起失效。
         """
         污染 = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
         code = self._run(ca.AUTO, 污染 + "\n" + self.LIMIT_LINE)
