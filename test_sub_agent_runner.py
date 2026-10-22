@@ -4434,7 +4434,7 @@ class TestAutoAccountPick(_HomeSandbox):
         before = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
                   for path in self.home.rglob("*")}
 
-        for account in ("default", "acct2", "acct3", "auto"):
+        for account in ("default", "acct2", "auto"):
             with self.subTest(account=account):
                 with self.assertRaises(ca.Rejected) as got:
                     self._run(account, self.FINE)

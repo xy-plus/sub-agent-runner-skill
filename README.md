@@ -117,12 +117,6 @@ python3 -m unittest test_sub_agent_runner -v
 `test_sub_agent_runner.py` 的模块 docstring 是维护者入口，那里记着这个仓库
 在「空测试」上栽过的八种形态和它们的解药。
 
-`TestAutoAccountPick` 守全满拒绝与换号；`TestTaskMigration`、`TestMetadataReaders`
-用两个 codex 账号守 rename、回滚、旧 writer 和交错读取。账号间迁移仍会遇到位置与
-内容短暂不一致，不能随跨 runner 迁移一起删掉这些保护。
-`TestModuleBashCallIsolation` 必须装载仍会运行代理启动路径的用例；全满用例现在提前
-拒绝，用它已无法验证启动时的调用标记隔离。
-
 **测试一次都不会真起 codex 或 claude**：`setUpModule` 拦截本进程的启动，并在 PATH
 最前面放置临时替身，让 Python、Bash 等子进程也继承防线。替身记下命令后以非零
 退出；模块收尾发现记录就令测试失败，防止误调用被正常的失败用例吞掉。
