@@ -28,6 +28,7 @@ runner，再交给 `find_task_agent_pid` 和 `_resume_round`。
 """
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -210,6 +211,52 @@ INTERRUPT_MARK = "----- codex-sub-agent 本轮被 INT 打断，上下文保留�
 # 也不用 assert：`python3 -O` 会把它整个抹掉，而这两条是承重的。
 _CAUSES = ("stop", "interrupt-and-resume", "外部信号转发")
 _KINDS = ("run", "resume", "interrupt-and-resume")
+
+# hook 与 runner 共用一次 Bash 调用的协议；不把「加载过 skill」变成启动凭证。
+# 没有有效标记时照常运行，用户明确接受未注册/脚本失效及刻意清标记的边界。
+BASH_CALL_ENV = "SUB_AGENT_RUNNER_BASH_CALL"
+FOREGROUND_REFUSAL = ("这次 Bash 调用是前台：会占住对话、跑完也没有通知；"
+                      "用 `run_in_background: true` 重新发这条命令")
+
+
+def bash_call():
+    value = os.environ.get(BASH_CALL_ENV, "")
+    parts = value.split(":")
+    if len(parts) == 2 and parts[0] in ("foreground", "background") and parts[1]:
+        return tuple(parts)
+    return None
+
+
+def bash_call_directory(call_id):
+    # 调用编号只决定归属，不直接用作路径；固定长度的散列也避免斜线或过长编号
+    # 改变目录层级。用户与调用各隔一层，两次并行调用不会消费对方的结论。
+    root = pathlib.Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+    return root / f"sub-agent-runner-{os.getuid()}" / hashlib.sha256(call_id.encode()).hexdigest()
+
+
+def require_background_call():
+    call = bash_call()
+    if call is not None and call[0] == "foreground":
+        try:
+            directory = bash_call_directory(call[1])
+            directory.mkdir(parents=True, exist_ok=True)
+            # 拒绝原因固定，不含任务信息；一次调用只需一个标记，不留逐 PID 副本。
+            (directory / "refused").touch()
+        except OSError as error:
+            print(f"[sub-agent-runner] 拒绝标记写不进调用目录：{error}", file=sys.stderr)
+        reject(FOREGROUND_REFUSAL)
+
+
+def write_bash_call_result(task, code, verdict_line):
+    call = bash_call()
+    if call is not None and call[0] == "background":
+        try:
+            directory = bash_call_directory(call[1])
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / f"{os.getpid()}.done").write_text(json.dumps(
+                {"task": task, "exit_code": code, "verdict": verdict_line}, ensure_ascii=False))
+        except OSError as error:
+            print(f"[sub-agent-runner] 结论写不进调用目录：{error}", file=sys.stderr)
 
 
 def _require_enum(value, allowed, name):
@@ -2388,9 +2435,11 @@ def status_row(meta, verdict):
 
 
 def _print_verdict(task, verdict):
-    print(f"\n[sub-agent-runner] {task}: {verdict.state} —— {verdict.reason}")
+    verdict_line = f"[sub-agent-runner] {task}: {verdict.state} —— {verdict.reason}"
+    print("\n" + verdict_line)
     for line in verdict.detail:
         print(f"  {line}")
+    write_bash_call_result(task, EXIT[verdict.state], verdict_line)
 
 
 def _reject_bad_runner_combo(args):
@@ -2421,6 +2470,7 @@ def _reject_bad_runner_combo(args):
 
 
 def cmd_run(args):
+    require_background_call()
     # **第一行就拒。** 排在 find_meta / ensure_isolation / new_meta 全部之前，
     # 所以被拒的调用在盘上一个字节都不留。
     _reject_bad_runner_combo(args)
@@ -2686,6 +2736,7 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
 
 
 def cmd_resume(args):
+    require_background_call()
     home, meta = find_meta(args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
@@ -2735,6 +2786,7 @@ def cmd_interrupt_and_resume(args):
 
     下面的顺序是**硬约束**，不是排版顺序：五道闸全部走完才允许发信号。
     """
+    require_background_call()
     # ────── 五道闸 ──────
     home, meta = find_meta(args.task)                      # 1. 任务存在？
     if meta is None:

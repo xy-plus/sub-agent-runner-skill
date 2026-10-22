@@ -6537,3 +6537,129 @@ class TestChildProcessAgentGuard(unittest.TestCase):
                 self.assertIn("tearDownModule", result.stderr)
                 self.assertIn(binary, result.stderr)
                 self.assertIn("--guard-probe", result.stderr)
+
+
+class TestBackgroundMarkCall(_HomeSandbox):
+    def _mark(self, tool_input):
+        guard = pathlib.Path(ca.__file__).with_name("background_guard.py")
+        result = subprocess.run([sys.executable, str(guard), "mark-call"],
+                                input=json.dumps({"tool_input": tool_input,
+                                                  "tool_use_id": "toolu-call_01"}),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_无runner名字不输出不改写(self):
+        self.assertEqual(self._mark({"command": "printf ordinary", "timeout": 10}), "")
+
+    def test_只改command_保留输入字段_不接管权限_按后台字段打标记(self):
+        for name in ("sub-agent-runner", "sub_agent_runner.py"):
+            for background in (True, False, None, "true"):
+                with self.subTest(name=name, background=background):
+                    command = f"printf '%s\\n' '{name}'\nprintf done"
+                    original = {"command": command, "timeout": 12345, "description": "keep me"}
+                    if background is not None:
+                        original["run_in_background"] = background
+                    data = json.loads(self._mark(original))
+                    hook = data["hookSpecificOutput"]
+                    self.assertEqual(set(hook), {"hookEventName", "updatedInput"})
+                    self.assertEqual(hook["hookEventName"], "PreToolUse")
+                    updated = hook["updatedInput"]
+                    marker, trap, rest = updated["command"].split("\n", 2)
+                    mode = "background" if background is True else "foreground"
+                    self.assertEqual(marker, f"export SUB_AGENT_RUNNER_BASH_CALL={mode}:toolu-call_01")
+                    self.assertIn('end-call "$rc"', trap)
+                    self.assertIn('if [ -x "$G" ]', trap)
+                    self.assertTrue(trap.endswith("' EXIT"))
+                    self.assertEqual(rest, command)
+                    updated["command"] = command
+                    self.assertEqual(updated, original)
+
+
+class TestBackgroundRunner(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        self.runtime = self.home / "runtime"
+        self.runtime.mkdir()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+        self.env_patch = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.runtime)})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def _argv(self, command):
+        args = (["run", "--task", "t", "--runner", "codex", "--account", "default",
+                 "--dir", str(self.workdir)] if command == "run" else [command, "t"])
+        if command in ("run", "resume", "interrupt-and-resume"):
+            args += ["--brief", str(self.brief), "--effort", "max", "--no-skill"]
+        return args
+
+    def test_前台三个启动入口都在状态变更前拒绝_调用只留一份拒绝标记(self):
+        before = {p.relative_to(self.home) for p in self.home.rglob("*")}
+        for command in ("run", "resume", "interrupt-and-resume"):
+            with self.subTest(command=command):
+                argv = self._argv(command)
+                argv[argv.index("--brief") + 1] = str(self.home / "missing.md")
+                result = subprocess.run([sys.executable, ca.__file__, *argv],
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="foreground:test-call"),
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("这次 Bash 调用是前台", result.stderr)
+                self.assertIn("run_in_background: true", result.stderr)
+        new = {p.relative_to(self.home) for p in self.home.rglob("*")} - before
+        self.assertTrue(new, "拒绝说明没有回传标记，重定向后 Claude 会看不到原因")
+        self.assertTrue(all(p.parts[0] == "runtime" for p in new), new)
+        records = [p for p in self.runtime.rglob("*") if p.is_file()]
+        self.assertEqual(len(records), 1, "固定拒绝说明应是调用级标记")
+
+    def test_调用目录不可写时仍拒绝并显示正确写法(self):
+        argv = self._argv("run")
+        argv[argv.index("--brief") + 1] = str(self.home / "missing.md")
+        result = subprocess.run([sys.executable, ca.__file__, *argv],
+                                env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="foreground:blocked",
+                                         XDG_RUNTIME_DIR=str(self.brief)),
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("run_in_background: true", result.stderr)
+        self.assertFalse((self.home / ".codex-subagent").exists())
+
+    def test_后台三入口结束都写实际结论(self):
+        for command in ("run", "resume", "interrupt-and-resume"):
+            with self.subTest(command=command):
+                home = ca.ensure_isolation(ca.CODEX, "default")
+                ca.write_meta(home, "t", _full_meta("t", dir=str(self.workdir),
+                              session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
+                with mock.patch.dict(os.environ, {"SUB_AGENT_RUNNER_BASH_CALL": "background:" + command}), \
+                        _no_codex(), _capture_stdout():
+                    args = ca.build_parser().parse_args(self._argv(command))
+                    self.assertEqual(args.func(args), 1)
+                records = list(self.runtime.rglob("*.done"))
+                self.assertEqual(len(records), ("run", "resume", "interrupt-and-resume").index(command) + 1)
+                result = json.loads(next(p for p in records if p not in getattr(self, "seen", set())).read_text())
+                self.assertEqual((result["task"], result["exit_code"]), ("t", 1))
+                self.assertIn("failed", result["verdict"])
+                self.seen = set(records)
+
+    def test_没有标记或格式不对仍运行且不写调用目录(self):
+        for marker in (None, "foreground", "foreground:", "background:", "invalid:call"):
+            with self.subTest(marker=marker):
+                env = {} if marker is None else {"SUB_AGENT_RUNNER_BASH_CALL": marker}
+                with mock.patch.dict(os.environ, env), _no_codex(), _capture_stdout():
+                    if marker is None:
+                        os.environ.pop("SUB_AGENT_RUNNER_BASH_CALL", None)
+                    args = ca.build_parser().parse_args(self._argv("run"))
+                    self.assertEqual(args.func(args), 1)
+                self.assertEqual(list(self.runtime.iterdir()), [])
+
+    def test_status和stop不受前台标记影响(self):
+        for command in ("status", "stop"):
+            with self.subTest(command=command):
+                result = subprocess.run([sys.executable, ca.__file__, *self._argv(command)],
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="foreground:query"),
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("没有这个任务", result.stderr)
+                self.assertNotIn("这次 Bash 调用是前台", result.stderr)
+        self.assertEqual(list(self.runtime.iterdir()), [])
