@@ -101,6 +101,7 @@ import json
 import os
 import pathlib
 import re
+import select
 import shlex
 import signal
 import subprocess
@@ -6663,3 +6664,340 @@ class TestBackgroundRunner(_HomeSandbox):
                 self.assertIn("没有这个任务", result.stderr)
                 self.assertNotIn("这次 Bash 调用是前台", result.stderr)
         self.assertEqual(list(self.runtime.iterdir()), [])
+
+
+class TestBackgroundEndCall(_HomeSandbox):
+    """真 Bash 的退出边界；替身只写测试状态和协议记录，绝不启动代理。"""
+
+    def setUp(self):
+        super().setUp()
+        self.runtime = self.home / "runtime"
+        self.state = self.home / "state"
+        self.binaries = self.home / "bin"
+        for directory in (self.runtime, self.state, self.binaries):
+            directory.mkdir()
+        self.fixture = self.home / "sub_agent_runner.py"
+        self.fixture.write_text(
+            f"#!{sys.executable}\n"
+            "import os,pathlib,sys,time\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import sub_agent_runner as runner\n"
+            "args = sys.argv[1:]\n"
+            "task = (args[args.index('--task') + 1] if args[0] == 'run' else args[1])\n"
+            "state = pathlib.Path(os.environ['TEST_RUNNER_STATE'])\n"
+            "try:\n"
+            "    runner.require_background_call()\n"
+            "except runner.Rejected as error:\n"
+            "    (state / (task + '.refused')).touch()\n"
+            "    print(error.message, file=sys.stderr)\n"
+            "    sys.exit(error.code)\n"
+            "(state / (task + '.started')).write_text(str(os.getpid()))\n"
+            "while not (state / (task + '.release')).exists():\n"
+            "    time.sleep(0.01)\n"
+            "code = int(args[args.index('--exit-code') + 1])\n"
+            "line = '[sub-agent-runner] ' + task + ': fixture verdict ' + str(code)\n"
+            "runner.write_bash_call_result(task, code, line)\n"
+            "(state / (task + '.finished')).touch()\n"
+            "print(line, flush=True)\n"
+            "sys.exit(code)\n")
+        self.fixture.chmod(0o755)
+        (self.binaries / "sub-agent-runner").symlink_to(self.fixture)
+        self.guard = pathlib.Path(ca.__file__).with_name("background_guard.py")
+        self.installed = self.home / ".claude" / "skills" / "sub-agent-runner" / "background_guard.py"
+        self.installed.parent.mkdir(parents=True)
+        # 仅测试入口替换扫描目标，生产护栏始终比较它导入模块的真实路径。
+        self.installed.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib,sys\n"
+            f"sys.path.insert(0, {str(self.guard.parent)!r})\n"
+            "import background_guard as guard\n"
+            f"guard.RUNNER_SCRIPT = pathlib.Path({str(self.fixture)!r}).resolve()\n"
+            "sys.exit(guard.main())\n")
+        self.installed.chmod(0o755)
+        self.snapshot = self.home / "snapshot.sh"
+        self.snapshot.write_text(":\n")
+        self.env_patch = mock.patch.dict(os.environ, {
+            "XDG_RUNTIME_DIR": str(self.runtime), "TEST_RUNNER_STATE": str(self.state),
+            "PATH": str(self.binaries) + os.pathsep + os.environ["PATH"]})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+        self.processes, self.output = [], {}
+        self.addCleanup(self._cleanup_processes)
+
+    def _cleanup_processes(self):
+        for started in self.state.glob("*.started"):
+            started.with_suffix(".release").touch()
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and any(p.poll() is None for p in self.processes):
+            time.sleep(0.02)
+        for process in self.processes:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            process.stdout.close()
+        # setsid 的替身不在 Bash 进程组里；只核对本测试脚本后清理。
+        for started in self.state.glob("*.started"):
+            pid = started.read_text().strip()
+            if not pid.isdigit():
+                continue
+            try:
+                argv = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                if os.fsencode(str(self.fixture)) in argv or os.fsencode(str(self.binaries / "sub-agent-runner")) in argv:
+                    os.kill(int(pid), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+
+    def _command(self, task, code):
+        return f"sub-agent-runner run --task {task} --exit-code {code} > /dev/null 2>&1"
+
+    def _ready(self, task, suffix):
+        path = shlex.quote(str(self.state / f"{task}.{suffix}"))
+        return f"while [ ! -f {path} ]; do sleep 0.01; done"
+
+    def _start(self, command, call_id, background):
+        tool_input = {"command": command}
+        if background:
+            tool_input["run_in_background"] = True
+        marked = subprocess.run(
+            [sys.executable, str(self.guard), "mark-call"],
+            input=json.dumps({"tool_input": tool_input, "tool_use_id": call_id}),
+            text=True, capture_output=True, timeout=5)
+        self.assertEqual(marked.returncode, 0, marked.stderr)
+        rewritten = json.loads(marked.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        # Claude Code 的 source && eval && pwd 形状；不能换成 bash -c 单独执行正文。
+        wrapped = (f"source {shlex.quote(str(self.snapshot))} && eval {shlex.quote(rewritten)}"
+                   f" && pwd -P >| {shlex.quote(str(self.home / (call_id + '.pwd')))}")
+        process = subprocess.Popen(["/bin/bash", "--noprofile", "--norc", "-c", wrapped],
+                                   cwd=self.home, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        self.processes.append(process)
+        self.output[process.pid] = b""
+        return process
+
+    def _read_until(self, process, text):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([process.stdout], [], [], 0.05)
+            if readable:
+                chunk = os.read(process.stdout.fileno(), 65536)
+                self.output[process.pid] += chunk
+                if text.encode() in self.output[process.pid]:
+                    return
+                if not chunk:
+                    break
+        self.fail(f"没有看到 {text!r}：" + self.output[process.pid].decode(errors="replace"))
+
+    def _finish(self, process):
+        tail, _ = process.communicate(timeout=8)
+        return process.returncode, (self.output[process.pid] + tail).decode(errors="replace")
+
+    def _release(self, task):
+        (self.state / (task + ".release")).touch()
+
+    def test_脱离的成功失败都等到结束_结论和退出码进入调用(self):
+        for task, code in (("ok", 0), ("failed", 1)):
+            with self.subTest(code=code):
+                process = self._start(self._command(task, code) + " & echo dispatched; "
+                                      + self._ready(task, "started"), task, True)
+                self._read_until(process, "等它们跑完：" + task)
+                self.assertIsNone(process.poll())
+                self.assertFalse((self.state / (task + ".finished")).exists())
+                self._release(task)
+                actual, output = self._finish(process)
+                self.assertEqual(actual, code, output)
+                self.assertIn(f"{task}: fixture verdict {code}", output)
+                self.assertFalse(ca.bash_call_directory(task).exists())
+
+    def test_扫描前已失败的任务也进通知(self):
+        self._release("fast")
+        command = (self._command("fast", 1) + " & " + self._ready("fast", "finished")
+                   + "; wait; echo dispatched")
+        code, output = self._finish(self._start(command, "already-failed", True))
+        self.assertEqual(code, 1, output)
+        self.assertIn("fast: fixture verdict 1", output)
+        self.assertNotIn("等它们跑完", output)
+
+    def test_一个已失败另一个仍活着_两个结论都汇总(self):
+        self._release("fast")
+        command = (self._command("fast", 1) + " & " + self._ready("fast", "finished")
+                   + "; " + self._command("slow", 0) + " & " + self._ready("slow", "started"))
+        process = self._start(command, "mixed", True)
+        self._read_until(process, "等它们跑完：slow")
+        self.assertIsNone(process.poll())
+        self._release("slow")
+        code, output = self._finish(process)
+        self.assertEqual(code, 1, output)
+        self.assertIn("fast: fixture verdict 1", output)
+        self.assertIn("slow: fixture verdict 0", output)
+
+    def test_循环并行两个任务_按严重度取最差结论(self):
+        command = ('for task in suspect interrupted; do '
+                   'if [ "$task" = suspect ]; then code=3; else code=130; fi; '
+                   'sub-agent-runner run --task "$task" --exit-code "$code" > /dev/null 2>&1 & done; '
+                   + self._ready("suspect", "started") + "; " + self._ready("interrupted", "started"))
+        process = self._start(command, "loop", True)
+        self._read_until(process, "等它们跑完")
+        self._release("suspect")
+        self._release("interrupted")
+        code, output = self._finish(process)
+        self.assertEqual(code, 3, output)
+        self.assertIn("suspect: fixture verdict 3", output)
+        self.assertIn("interrupted: fixture verdict 130", output)
+
+    def test_常见脱离方式和Python解释器选项都要等(self):
+        for index, form in enumerate((
+                "(setsid -f {command})", '"setsid" -f {command}',
+                "bash -c {quoted}", "nohup {command} &",
+                f"{shlex.quote(sys.executable)} -u {{script}} run --task {{task}} --exit-code 1 > /dev/null 2>&1 &",
+                f"{shlex.quote(sys.executable)} -X utf8 {{script}} run --task {{task}} --exit-code 1 > /dev/null 2>&1 &",
+                f"{shlex.quote(sys.executable)} -W ignore {{script}} run --task {{task}} --exit-code 1 > /dev/null 2>&1 &")):
+            task = f"wrapped{index}"
+            with self.subTest(form=form):
+                command = form.format(command=self._command(task, 1), task=task,
+                                      script=shlex.quote(str(self.fixture)),
+                                      quoted=shlex.quote(self._command(task, 1) + " &"))
+                process = self._start(command + "; " + self._ready(task, "started")
+                                      if not command.endswith("&") else
+                                      command + " " + self._ready(task, "started"), task, True)
+                self._read_until(process, "等它们跑完：" + task)
+                self._release(task)
+                code, output = self._finish(process)
+                self.assertEqual(code, 1, output)
+                self.assertIn(task + ": fixture verdict 1", output)
+
+    def test_两个续跑子命令也被认出并等待(self):
+        for command in ("resume", "interrupt-and-resume"):
+            task = command
+            with self.subTest(command=command):
+                body = (f"sub-agent-runner {command} {task} --exit-code 0 > /dev/null 2>&1 & "
+                        + self._ready(task, "started"))
+                process = self._start(body, task, True)
+                self._read_until(process, "等它们跑完：" + task)
+                self._release(task)
+                self.assertEqual(self._finish(process)[0], 0)
+
+    def test_正确直接派活保留自身退出码_额外打印结论(self):
+        for code in (0, 1):
+            task = f"direct{code}"
+            self._release(task)
+            result, output = self._finish(self._start(self._command(task, code), task, True))
+            self.assertEqual(result, code, output)
+            self.assertIn(f"{task}: fixture verdict {code}", output)
+            self.assertNotIn("等它们跑完", output)
+
+    def test_原命令非零优先_任务失败结论照样打印(self):
+        body = self._command("runnerfailed", 1) + " & " + self._ready("runnerfailed", "started") + "; exit 3"
+        process = self._start(body, "original-error", True)
+        self._read_until(process, "等它们跑完")
+        self._release("runnerfailed")
+        code, output = self._finish(process)
+        self.assertEqual(code, 3, output)
+        self.assertIn("runnerfailed: fixture verdict 1", output)
+
+    def test_被等待的替身强杀没结论_按失败计(self):
+        process = self._start(self._command("killed", 0) + " & " + self._ready("killed", "started"),
+                              "killed", True)
+        self._read_until(process, "等它们跑完：killed")
+        pid = int((self.state / "killed.started").read_text())
+        os.kill(pid, signal.SIGKILL)
+        code, output = self._finish(process)
+        self.assertEqual(code, 1, output)
+        self.assertIn("killed：没留下结论", output)
+
+    def test_两次调用不同编号互不等待(self):
+        processes = {}
+        for task in ("first", "second"):
+            process = self._start(self._command(task, 0) + " & " + self._ready(task, "started"), task, True)
+            self._read_until(process, "等它们跑完：" + task)
+            processes[task] = process
+        self._release("first")
+        self.assertEqual(self._finish(processes["first"])[0], 0)
+        self.assertIsNone(processes["second"].poll())
+        self._release("second")
+        self.assertEqual(self._finish(processes["second"])[0], 0)
+
+    def test_前台各种shell写法都拒绝_说明可见_原非零码保留(self):
+        for index, form in enumerate((
+                "{command}", "{command} & echo dispatched; {ready}",
+                "printf '%s\\n' \"$({command})\"", '"$({command})"',
+                '{quoted_command}', 'env -u PYTHONPATH {command}', 'nice -n 10 {command}',
+                'bash --noprofile --norc -c {nested}', 'cat <<EOF\n$({command})\nEOF')):
+            task = f"foreground{index}"
+            command = self._command(task, 0)
+            body = form.format(command=command, ready=self._ready(task, "refused"),
+                               quoted_command=command.replace(" run ", ' r"un" '),
+                               nested=shlex.quote(command))
+            with self.subTest(form=form):
+                code, output = self._finish(self._start(body, task, False))
+                self.assertEqual(code, 127 if index == 3 else 2, output)
+                self.assertIn("这次 Bash 调用是前台", output)
+                self.assertIn("run_in_background: true", output)
+                self.assertFalse((self.state / (task + ".started")).exists())
+
+    def test_多个前台拒绝在调用输出里只回传一次固定说明(self):
+        body = (self._command("refused1", 0) + " & " + self._command("refused2", 0)
+                + " & " + self._ready("refused1", "refused") + "; " + self._ready("refused2", "refused"))
+        code, output = self._finish(self._start(body, "refused-twice", False))
+        self.assertEqual(code, 2, output)
+        self.assertEqual(output.count("这次 Bash 调用是前台"), 1, output)
+
+    def test_活着的Python_c进程即使参数有脚本路径也不等待(self):
+        ready = self.state / "unrelated.started"
+        release = self.state / "unrelated.release"
+        child = (f"import pathlib,time; pathlib.Path({str(ready)!r}).touch(); "
+                 f"exec(\"while not pathlib.Path({str(release)!r}).exists(): time.sleep(0.01)\")")
+        body = (f"{shlex.quote(sys.executable)} -c {shlex.quote(child)} {shlex.quote(str(self.fixture))} run "
+                "> /dev/null 2>&1 & " + self._ready("unrelated", "started"))
+        process = self._start(body, "data-python", True)
+        code, output = self._finish(process)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("等它们跑完", output)
+        self.assertFalse(release.exists())
+        release.touch()
+
+    def test_活着的printf和grep只是数据_不等待(self):
+        for binary in ("printf", "grep"):
+            with self.subTest(binary=binary):
+                fifo = self.home / "run"
+                if not fifo.exists():
+                    os.mkfifo(fifo)
+                descriptor = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+                self.addCleanup(os.close, descriptor)
+                pid_file = self.home / (binary + ".pid")
+                body = (("/usr/bin/printf '%1000000s %s %s\\n' sub-agent-runner run x > run 2>/dev/null" if binary == "printf"
+                         else "/usr/bin/grep sub-agent-runner run > /dev/null 2>&1")
+                        + f" & printf '%s' \"$!\" > {shlex.quote(str(pid_file))}")
+                code, output = self._finish(self._start(body, "data-" + binary, True))
+                self.assertEqual(code, 0, output)
+                self.assertNotIn("等它们跑完", output)
+                pid = int(pid_file.read_text())
+                fields = ca._read_stat_fields(str(pid))
+                self.assertIsNotNone(fields, "阴性陪练在扫描时必须还活着")
+                self.assertNotEqual(fields[0], "Z")
+                os.kill(pid, signal.SIGKILL)
+
+    def test_已经wait完的数据命令正常返回(self):
+        document = self.home / "document"
+        document.write_text("sub-agent-runner run\n")
+        for body in ("printf '%s %s\\n' sub-agent-runner run & wait",
+                     f"rg 'sub-agent-runner run' {shlex.quote(str(document))} & wait"):
+            with self.subTest(body=body):
+                code, output = self._finish(self._start(body, "data-wait", True))
+                self.assertEqual(code, 0, output)
+                self.assertNotIn("等它们跑完", output)
+
+    def test_end_call自己出错时保留原退出码(self):
+        for original in (0, 3):
+            call_id = f"broken{original}"
+            directory = ca.bash_call_directory(call_id)
+            directory.mkdir(parents=True)
+            (directory / "123.done").write_text("not json")
+            code, output = self._finish(self._start("printf sub-agent-runner; exit " + str(original), call_id, True))
+            self.assertEqual(code, original, output)
+            self.assertIn("end-call 出错", output)
+
+    def test_退出脚本不存在时保留原退出码(self):
+        self.installed.unlink()
+        code, output = self._finish(self._start("printf sub-agent-runner; exit 7", "missing-guard", True))
+        self.assertEqual(code, 7, output)
