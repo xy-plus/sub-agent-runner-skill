@@ -1760,7 +1760,8 @@ def find_meta(task):
 
     rename 在磁盘上保有唯一一份，却不是扫描多个目录的快照：扫描可能跨过移动，
     看见零份、两份或已消失的路径；移动后写新内容前，位置也可能暂时与内容矛盾。
-    只有唯一且归属一致才作答。正常新任务零份只立即重扫一次，不等满一秒。
+    只有唯一且归属一致、扫描结束后原位置内容仍未变才作答；否则反向换家可能
+    先扫过空的新家、再读到随后被搬走的旧家。正常新任务零份只立即重扫一次。
     持续不一致时宁可拒绝，也不能让续跑把旧 runner 放进新家的隔离环境。
     """
     deadline, empty_seen = time.monotonic() + 1, False
@@ -1776,7 +1777,12 @@ def find_meta(task):
         if len(found) == 1 and not vanished:
             home, meta = found[0]
             if isolation_home(meta["runner"], meta["account"]) == home:
-                return home, meta
+                path = meta_path(home, task)
+                try:
+                    if _load_meta(path) == meta:
+                        return home, meta
+                except FileNotFoundError:
+                    vanished.append(path)
         if not found and not vanished:
             if empty_seen:
                 return None, None
@@ -1940,17 +1946,9 @@ def _previous_writer_alive(home, task):
     if not q.exists():
         return False
     previous = _load_meta(q)
-    # **上一轮要是本进程写的，那它已经写完了。** 写日志的包装器就是跑 run_codex
-    # 的这个进程（tee 循环在它自己身上），所以它一落盘，磁盘上那副身份就是它自己。
-    # run_codex 单线程顺序执行：能走到这里，本进程上一轮的 tee 循环早已返回。
-    # 不加这一行，同一个进程连跑两轮就会**等自己**——白等满一个 ROUND_END_TIMEOUT，
-    # 再拿到一句**说谎的诊断**（「包装器还在读 codex 的输出」，而那个包装器就是
-    # 问话的人自己）。实测超时压到 0.5s 时第二轮就是这么被自己挡住的。
-    # 这一行不是注释能代替的：失败模式是 60 秒静默挂起（等待排在分隔符之前，
-    # 屏幕和日志都是死的）。**但要说准它保护的是谁**：CLI 路径上一个进程一生
-    # 只调一次 run_codex（三个 cmd_* 各走其一），磁盘上那副身份不可能是本进程，
-    # 所以这一支在生产里**不可达**。它保护的是同进程重复调用——单测，以及哪天
-    # 有人把本模块当库用。留着的代价是一行，换来谓词对这类用法也是全函数。
+    # 换家时 cmd_run 已把本轮的 writer 身份写到新家，尚未进入 tee；同进程顺序
+    # 续跑时，上一轮 tee 也已返回。这两种都不该等自己，否则会白等到超时，
+    # 再误报「包装器还在读输出」。
     if (previous["writer_pid"], previous["writer_start"]) == _writer_identity():
         return False
     fields = _read_stat_fields(previous["writer_pid"])

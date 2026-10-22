@@ -6438,6 +6438,53 @@ class TestMetadataReaders(_HomeSandbox):
                 self.fail(error.message)
         self.assertEqual(found, (self.deepseek, self.deepseek_meta))
 
+    def test_读完DeepSeek旧家后换到Codex_resume不重建旧元数据(self):
+        # 新家在扫描顺序中更早，读完旧家后再搬走，就不会在本轮扫出两份。
+        # 注入的只是迁移时刻；rename、写新内容、续跑和元数据落盘都走真实代码。
+        for meta in (self.deepseek_meta, self.codex_meta):
+            meta.update(dir=str(self.home), session_id="01a0b408-f718-7ff3-8123-d5202551acba")
+        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+        brief = self.home / "brief.md"
+        brief.write_text("继续干活")
+        args = ca.build_parser().parse_args([
+            "resume", "t", "--brief", str(brief), "--effort", "max", "--no-skill"])
+        load = ca._load_meta
+        moved = False
+
+        def load_and_move(path):
+            nonlocal moved
+            meta = load(path)
+            if path == ca.meta_path(self.deepseek, "t") and not moved:
+                moved = True
+                self._move(self.deepseek, self.codex, self.codex_meta)
+            return meta
+
+        with mock.patch.object(ca, "_load_meta", load_and_move), \
+                _fake_agent_proc(b"done\n") as agent, _capture_stdout():
+            self.assertEqual(ca.cmd_resume(args), 1)
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists(), "续跑重建了已搬走的旧家")
+        self.assertEqual(agent.call_args.args[0][0], "codex", "续跑启动了旧执行者")
+        paths = [path for home in ca.isolation_roots() for path in (home / "tasks").glob("t.json")]
+        self.assertEqual(paths, [ca.meta_path(self.codex, "t")])
+        self.assertEqual(ca.find_meta("t")[1]["runner"], "codex")
+
+    def test_读取后原位置内容已变_重扫取新内容(self):
+        ca.write_meta(self.codex, "t", self.codex_meta)
+        current = dict(self.codex_meta, started_at="2026-10-22T12:00:00")
+        load = ca._load_meta
+        changed = False
+
+        def load_and_change(path):
+            nonlocal changed
+            meta = load(path)
+            if not changed:
+                changed = True
+                ca.write_meta(self.codex, "t", current)
+            return meta
+
+        with mock.patch.object(ca, "_load_meta", load_and_change):
+            self.assertEqual(ca.find_meta("t"), (self.codex, current))
+
     def test_读新家前rename_瞬时零份立即重扫(self):
         ca.write_meta(self.deepseek, "t", self.deepseek_meta)
         exists = pathlib.Path.exists
