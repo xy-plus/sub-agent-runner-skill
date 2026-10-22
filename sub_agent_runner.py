@@ -1717,31 +1717,61 @@ def find_meta(task):
     home 走返回值，不塞进 meta 里当 `_home` 魔法键：魔法键意味着每个写回元数据
     的地方都得记得把它剥掉，而「必须记得」正是这个工具存在的理由本身。
 
-    查到多份就拒绝，不"取第一个"：那会让 status/resume/stop 静默作用到扫描顺序
-    更靠前的那个会话上。而任务名撞车这条路很好走——`auto` 挑中另一个账号时，
-    同一个任务名就会在两个隔离目录里各有一份。`cmd_run` 用显式迁移不让这个状态
-    建起来（旧的那份当场 unlink），这里是第二道。
+    rename 在磁盘上保有唯一一份，却不是扫描多个目录的快照：扫描可能跨过移动，
+    看见零份、两份或已消失的路径；移动后写新内容前，位置也可能暂时与内容矛盾。
+    只有唯一且归属一致才作答。正常新任务零份只立即重扫一次，不等满一秒。
+    持续不一致时宁可拒绝，也不能让续跑把旧 runner 放进新家的隔离环境。
     """
-    found = []
-    for home in isolation_roots():
-        p = meta_path(home, task)
-        if p.exists():
-            found.append((home, _load_meta(p)))
-    if len(found) > 1:
-        reject(f"任务名 {task} 在多个隔离目录里都有："
-               + "、".join(str(h) for h, _ in found)
-               + "\n无法确定该操作哪一个，删掉不要的那份元数据再来。")
-    return found[0] if found else (None, None)
+    deadline, empty_seen = time.monotonic() + 1, False
+    while True:
+        found, vanished = [], []
+        for home in isolation_roots():
+            path = meta_path(home, task)
+            if path.exists():
+                try:
+                    found.append((home, _load_meta(path)))
+                except FileNotFoundError:
+                    vanished.append(path)
+        if len(found) == 1 and not vanished:
+            home, meta = found[0]
+            if isolation_home(meta["runner"], meta["account"]) == home:
+                return home, meta
+        if not found and not vanished:
+            if empty_seen:
+                return None, None
+            empty_seen = True
+            continue
+        if time.monotonic() >= deadline:
+            locations = []
+            for home, meta in found:
+                expected = isolation_home(meta["runner"], meta["account"])
+                locations.append(f"  {meta_path(home, task)} → 内容所指的家 {expected}，"
+                                 f"应放在 {meta_path(expected, task)}")
+            locations += [f"  {path} → 读取时消失" for path in vanished]
+            reject(f"任务名 {task} 在多个隔离目录中出现或内容与所在的家不一致，"
+                   "重扫 1 秒后仍无法确定归属：\n" + "\n".join(locations)
+                   + "\n恢复办法：把元数据文件挪回内容所指的家的 tasks/ 下，"
+                   "或删掉多出的那份元数据，再重试。")
+        time.sleep(0.05)
 
 
 def all_metas():
-    out = []
+    # 先收任务名，再逐任务经同一个一致性读者；一个坏任务不会致盲整个列表。
+    tasks = set()
     for home in isolation_roots():
         tasks_dir = home / "tasks"
         if not tasks_dir.is_dir():
             continue
         for p in sorted(tasks_dir.glob("*.json")):
-            out.append((home, _load_meta(p)))
+            tasks.add(p.stem)
+    out = []
+    for task in sorted(tasks):
+        try:
+            home, meta = find_meta(task)
+            if meta is not None:
+                out.append((home, meta))
+        except Rejected as error:
+            out.append((None, error))
     return out
 
 
@@ -2414,15 +2444,6 @@ def cmd_run(args):
 
     old_home, old_meta = find_meta(args.task)
 
-    # **跨 runner 同名任务当场拒。** 跨账号还有 `--account auto` 那条迁移路，
-    # 跨 runner 一条都没有（auto 只在 codex 的账号之间搬），而放任不管的后果是
-    # 同一个名字出现在两个隔离目录里——`find_meta` 此后一律拒绝，
-    # `status`／`resume`／`stop` 对这个任务全退 2，两份元数据谁也够不着。
-    # 排在这里：`find_meta` 是纯读，还没有任何状态变更。
-    if old_meta is not None and old_meta["runner"] != runner:
-        reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
-               f"跨 runner 没有迁移路径（会话、报告、日志都在那边），换个任务名。")
-
     if args.account == AUTO:
         candidates = accounts_by_availability()
         if not candidates:
@@ -2439,72 +2460,60 @@ def cmd_run(args):
             account = candidates[0]
     else:
         account = args.account
-        # 跨账号同名的护栏**只在强制模式下需要**：同一个名字出现在两个隔离目录里
-        # 时，find_meta 会数出两份并拒绝，而另一份就成了再也够不着的孤儿元数据。
-        # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
-        # 挑中别的账号时在下面**显式**把旧的那份搬过来。
-        # deepseek 走不到这一支的拒绝：它只有一个家，`old_home` 相等，条件不成立。
-        if old_meta is not None and old_home != isolation_home(runner, account):
+
+    # 显式选择不搬任务；auto 可跨账号、跨 runner，复用同一段迁移代码。
+    home = isolation_home(runner, account)
+    if old_meta is not None and args.account != AUTO:
+        if old_meta["runner"] != runner:
+            reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
+                   "非 auto 的同名任务不能换 runner，换个任务名。")
+        if old_home != home:
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
-                   f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
 
-    # 「这个任务名此刻有没有活着的 codex」——查一次，**在动任何状态之前**，
-    # 而且**旧的家和选中的家都要查**。
-    #
-    # 只查旧家是不够的：迁移那一支会先把旧元数据 unlink 掉再进 run_codex，而
-    # run_codex 里的 `_wait_previous_round_ends` 等满 60 秒之后会 `reject`——
-    # 那一刻旧的已经删了、新的还没写，任务从 status / stop / resume 三条路上
-    # 整个消失。run_codex 的注释写着「这一等排在 write_meta 之前，所以超时不留
-    # 半个状态」，而迁移是从**外面**把那条不变量破掉的。
-    #
-    # **为什么查 `find_agent_pid` 就够**（不必把整个 `_wait_previous_round_ends`
-    # 搬出来重跑一遍）：能走到迁移，说明 `find_meta` 只数出一份元数据（两份它当场
-    # 拒），于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
-    # `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的就只剩
-    # codex 这一条。把等待搬出来还会引入第二个调用点，而它之所以住在 run_codex
-    # 里，正是为了让调用方不必记得任何事。
-    #
-    # **这不替代 run_codex 内部每次 spawn 前的等待**：那一条问的是「上一轮的
-    # writer 和 codex 排干了没有」，每轮都必须做。
-    #
-    # **deepseek 的 needle 只住在元数据里**，所以它靠的是「元数据在不在」，
-    # 而不是像 codex 那样由 (home, task) 算得出——元数据不在时它老实答 None。
-    # 这一格对它仍然是有效的：上面那条跨 runner 拒绝保证了，能走到这里的 deepseek
-    # 任务 `old_home` 要么是 None（那就真没有上一轮）、要么就是这个家（那就带着
-    # 元数据，`find_task_agent_pid` 从磁盘读得到上一轮的 uuid）。
-    home = isolation_home(runner, account)
-    for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
-        if find_task_agent_pid(runner, candidate_home, args.task) is not None:
+    # 所有会拒绝的检查必须在动文件之前。旧 agent 按旧 runner 查，新家按本轮的
+    # runner 查；agent 已停但旧 writer 还在排管道时，也不能搬走它还会写回的元数据。
+    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    homes = [(home, runner)] if old_home in (None, home) else [
+        (old_home, old_meta["runner"]), (home, runner)]
+    for candidate_home, candidate_runner in homes:
+        if find_task_agent_pid(candidate_runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `sub-agent-runner stop {args.task}`")
+    if old_home is not None and old_home != home and _previous_writer_alive(old_home, args.task):
+        reject(f"任务 {args.task} 旧家的 writer 还在收尾（{old_home}），稍后重试。")
 
     home = ensure_isolation(runner, account)
+    meta = new_meta(args.task, runner, account, str(workdir), args.effort, args.skills)
     if old_meta is not None:
         if old_home == home:
             print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
-                  f"上一轮的报告会被删掉、日志会被追加")
+                  "上一轮的报告会被删掉、日志会被追加")
         else:
-            # 只有 auto 走得到这里（强制模式上面那道护栏已经拒了）。
-            # **措辞必须点明旧产物留在原处。** 上面那句「上一轮的报告会被删掉」
-            # 在跨账号时是**假话**：`clear_report` 只动这一轮要写的那个报告
-            # （新 home 的），旧 home 的 reports/ 和 logs/ 一个字节都没碰。
-            # 搬的只有元数据——不搬的话同一个名字出现在两个隔离目录里，
-            # find_meta 当场数出两份，status/stop 从此全退 2。
-            print(f"[sub-agent-runner] 任务 {args.task} 原本在账号 {old_meta['account']}，"
-                  f"本次改用 {account}：元数据搬过来，"
-                  f"旧账号的报告和日志留在 {old_home} 原处不动。")
-            meta_path(old_home, args.task).unlink(missing_ok=True)
+            # 同一文件系统的一次 rename 保证磁盘上恰好一份；读者负责重扫跨过
+            # rename 的扫描和位置/内容的短暂不一致。不能先删旧或先造第二份。
+            old_path, new_path = meta_path(old_home, args.task), meta_path(home, args.task)
+            try:
+                os.rename(old_path, new_path)
+            except OSError as error:
+                reject(f"任务 {args.task} 元数据 rename 失败（{error}），仍在 {old_path}。")
+            try:
+                write_meta(home, args.task, meta)
+            except OSError as error:
+                try:
+                    os.rename(new_path, old_path)
+                except OSError as rollback_error:
+                    reject(f"任务 {args.task} 写新内容失败（{error}），挪回也失败"
+                           f"（{rollback_error}）；元数据仍在 {new_path}，内容所指的家是"
+                           f" {old_home}。把文件挪回 {old_path} 后重试。")
+                reject(f"任务 {args.task} 写新内容失败（{error}），已挪回 {old_path}，"
+                       "原内容未变。")
+            print(f"[sub-agent-runner] 任务 {args.task} 原本在 {old_meta['runner']}"
+                  f"（账号 {old_meta['account']}），本次改用 {runner}（账号 {account}）："
+                  f"元数据搬过来，旧家的报告和日志留在 {old_home} 原处不动。")
+            # 新内容由本进程写入；run_codex 的 _previous_writer_alive 判自己已停，
+            # 不会等自己。旧家已在上面确认 writer 与 agent 都结束。
 
-    # 不再打印兜底句：它每轮派生、有白名单时是多行，而「这一轮给了哪些 skill」
-    # 的权威副本在元数据的 skills 字段里（见 new_meta）。印第二份只会漂移。
-    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
-    # 本轮的拥有者：judge 收的就是 run_codex 回传的那一对，**不用 read_last_round**
-    # ——后者是外部观察者的上界，拥有者用它就是把事实换回推测。
-    # meta 先落成局部变量：deepseek 的 argv 要用它铸好的 session id，
-    # **argv 里那个和元数据里那个必须是同一个**——两处各算各的话，PID 反查按
-    # 元数据里那个去找，而真跑的是 argv 里那个，于是 status 说不在跑、stop 不发信号。
-    meta = new_meta(args.task, runner, account, str(workdir), args.effort, args.skills)
     make_argv = (
         (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if runner == CODEX
         else (lambda r: build_deepseek_argv(args.effort, meta["session_id"], brief)))
@@ -2566,8 +2575,12 @@ def cmd_status(args):
     if not rows:
         print("还没有任何任务")
         return EXIT["success"]
-    worst = "success"
+    worst, has_error = "success", False
     for home, meta in rows:
+        if isinstance(meta, Rejected):
+            print(meta.message)
+            has_error = True
+            continue
         report, log = _report_path(home, meta["task"]), _log_path(home, meta["task"])
         pid = find_task_agent_pid(meta["runner"], home, meta["task"])
         # 还在跑就**不读日志**：判据在这一支根本用不到它，而 status 是轮询用的
@@ -2582,7 +2595,7 @@ def cmd_status(args):
             # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
             print(f"    {line}")
         worst = _worse(worst, verdict.state)
-    return EXIT[worst]
+    return USAGE_ERROR if has_error else EXIT[worst]
 
 
 def check_can_resume(task, meta, brief_path):

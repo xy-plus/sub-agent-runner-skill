@@ -6211,3 +6211,269 @@ class TestQuotaReadTime(_HomeSandbox):
                 self.assertIn("交给 DeepSeek", output)
                 self.assertIn("run", output)
                 self.assertIn("新会话", output)
+
+
+class TestTaskMigration(_HomeSandbox):
+    """换家必须保有唯一的元数据，并在读者确认归属后才能操作隔离目录。"""
+
+    def setUp(self):
+        super().setUp()
+        self.codex = ca.ensure_isolation(ca.CODEX, "default")
+        self.deepseek = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("干活")
+        self.old_meta = _full_meta("t", dir=str(self.workdir),
+                                   session_id="01a0b408-f718-7ff3-8123-d5202551acba")
+        ca.write_meta(self.codex, "t", self.old_meta)
+        ca.write_usage_limit(self.codex, datetime.datetime(2099, 1, 1), "fixture")
+
+    def _args(self):
+        return ca.build_parser().parse_args([
+            "run", "--task", "t", "--runner", "codex", "--account", "auto",
+            "--dir", str(self.workdir), "--brief", str(self.brief),
+            "--effort", "max", "--no-skill"])
+
+    def _run(self):
+        def spawn(argv, **kwargs):
+            proc = mock.MagicMock()
+            if argv[0] == "codex":
+                pathlib.Path(argv[argv.index("-o") + 1]).write_text("done")
+                raw = b"done\n"
+            else:
+                raw = b'{"type":"result","subtype":"success","is_error":false,"result":"done"}\n'
+            proc.stdout = io.BytesIO(raw)
+            return proc
+
+        with _capture_stdout() as output, mock.patch.object(ca.subprocess, "Popen", spawn):
+            code = ca.cmd_run(self._args())
+        return code, output["text"]
+
+    def test_auto在两侧往返_旧产物保留_status显示新执行者(self):
+        (self.codex / "logs" / "t.log").write_text("old log")
+        (self.codex / "reports" / "t.md").write_text("old report")
+        self.assertEqual(self._run()[0], 0)
+        home, meta = ca.find_meta("t")
+        self.assertEqual((home, meta["runner"], meta["account"]),
+                         (self.deepseek, "deepseek", None))
+        self.assertFalse(ca.meta_path(self.codex, "t").exists())
+        self.assertEqual(len(ca.all_metas()), 1)
+        self.assertEqual((self.codex / "logs" / "t.log").read_text(), "old log")
+        self.assertEqual((self.codex / "reports" / "t.md").read_text(), "old report")
+        with _capture_stdout() as output:
+            self.assertEqual(ca.cmd_status(argparse.Namespace(task="t")), 0)
+        self.assertEqual(output["text"].split()[1], "deepseek")
+        deepseek_log = (self.deepseek / "logs" / "t.log").read_bytes()
+        ca.usage_limit_path(self.codex).unlink()
+        try:
+            self.assertEqual(self._run()[0], 0)
+        except ca.Rejected as error:
+            self.fail("auto 应能从 DeepSeek 换回 Codex：" + error.message)
+        home, meta = ca.find_meta("t")
+        self.assertEqual((home, meta["runner"], meta["account"]),
+                         (self.codex, "codex", "default"))
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertEqual((self.deepseek / "logs" / "t.log").read_bytes(), deepseek_log)
+
+    def test_brief校验在换家之前_旧元数据一个字节不动(self):
+        self.brief.write_text("不得使用任何 skill")
+        before = ca.meta_path(self.codex, "t").read_bytes()
+        with self.assertRaises(ca.Rejected):
+            self._run()
+        self.assertTrue(ca.meta_path(self.codex, "t").exists())
+        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+
+    def test_旧家agent按旧runner查_还在跑就拒绝且不换家(self):
+        def agent(runner, home, task):
+            return 4242 if (runner, home) == ("codex", self.codex) else None
+
+        with mock.patch.object(ca, "find_task_agent_pid", agent):
+            with self.assertRaises(ca.Rejected) as got:
+                self._run()
+        self.assertIn("还在跑", got.exception.message)
+        self.assertTrue(ca.meta_path(self.codex, "t").exists())
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+
+    def test_旧writer尚未结束就拒绝且不换家(self):
+        self.old_meta.update(_live_writer(self))
+        ca.write_meta(self.codex, "t", self.old_meta)
+        before = ca.meta_path(self.codex, "t").read_bytes()
+        with self.assertRaises(ca.Rejected) as got:
+            self._run()
+        self.assertRegex(got.exception.message, "writer|收尾")
+        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+
+    def test_rename失败时原文件不变_不启动代理(self):
+        before = ca.meta_path(self.codex, "t").read_bytes()
+        with mock.patch.object(ca.os, "rename", side_effect=OSError("rename failed")):
+            with self.assertRaises(ca.Rejected) as got:
+                self._run()
+        self.assertIn("rename", got.exception.message)
+        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+
+    def test_写新内容失败时挪回旧家且内容不变(self):
+        before = ca.meta_path(self.codex, "t").read_bytes()
+        replace = ca.os.replace
+
+        def fail_new(src, dst):
+            if dst == ca.meta_path(self.deepseek, "t"):
+                raise OSError("new write failed")
+            return replace(src, dst)
+
+        with mock.patch.object(ca.os, "replace", fail_new):
+            try:
+                self._run()
+            except (ca.Rejected, OSError) as error:
+                self.assertIsInstance(error, ca.Rejected, "写失败要给出可操作的拒绝说明")
+            else:
+                self.fail("新内容写失败却继续派活")
+        self.assertTrue(ca.meta_path(self.codex, "t").exists())
+        self.assertEqual(ca.meta_path(self.codex, "t").read_bytes(), before)
+        self.assertFalse(ca.meta_path(self.deepseek, "t").exists())
+        self.assertEqual(ca.find_meta("t")[0], self.codex)
+
+    def test_显式DeepSeek遇到Codex同名任务照旧拒绝(self):
+        args = self._args()
+        args.runner, args.account = "deepseek", None
+        with self.assertRaises(ca.Rejected):
+            ca.cmd_run(args)
+        self.assertEqual(ca.find_meta("t")[0], self.codex)
+
+    def test_写新和挪回都失败后_各入口拒用不一致的目录(self):
+        rename = ca.os.rename
+
+        def fail_rollback(src, dst):
+            if dst == ca.meta_path(self.codex, "t"):
+                raise OSError("rollback failed")
+            return rename(src, dst)
+
+        with mock.patch.object(ca.os, "rename", fail_rollback), \
+                mock.patch.object(ca.os, "replace", side_effect=OSError("write failed")):
+            try:
+                with self.assertRaises(ca.Rejected) as got:
+                    self._run()
+            except OSError:
+                self.fail("迁移失败未给出元数据位置与恢复说明")
+        self.assertIn(str(ca.meta_path(self.deepseek, "t")), got.exception.message)
+        self.assertFalse(ca.meta_path(self.codex, "t").exists())
+        self.assertTrue(ca.meta_path(self.deepseek, "t").exists())
+        for command in ("status", "resume", "interrupt-and-resume", "stop", "run"):
+            with self.subTest(command=command), \
+                    mock.patch.object(ca, "find_task_agent_pid", side_effect=AssertionError("用了错误的家")):
+                args = self._args() if command == "run" else ca.build_parser().parse_args(
+                    [command, "t"] + ([] if command in ("status", "stop") else
+                                      ["--brief", str(self.brief), "--effort", "max", "--no-skill"]))
+                with self.assertRaises(ca.Rejected) as got:
+                    args.func(args)
+                self.assertIn(str(self.codex / "tasks"), got.exception.message)
+                self.assertIn(str(self.deepseek / "tasks"), got.exception.message)
+                self.assertRegex(got.exception.message, "挪回|移回")
+
+
+class TestMetadataReaders(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        self.codex = ca.ensure_isolation(ca.CODEX, "default")
+        self.deepseek = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.codex_meta = _full_meta("t")
+        self.deepseek_meta = _full_meta("t", runner="deepseek", account=None)
+
+    def _move(self, old, new, meta):
+        os.rename(ca.meta_path(old, "t"), ca.meta_path(new, "t"))
+        ca.write_meta(new, "t", meta)
+
+    def test_新任务零份立即只重扫一次_不等一秒(self):
+        with mock.patch.object(ca, "isolation_roots", wraps=ca.isolation_roots) as roots, \
+                mock.patch.object(ca.time, "sleep", side_effect=AssertionError("新任务不该等")):
+            self.assertEqual(ca.find_meta("brand-new"), (None, None))
+        self.assertEqual(roots.call_count, 2)
+
+    def test_读取旧家后rename_重扫不能误判两份(self):
+        ca.write_meta(self.codex, "t", self.codex_meta)
+        load = ca._load_meta
+        moved = False
+
+        def load_and_move(path):
+            nonlocal moved
+            meta = load(path)
+            if path == ca.meta_path(self.codex, "t") and not moved:
+                moved = True
+                self._move(self.codex, self.deepseek, self.deepseek_meta)
+            return meta
+
+        with mock.patch.object(ca, "_load_meta", load_and_move):
+            try:
+                found = ca.find_meta("t")
+            except ca.Rejected as error:
+                self.fail(error.message)
+        self.assertEqual(found, (self.deepseek, self.deepseek_meta))
+
+    def test_读新家前rename_瞬时零份立即重扫(self):
+        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+        exists = pathlib.Path.exists
+        moved = False
+
+        def move_before_old_exists(path):
+            nonlocal moved
+            if path == ca.meta_path(self.deepseek, "t") and not moved:
+                moved = True
+                self._move(self.deepseek, self.codex, self.codex_meta)
+            return exists(path)
+
+        with mock.patch.object(pathlib.Path, "exists", move_before_old_exists):
+            self.assertEqual(ca.find_meta("t"), (self.codex, self.codex_meta))
+
+    def test_exists和read之间rename_不能抛裸文件不存在(self):
+        ca.write_meta(self.codex, "t", self.codex_meta)
+        load = ca._load_meta
+        moved = False
+
+        def move_before_read(path):
+            nonlocal moved
+            if path == ca.meta_path(self.codex, "t") and not moved:
+                moved = True
+                self._move(self.codex, self.deepseek, self.deepseek_meta)
+            return load(path)
+
+        with mock.patch.object(ca, "_load_meta", move_before_read):
+            try:
+                found = ca.find_meta("t")
+            except (FileNotFoundError, ca.Rejected) as error:
+                self.fail(str(error))
+        self.assertEqual(found, (self.deepseek, self.deepseek_meta))
+
+    def test_rename到新家但未写完_等待内容与位置一致(self):
+        ca.write_meta(self.codex, "t", self.codex_meta)
+        os.rename(ca.meta_path(self.codex, "t"), ca.meta_path(self.deepseek, "t"))
+
+        def finish():
+            time.sleep(0.15)
+            ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+
+        writer = threading.Thread(target=finish)
+        writer.start()
+        self.addCleanup(writer.join)
+        self.assertEqual(ca.find_meta("t"), (self.deepseek, self.deepseek_meta))
+
+    def test_持续多份列出路径与内容所指的家_其他任务仍显示(self):
+        ca.write_meta(self.codex, "t", self.codex_meta)
+        ca.write_meta(self.deepseek, "t", self.deepseek_meta)
+        ca.write_meta(self.codex, "good", _full_meta("good"))
+        (self.codex / "reports" / "good.md").write_text("finished")
+        with self.assertRaises(ca.Rejected) as got:
+            ca.find_meta("t")
+        for path in (self.codex / "tasks" / "t.json", self.deepseek / "tasks" / "t.json"):
+            self.assertIn(str(path), got.exception.message)
+        self.assertRegex(got.exception.message, "删掉|删除")
+        with _capture_stdout() as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            try:
+                code = ca.cmd_status(argparse.Namespace(task=None))
+            except ca.Rejected as error:
+                self.fail("坏任务不该让整个列表拒绝：" + error.message)
+        self.assertEqual(code, 2)
+        self.assertIn("good", output["text"])
+        self.assertIn("t.json", output["text"] + errors.getvalue())
