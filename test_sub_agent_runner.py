@@ -132,7 +132,7 @@ ERR_USER_LAYER_REAL = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (htt
 # 11 份是这个形状（共 22 行，占真实消息的 39%），来自 Plus 账号的 5 小时档。
 # **教训本身比数字值钱：形态清单要从现网语料里数出来，不能从一两条样本里想出来。**
 # 日期按实际采用错误行自己的读取时刻取最近一次；分钟精度与读取延迟可能让
-# 它刚过去，不能一律推成明天。排序函数本身不读时钟，全满改派在入口另作判断。
+# 它刚过去，不能一律推成明天。排序函数本身不读时钟，全满拒绝在入口另作判断。
 # 逐字节拷自 /home/xy/.codex-subagent-acct3/logs/bn5m-engine-5min.log。
 ERR_USER_LAYER_REAL_NO_DATE = 'ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 4:02 AM.'
 ERR_RECONNECT = "\x1b[1m\x1b[31mERROR:\x1b[0m\x1b[0m Reconnecting... 2/5"
@@ -1669,7 +1669,7 @@ class TestAccountOrder(_HomeSandbox):
         self.assertNotIn("acct3", ca.accounts_by_availability())
 
     def test_有登录态的一个都不少(self):
-        # 排序保留全部有登录态候选；入口再判断是否全满并改派 DeepSeek。
+        # 排序保留全部有登录态候选；入口再判断是否全满并拒绝派活。
         for account in ("default", "acct2", "acct3"):
             self._limit(account, datetime.datetime(2099, 1, 1))
         self.assertEqual(sorted(ca.accounts_by_availability()),
@@ -4239,8 +4239,8 @@ class TestRunnerCLI(_HomeSandbox):
         self.assertEqual(popen.call_args.args[0][0], ca.DEEPSEEK_BIN)
 
     def test_同名任务不许跨runner复用(self):
-        # 只有 --account auto 可以跨 runner 换家；显式 DeepSeek 遇到 Codex
-        # 同名任务仍拒绝，不能创建第二份元数据。
+        # DeepSeek 遇到 Codex 同名任务也拒绝，不能创建第二份元数据；
+        # auto 与显式 Codex 遇到同名 DeepSeek 的方向见 TestAutoAccountPick。
         codex_home = ca.ensure_isolation(ca.CODEX, "default")
         ca.write_meta(codex_home, "t", ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ()))
         with self.assertRaises(ca.Rejected) as got:
@@ -4581,8 +4581,8 @@ class TestAutoAccountPick(_HomeSandbox):
         而整轮文本正是被污染的那个东西——上一行刚用已分类的错误行判「撞没撞上」，
         下一行就把这条规矩丢了，`search()` 取的是全文**第一个**匹配。
 
-        一条 2099 年的假记录会错误推迟该账号，甚至与其他记录一起触发 DeepSeek
-        改派。落盘的 raw 也会是那行 fixture，审计线索一起失效。
+        一条 2099 年的假记录会错误推迟该账号，甚至与其他记录一起触发全满拒绝。
+        落盘的 raw 也会是那行 fixture，审计线索一起失效。
         """
         污染 = "    47  ERR_USER_LAYER_REAL = '... or try again at Dec 31st, 2099 11:59 PM.'"
         code = self._run(ca.AUTO, 污染 + "\n" + self.LIMIT_LINE)
@@ -6587,6 +6587,8 @@ class TestMetadataReaders(_HomeSandbox):
 
 class TestModuleBashCallIsolation(_HomeSandbox):
     def test_继承前后台标记时派活测试通过且不写外部调用目录_结束恢复原值(self):
+        # 全满用例已在启动前拒绝；这里要用仍会走 run_codex 和 spawn 的用例，
+        # 才能发现启动时继承标记导致的误拒绝或外部调用目录污染。
         driver = (
             "import json,os,pathlib,sys,unittest\n"
             "import test_sub_agent_runner as tests\n"

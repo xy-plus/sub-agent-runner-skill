@@ -9,8 +9,10 @@
 `isolation_home`／`ensure_isolation`／`find_task_agent_pid`——它们不问「怎么跑」，
 只按 runner 取事实。
 `cmd_run` 选择执行者与 argv builder，auto 在全部有登录态的 codex 号都有限流记录
-且未到期时改派 DeepSeek。run 和续跑共用 `record_usage_limit`，只记账与提示，
-不在轮内接力。status/resume/stop 从唯一且归属一致的元数据查实际执行者。
+且未到期时，在任何任务状态变更前拒绝（退出码 2），逐个列出账号与恢复时间。
+换 DeepSeek 由调用方按 SKILL.md 换任务名、显式派活；auto 只在 codex 账号间搬元数据。
+run 和续跑共用 `record_usage_limit`，只记账与提示，不在轮内接力。
+status/resume/stop 从唯一且归属一致的元数据查实际执行者。
 
 后台事实由 `background_guard.py mark-call` 传入；三个启动入口运行时拒绝前台。
 shell 退出时 end-call 等待本次调用脱离的 runner 并收齐结论，不另造通知通道。
@@ -552,7 +554,7 @@ def hit_usage_limit(error_lines):
     判据而继续涨**，而它本身就是论据：污染源不是意外，是这个功能的日常。
     对整轮文本做子串匹配，那些行会被判成额度问题——而在 `cmd_run` 里，
     那意味着给一个健康账号写下假限流记录。它会被排到后面，其他账号也有未到期
-    记录时还会错误改派 DeepSeek，因此不能把普通文本中的同字样当作额度依据。
+    记录时还会错误拒绝 auto 派活，因此不能把普通文本中的同字样当作额度依据。
 
     **规矩：判据一旦成为控制依据，证据就必须来自已经分类过的错误行。**
     同一条规矩在本文件有第二个实例——`judge` 里的 `THREAD_LOCK_MARK`。它比这条
@@ -634,7 +636,7 @@ def parse_reset_time(text, now):
     返回 `(时间, 原始串)`——两样必须来自**同一次匹配**：原始串是落盘时的审计线索
     （解析错了一眼看得出），拆成两个函数就可能各匹配各的、对不上。
 
-    返回朴素本地时间，不编造时区。记录既供排序，也用于 auto 全满时改派 DeepSeek，
+    返回朴素本地时间，不编造时区。记录既供排序，也用于 auto 全满时拒绝派活，
     所以无日期消息缺乏可靠读取时刻时必须放弃记账；带日期的消息使用原日期。
 
     抠不到宁可返回 `None`——调用方会退化成「无记录＝排最前＝照样会被试到」，
@@ -745,7 +747,7 @@ def write_usage_limit(home, reset_at, raw):
     """记下这个账号什么时候恢复。只在解析得到非 None 的日期时间时调用。
 
     `raw` 是审计线索：解析错了（时区、OpenAI 改文案）一眼看得出，不用翻日志。
-    **没有 `seen_at`**——排序与全满改派都只消费 `reset_at`；
+    **没有 `seen_at`**——排序与全满拒绝都只消费 `reset_at`；
     没有消费者的字段一旦加进去就再也删不掉了。
 
     **写不进去只提示、不抛，并返回 `False`。** 写失败时下次 auto 少一条限流依据，
@@ -802,7 +804,7 @@ def accounts_by_availability():
     """按「预计什么时候能用」给候选账号排序。
 
     这里保持纯排序、不读时钟。cmd_run 再核所有候选的记录是否都未到期，只有
-    全满时才改派 DeepSeek；显式账号照试。坏记录按无记录处理，不锁死可用账号。
+    全满时拒绝派活；显式账号照试。坏记录按无记录处理，不锁死可用账号。
 
     登录态是硬前提：没有 `auth.json`，
     `ensure_isolation` 会直接 `reject` 退出 2，于是**一个账号缺登录态就会把整条
@@ -1762,7 +1764,8 @@ def find_meta(task):
     看见零份、两份或已消失的路径；移动后写新内容前，位置也可能暂时与内容矛盾。
     只有唯一且归属一致、扫描结束后原位置内容仍未变才作答；否则反向换家可能
     先扫过空的新家、再读到随后被搬走的旧家。正常新任务零份只立即重扫一次。
-    持续不一致时宁可拒绝，也不能让续跑把旧 runner 放进新家的隔离环境。
+    持续不一致时宁可拒绝，也不能让续跑沿用旧账号的隔离环境或重建旧家的元数据。
+    同一个 runner 的账号间迁移也有这些窗口；取消跨 runner 迁移不等于可以取消重扫。
     """
     deadline, empty_seen = time.monotonic() + 1, False
     while True:
@@ -2493,6 +2496,9 @@ def cmd_run(args):
                    + "\n先跑 `codex-acct login <账号>`。")
         limits = active_account_limits(candidates, datetime.datetime.now())
         if len(limits) == len(candidates):
+            # 用户要求（2026-10-23）：全满就拒绝，不在工具里换 DeepSeek。
+            # 必须先于 ensure_isolation、迁移和 run_codex，连旧任务也不能改动；
+            # SKILL.md 负责让调用方不等恢复、换名显式派 DeepSeek。
             reject("codex 号都在限流期内，auto 模式拒绝分配：\n"
                    + "\n".join(f"  {name} 至 {reset:%Y-%m-%d %H:%M}" for name, reset in limits))
         account = candidates[0]
@@ -2570,6 +2576,7 @@ def record_usage_limit(home, meta, this_round, verdict, continuing):
     真实限流错误曾在轮首之后中位 101 行、最多 23,630 行出现，任务可能已经改了
     文件。让 Claude 检查工作目录、补 brief 后重发，不能把「撞限」等同于零工作量。
     不另起探测任务：选择依据仍是本轮已分类错误和账号现有记录。
+    全满只提示下次 auto 会被拒；run 与续跑继续共用同一套恢复时间记账。
     """
     if meta["runner"] != CODEX or verdict.state != "failed" or not hit_usage_limit(verdict.detail):
         return
