@@ -534,7 +534,7 @@ class TestRoundBoundary(unittest.TestCase):
 
         self.assertEqual(ca.judge(rd).state, "interrupted")
         # 反面钉一条：猜边界（只看最后一轮）在这里当场失明——证明上面那条真的在挡东西
-        self.assertNotEqual(ca.judge(ca.Round(report, ca.read_last_round(log))).state,
+        self.assertNotEqual(ca.judge(ca.Round(report, ca.read_last_round(log), None)).state,
                             "interrupted")
 
     def test_区间右端截到下一个分隔符_后一轮的内容不许被吞进前一轮(self):
@@ -823,7 +823,7 @@ class TestJudge(unittest.TestCase):
         self.report = self.d / "t.md"
 
     def _judge(self, round_text="正常收尾\n"):
-        return ca.judge(ca.Round(self.report, round_text))
+        return ca.judge(ca.Round(self.report, round_text, None))
 
     def test_orphan_does_not_hide_other_tracing_errors(self):
         self.report.write_text("干完了\n")
@@ -1163,7 +1163,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         self.assertEqual(ca._worse("interrupted", "running"), "interrupted")
 
     def test_有打断标记且无报告时状态是interrupted(self):
-        v = ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n"))
+        v = ca.judge(ca.Round(self.report, ca.INTERRUPT_MARK + "\n", None))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 130)
         self.assertIn("resume", v.reason)
@@ -1182,7 +1182,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
                 ("报告缺失", "什么都没有\n"),
                 ("报告缺失且有杂错误", "ERROR: boom\n" + ERR_TRACING_UNKNOWN + "\n")):
             with self.subTest(情形=name):
-                v = ca.judge(ca.Round(self.report, text))
+                v = ca.judge(ca.Round(self.report, text, None))
                 self.assertEqual(v.state, "failed", "前提不成立：这条根本不是 failed")
                 self.assertEqual(v.detail, ca.runtime_error_lines(text))
 
@@ -1205,7 +1205,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for name, evidence, 处置 in (("额度上限", ERR_USER_LAYER_REAL, "换账号"),
                                      ("写锁", ERR_FATAL, "新起一个任务")):
             with self.subTest(情形=name):
-                v = ca.judge(ca.Round(self.report, evidence + "\n"))
+                v = ca.judge(ca.Round(self.report, evidence + "\n", None))
                 self.assertEqual(v.state, "failed")
                 self.assertEqual(ca.EXIT[v.state], 1)
                 # reason 必须钉住：`failed` 这个状态还有一条「报告缺失」的兜底，
@@ -1225,7 +1225,7 @@ class TestInterruptedIsItsOwnState(unittest.TestCase):
         for other in (ca.USAGE_LIMIT_MARK, ca.THREAD_LOCK_MARK):
             self.assertNotIn(other, ERR_ROLLOUT_ON_INTERRUPT,
                              "前提不成立：样本行自带更坏的标记，这条测的不是共存优先级")
-        v = ca.judge(ca.Round(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n"))
+        v = ca.judge(ca.Round(self.report, ERR_ROLLOUT_ON_INTERRUPT + "\n" + ca.INTERRUPT_MARK + "\n", None))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(len(v.detail), 1)
         self.assertIn("codex_core::session", v.detail[0])
@@ -1264,21 +1264,17 @@ class TestParseResetTime(unittest.TestCase):
         self.assertEqual(got[0], datetime.datetime(2026, 9, 22, 11, 10), "同一天的晚些时候")
         self.assertEqual(got[1], "11:10 AM")
 
-    def test_只有时刻_已经过了就算明天_跨月跨年也要对(self):
-        """「+1 天」不许自己拿 `day + 1` 拼——那在月末年末会造出 9 月 31 日。
-
-        实现用的是 `timedelta(days=1)`，日历进位归标准库。这三个 case 钉的就是
-        「进位没被自己实现一遍」：月末、年末各一条，删掉 timedelta 改成手拼当场红。
-        """
-        for name, now, want in (
-                ("同月内跨到明天", datetime.datetime(2026, 9, 22, 15, 0),
-                 datetime.datetime(2026, 9, 23, 11, 10)),
-                ("跨月", datetime.datetime(2026, 9, 30, 15, 0),
-                 datetime.datetime(2026, 10, 1, 11, 10)),
-                ("跨年", datetime.datetime(2026, 12, 31, 15, 0),
-                 datetime.datetime(2027, 1, 1, 11, 10))):
-            with self.subTest(情形=name):
-                got = ca.parse_reset_time("or try again at 11:10 AM.", now=now)
+    def test_只有时刻取最近一次_分钟精度和午夜两侧(self):
+        # 改回「之后的下一次」会把刚过恢复分钟的账号再排除一天。
+        for text, now, want in (
+                ("6:23 PM", datetime.datetime(2026, 10, 22, 18, 23, 0, 10000),
+                 datetime.datetime(2026, 10, 22, 18, 23)),
+                ("12:10 AM", datetime.datetime(2026, 12, 31, 23, 55),
+                 datetime.datetime(2027, 1, 1, 0, 10)),
+                ("11:59 PM", datetime.datetime(2026, 10, 1, 0, 1),
+                 datetime.datetime(2026, 9, 30, 23, 59))):
+            with self.subTest(text=text):
+                got = ca.parse_reset_time(f"or try again at {text}.", now=now)
                 self.assertEqual(got[0], want)
 
     def test_只有时刻_正好等于now就算今天(self):
@@ -1288,9 +1284,18 @@ class TestParseResetTime(unittest.TestCase):
 
     def test_只有时刻_从整行真实日志字节里也解析得出(self):
         # 未经我手的那一份（见 ERR_USER_LAYER_REAL_NO_DATE），4:02 AM。
-        # now 取 9:00，所以答案是**明天**的 4:02。
+        # 读到时是 9:00，最近的是今天 4:02，已过期也不能编成明天。
         self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL_NO_DATE, now=self.NOW)[0],
-                         datetime.datetime(2026, 9, 23, 4, 2))
+                         datetime.datetime(2026, 9, 22, 4, 2))
+
+    def test_没有读取时刻时不编造日期_仍区分可解析与缺时间(self):
+        try:
+            got = ca.parse_reset_time("try again at 6:00 AM", now=None)
+        except AttributeError:
+            self.fail("没有读取时刻时仍在访问 now.replace，不能猜恢复日期")
+        self.assertEqual(got, (None, "6:00 AM"))
+        self.assertEqual(ca.parse_reset_time(ERR_USER_LAYER_REAL, now=None),
+                         (datetime.datetime(2026, 9, 25, 17, 4), "Sep 25th, 2026 5:04 PM"))
 
     def test_带日期的那种不受now影响(self):
         # 带日期的消息自带全部信息，不许被 now 改写
@@ -2143,7 +2148,7 @@ class TestDeepseekRunner(_HomeSandbox):
         self.assertIn(残片, text, "前提不成立：残片被抹掉了，那这条测的就不是「粘住」")
         errs = ca.runtime_error_lines(text)
         self.assertEqual(len(errs), 1, f"补的行没落在行首，^ERROR: 匹配不上：{text!r}")
-        v = ca.judge(ca.Round(rp, text))
+        v = ca.judge(ca.Round(rp, text, None))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -2177,7 +2182,7 @@ class TestDeepseekRunner(_HomeSandbox):
         lines = ca.deepseek_log_lines(self.DENIED)
         self.assertTrue(any("被拒" in l for l in lines))
         self.assertIn("Write", "".join(lines))
-        v = ca.judge(ca.Round(rp, "\n".join(lines)))
+        v = ca.judge(ca.Round(rp, "\n".join(lines), None))
         self.assertEqual(v.state, "failed")
         self.assertEqual(ca.EXIT[v.state], 1)
 
@@ -2186,7 +2191,7 @@ class TestDeepseekRunner(_HomeSandbox):
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.INT, rp, lp)
         text = "\n".join([self.INT, ca.INTERRUPT_MARK, lp.read_text()])
-        v = ca.judge(ca.Round(rp, text))
+        v = ca.judge(ca.Round(rp, text, None))
         self.assertEqual(v.state, "interrupted")
         self.assertEqual(ca.EXIT[v.state], 130)
 
@@ -2194,7 +2199,7 @@ class TestDeepseekRunner(_HomeSandbox):
         rp, lp = self.home / "r.md", self.home / "t.log"
         lp.write_bytes(b"")
         ca.finish_deepseek_round(self.OK, rp, lp)
-        self.assertEqual(ca.judge(ca.Round(rp, self.OK)).state, "success")
+        self.assertEqual(ca.judge(ca.Round(rp, self.OK, None)).state, "success")
 
     def test_JSONL本身一条都不该被judge当成错误行(self):
         # 这是「非补不可」的根据：judge 的 detail 来自 runtime_error_lines，
@@ -2232,7 +2237,7 @@ class TestDeepseekRunner(_HomeSandbox):
         ca.finish_deepseek_round('{"type":"result","subtype":"success","result":"",'
                                  '"permission_denials":[]}', rp, lp)
         self.assertEqual(rp.read_text(), "")
-        self.assertEqual(ca.judge(ca.Round(rp, "")).state, "failed")
+        self.assertEqual(ca.judge(ca.Round(rp, "", None)).state, "failed")
 
     def test_PID反查的进程名按runner取(self):
         # 实测读 /proc/<pid>/comm：claude-deepseek 是 exec 掉的 bash 包装，
@@ -4341,11 +4346,17 @@ class TestAutoAccountPick(_HomeSandbox):
         限流；有报告时 A 不计入，所以假进程须还原额度错误发生在写报告前的情形。
         """
         def one(argv, *a, **kwargs):
-            self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
-            if not ca.runtime_error_lines(text):
+            if argv[0] == "claude-deepseek":
+                self.spawned.append("deepseek")
+                output = json.dumps({"type": "result", "subtype": "success",
+                                     "is_error": False, "result": "干完了\n"}) + "\n"
+            else:
+                self.spawned.append(self.account_of[kwargs["env"]["CODEX_HOME"]])
+                output = text
+            if argv[0] == "codex" and not ca.runtime_error_lines(text):
                 pathlib.Path(argv[argv.index("-o") + 1]).write_text("干完了\n")
             proc = mock.MagicMock()
-            proc.stdout.read1.side_effect = [text.encode(), b""]
+            proc.stdout.read1.side_effect = [output.encode(), b""]
             proc.wait.return_value = 1
             return proc
         popen.side_effect = one
@@ -4358,6 +4369,53 @@ class TestAutoAccountPick(_HomeSandbox):
         return code
 
     # ── 挑号 ────────────────────────────────────────────────────────────
+
+    def test_全满时改派DeepSeek_元数据和status都用实际执行者(self):
+        for account, year in (("default", 2099), ("acct2", 2098), ("acct3", 2097)):
+            self._limit(account, datetime.datetime(year, 1, 1))
+        self.assertEqual(self._run(ca.AUTO, self.FINE), 0)
+        self.assertEqual(self.spawned, ["deepseek"])
+        home, meta = ca.find_meta("t")
+        self.assertEqual(home, self.home / ".claude-subagent")
+        self.assertEqual((meta["runner"], meta["account"]), ("deepseek", None))
+        self.assertIn("这一轮交给 DeepSeek", self.printed)
+        for year in (2097, 2098, 2099):
+            self.assertIn(str(year), self.printed)
+        with _capture_stdout() as printed:
+            self.assertEqual(ca.cmd_status(ca.build_parser().parse_args(["status", "t"])), 0)
+        self.assertEqual(printed["text"].split()[1], "deepseek")
+
+    def test_未满时无记录坏记录过期记录都能选Codex(self):
+        for state in ("missing", "broken", "expired"):
+            with self.subTest(state=state):
+                for account in ("default", "acct2", "acct3"):
+                    self._limit(account, datetime.datetime(2099, 1, 1))
+                path = ca.usage_limit_path(ca.isolation_home(ca.CODEX, "acct3"))
+                if state == "missing":
+                    path.unlink()
+                elif state == "broken":
+                    path.write_text("not json")
+                else:
+                    self._limit("acct3", datetime.datetime(2000, 1, 1))
+                self.spawned.clear()
+                self.assertEqual(self._run(ca.AUTO, self.FINE, task=state), 0)
+                self.assertEqual(self.spawned, ["acct3"])
+
+    def test_全满时显式账号仍只跑该号(self):
+        for account in ("default", "acct2", "acct3"):
+            self._limit(account, datetime.datetime(2099, 1, 1))
+        self.assertEqual(self._run("acct3", self.FINE), 0)
+        self.assertEqual(self.spawned, ["acct3"])
+
+    def test_最后一个账号撞限后提示重发auto交给DeepSeek(self):
+        for account in ("default", "acct3"):
+            self._limit(account, datetime.datetime(2099, 1, 1))
+        line = self.LIMIT_LINE.replace("Sep 25th, 2026", "Sep 25th, 2099")
+        self.assertEqual(self._run(ca.AUTO, line), 1)
+        self.assertEqual(self.spawned, ["acct2"])
+        self.assertIn("codex 号都在限流期内", self.printed)
+        self.assertIn("重跑这条命令", self.printed)
+        self.assertIn("交给 DeepSeek", self.printed)
 
     def test_auto挑恢复时间最早的那个_并且只启动一次codex(self):
         # 「只启动一次」是 v4 的形状本身：没有循环，撞上限也不再换号重跑。
@@ -6022,3 +6080,134 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
                 pass
             proc.wait()
             proc.stderr.close()
+
+
+class TestQuotaReadTime(_HomeSandbox):
+    """若记账误用 EOF 时刻或最后一次同字样，这些用例会把恢复日期错成次日。"""
+
+    LIMIT = "ERROR: You’ve hit your usage limit. try again at 6:00 AM."
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.home / "brief.md"
+        self.brief.write_text("继续干活")
+        self.task_home = ca.ensure_isolation(ca.CODEX, "default")
+        real_datetime = datetime.datetime
+
+        class Clock(real_datetime):
+            current = real_datetime(2026, 10, 22, 5)
+
+            @classmethod
+            def now(cls):
+                return cls.current
+
+        self.clock = Clock
+        self.clock_patch = mock.patch.object(ca.datetime, "datetime", Clock)
+        self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+
+    def _run_chunks(self, kind, chunks):
+        if kind == "run":
+            argv = ["run", "--task", "t", "--runner", "codex", "--account", "default",
+                    "--dir", str(self.workdir)]
+        else:
+            ca.write_meta(self.task_home, "t", _full_meta(
+                "t", dir=str(self.workdir), session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
+            argv = [kind, "t"]
+        args = ca.build_parser().parse_args(
+            argv + ["--brief", str(self.brief), "--effort", "max", "--no-skill"])
+        iterator = iter(chunks)
+
+        def read(size):
+            when, chunk = next(iterator)
+            self.clock.current = when
+            return chunk
+
+        with _capture_stdout() as printed, _no_codex() as popen:
+            popen.return_value.stdout.read1.side_effect = read
+            code = args.func(args)
+            self.assertEqual(popen.call_count, 1, "撞上限也不允许当场换号重跑")
+        self.assertEqual(code, 1)
+        return printed["text"]
+
+    def test_错误行的读取时间不受EOF和后来的同字样影响(self):
+        for later in (b"", (self.LIMIT + "\n").encode(),
+                      b"child fixture: hit your usage limit\n"):
+            with self.subTest(later=later):
+                chunks = [(datetime.datetime(2026, 10, 22, 5),
+                           ("banner\n" + self.LIMIT + "\n").encode())]
+                if later:
+                    chunks.append((datetime.datetime(2026, 10, 22, 19), later))
+                chunks.append((datetime.datetime(2026, 10, 22, 19), b""))
+                self._run_chunks("run", chunks)
+                self.assertEqual(ca.read_usage_limit(self.task_home),
+                                 datetime.datetime(2026, 10, 22, 6))
+
+    def test_ANSI和跨块行以收齐的时刻为参照(self):
+        line = "ERROR: You’ve hit your \x1b[31musage limit\x1b[0m. try again at 6:00 AM.\n"
+        raw = line.encode()
+        cut = raw.index(b"usage") + 2
+        self._run_chunks("run", [
+            (datetime.datetime(2026, 10, 21, 19), raw[:cut]),
+            (datetime.datetime(2026, 10, 22, 5), raw[cut:]),
+            (datetime.datetime(2026, 10, 22, 19), b"")])
+        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+
+    def test_无换行的最后一行也在EOF被收齐(self):
+        self._run_chunks("run", [
+            (datetime.datetime(2026, 10, 22, 5), self.LIMIT.encode()),
+            (datetime.datetime(2026, 10, 22, 5, 1), b"")])
+        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+
+    def test_输出flush不能把已经读到的错误行时间拖晚(self):
+        clock = self.clock
+
+        class SlowLog(io.BytesIO):
+            def flush(self):
+                clock.current = datetime.datetime(2026, 10, 22, 19)
+
+        proc = mock.MagicMock()
+        proc.stdout.read1.side_effect = [(self.LIMIT + "\n").encode(), b""]
+        with _capture_stdout():
+            observed = ca._tee_until_exit(proc, SlowLog(), self.task_home, "t", _full_meta("t"))
+        self.assertEqual(observed, (0, datetime.datetime(2026, 10, 22, 5)))
+
+    def test_只记首条能解析的已分类限流行(self):
+        self._run_chunks("run", [
+            (datetime.datetime(2026, 10, 21, 19),
+             ("    fixture: " + self.LIMIT + "\nERROR: hit your usage limit\n").encode()),
+            (datetime.datetime(2026, 10, 22, 5), (self.LIMIT + "\n").encode()),
+            (datetime.datetime(2026, 10, 22, 19), b"")])
+        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+
+    def test_读取时刻行号对不上时不记无日期消息_带日期仍记(self):
+        tee = ca._tee_until_exit
+
+        def mismatched(*args):
+            tee(*args)
+            return (999, datetime.datetime(2026, 10, 22, 5))
+
+        for line, want in ((self.LIMIT, None),
+                           (ERR_USER_LAYER_REAL, datetime.datetime(2026, 9, 25, 17, 4))):
+            with self.subTest(line=line), mock.patch.object(ca, "_tee_until_exit", mismatched):
+                ca.usage_limit_path(self.task_home).unlink(missing_ok=True)
+                output = self._run_chunks("run", [
+                    (datetime.datetime(2026, 10, 22, 5), (line + "\n").encode()),
+                    (datetime.datetime(2026, 10, 22, 19), b"")])
+                self.assertEqual(ca.read_usage_limit(self.task_home), want)
+                if want is None:
+                    self.assertIn("恢复时间没记下", output)
+
+    def test_续跑两入口也记恢复时间并提示用run换执行者(self):
+        for kind in ("resume", "interrupt-and-resume"):
+            with self.subTest(kind=kind):
+                output = self._run_chunks(kind, [
+                    (datetime.datetime(2026, 10, 22, 5), (self.LIMIT + "\n").encode()),
+                    (datetime.datetime(2026, 10, 22, 5, 1), b"")])
+                self.assertEqual(ca.read_usage_limit(self.task_home),
+                                 datetime.datetime(2026, 10, 22, 6))
+                self.assertIn("交给 DeepSeek", output)
+                self.assertIn("run", output)
+                self.assertIn("新会话", output)

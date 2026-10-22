@@ -579,19 +579,18 @@ def parse_reset_time(text, now):
     第二种**只有时刻没有日期**，占真实消息的 39%。不认它的代价是：无记录＝排最前，
     于是 5 小时窗口里每次 run 都先挑中这个账号、白撞一整轮任务。
 
-    歧义（11:10 是今天还是明天）只在读到消息的那一刻存在，而消息说的是
-    "try again **at**"——未来。所以取 **>= now 的下一个该时刻**。
-    `now` **必填**：这是本功能唯一读时钟的地方，调用方必须显式交出它用的是哪个，
-    否则测试里一个隐式的 `datetime.now()` 会让「明天还是今天」随测试运行的时刻飘。
-    排序（`accounts_by_availability`）**一次都不读时钟**。
+    只有时刻的消息取离 `now` 最近的一次，可以刚过去。它属于 5 小时档，真实恢复
+    时刻距消息产生不超过约 5 小时、消息只精确到分钟；read1 有数据就返回，读取
+    只晚管道传输与调度时间，因此 ±12 小时内只有一个候选。包装进程被挂起近
+    7 小时以上才可能推错；不能以任意晚的 EOF 时刻代替该错误行自己的读取时刻。
+    `now` 必填，由调用方显式交出读取时刻；为 None 时仍识别首条可解析消息，
+    但无日期消息返回 `(None, 原始串)`，不编恢复日期，也不跳去采用后面的消息。
 
     返回 `(时间, 原始串)`——两样必须来自**同一次匹配**：原始串是落盘时的审计线索
     （解析错了一眼看得出），拆成两个函数就可能各匹配各的、对不上。
 
-    **返回朴素本地时间，不编造时区。** 消息里没有时区，实测也推不出来（恢复时间在
-    3~4 天后，拿文件 mtime 反推不出来）。这样做安全，是因为这个值**只当排序键**
-    （见 `accounts_by_availability`）：误差 ±12h 只在两个账号的恢复时间相差 12h
-    以内时才改变顺序，代价是多一次 codex 启动。
+    返回朴素本地时间，不编造时区。记录既供排序，也用于 auto 全满时改派 DeepSeek，
+    所以无日期消息缺乏可靠读取时刻时必须放弃记账；带日期的消息使用原日期。
 
     抠不到宁可返回 `None`——调用方会退化成「无记录＝排最前＝照样会被试到」，
     比写一个假时间进去安全得多。**带日期那一支匹配上但内容非法（月份名乱写、
@@ -617,9 +616,14 @@ def parse_reset_time(text, now):
     hour = _to_24h(m.group("hour"), m.group("half"))
     if hour is None:
         return None
-    when = now.replace(hour=hour, minute=int(m.group("minute")), second=0, microsecond=0)
-    if when < now:                      # 今天这个点已经过了，那说的就是明天
-        when += datetime.timedelta(days=1)
+    minute = int(m.group("minute"))
+    if not 0 <= minute <= 59:
+        return None
+    if now is None:
+        return None, m.group("raw")
+    when = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    when = min((when + datetime.timedelta(days=day) for day in (-1, 0, 1)),
+               key=lambda candidate: abs(candidate - now))
     return when, m.group("raw")
 
 
@@ -654,6 +658,14 @@ def usage_limit_reset(error_lines, now):
         got = parse_reset_time(line, now=now)
         if got is not None:
             return got
+    return None
+
+
+def usage_limit_line_number(text):
+    """首条能解析的已分类限流行的原始行号；不用文字匹配，重复文本也不会串行。"""
+    for number, line in enumerate(text.splitlines()):
+        if usage_limit_reset(runtime_error_lines(line), now=None) is not None:
+            return number
     return None
 
 
@@ -744,14 +756,10 @@ def read_usage_limit(home):
 def accounts_by_availability():
     """按「预计什么时候能用」给候选账号排序。
 
-    **额度记录只排顺序，不准拒绝**——本设计最重要的一条约束。
-    「这个账号真的没额度了」这个结论只能来自**真实尝试**，不能来自这里读到的
-    文件。文件会错（时区、时钟偏移、OpenAI 改文案，以及日志被回显污染——
-    见 `hit_usage_limit`）。只排顺序的话后果被限制在「顺序排差一格」；一旦允许
-    它拒绝，同一个错就变成「把好账号误判成死的、还告诉调用方没号可用」。
+    这里保持纯排序、不读时钟。cmd_run 再核所有候选的记录是否都未到期，只有
+    全满时才改派 DeepSeek；显式账号照试。坏记录按无记录处理，不锁死可用账号。
 
-    **登录态是唯一的例外，而且它不违反上面那条。** 那条约束管的是**额度记录**
-    ——一份会过期、会出错的缓存。登录态是当场可查的硬前提：没有 `auth.json`，
+    登录态是硬前提：没有 `auth.json`，
     `ensure_isolation` 会直接 `reject` 退出 2，于是**一个账号缺登录态就会把整条
     auto 命令打死**，哪怕别的账号完全可用。所以在这里就把它们滤掉。
 
@@ -774,6 +782,16 @@ def accounts_by_availability():
         return (read_usage_limit(isolation_home(CODEX, account)) or datetime.datetime.min,
                 account)
     return sorted((a for a in account_choices() if auth_source(a).exists()), key=sort_key)
+
+
+def active_account_limits(candidates, now):
+    """只认有登录态候选中尚未到期的记录；run 和撞限提示共用这个判定。"""
+    limits = []
+    for account in candidates:
+        reset = read_usage_limit(isolation_home(CODEX, account))
+        if reset is not None and reset > now:
+            limits.append((account, reset))
+    return limits
 
 
 def extract_session_id(log_text):
@@ -808,6 +826,7 @@ class Round(NamedTuple):
     """
     report_path: object   # pathlib.Path
     text: str             # 本轮的日志文本（已 strip_ansi、已切好边界）
+    limit_read: object    # (原始行号, 读到时刻)，或 None；观察者没有读取现场
 
 
 class Verdict(NamedTuple):
@@ -2164,7 +2183,7 @@ def run_codex(kind, home, task, meta, make_argv):
         previous = {sig: signal.signal(sig, forward_as_sigint)
                     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
         try:
-            _tee_until_exit(proc, log, home, task, meta)
+            limit_read = _tee_until_exit(proc, log, home, task, meta)
         finally:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
@@ -2184,7 +2203,7 @@ def run_codex(kind, home, task, meta, make_argv):
     # 成对回传是因为报告路径本来就归本函数所有（见上），调用方再算一遍同一个
     # 路径就又冒出一条「必须记得对齐」；而配错是静默算对的（理由见 Round）。
     # 副带好处：快照在 codex 退出那一刻取走，比「调用方稍后自己读」窗口更小。
-    return Round(report, read_round(_log_path(home, task), start_offset))
+    return Round(report, read_round(_log_path(home, task), start_offset), limit_read)
 
 
 def _tee_until_exit(proc, log, home, task, meta):
@@ -2195,8 +2214,18 @@ def _tee_until_exit(proc, log, home, task, meta):
         # **绝不从输出里读回来核对**：那会把一个已知事实变成待验证的推测。
         _tee_lines(proc, log)
         return
-    # ↓↓↓ 以下是 codex 那一支，一个字节未改 ↓↓↓
     head, session_id = b"", None
+    buffer, line_number, limit_read = b"", 0, None
+
+    def observe(data):
+        nonlocal line_number, limit_read
+        # 按完整行分类，ANSI、UTF-8 和错误字样都可跨 read1 块。只留首个候选的
+        # 身份与时刻；其余行的时间没有消费者，不建逐行时间表。
+        text = strip_ansi(data.decode("utf-8", "replace"))
+        number = usage_limit_line_number(text)
+        if number is not None:
+            limit_read = (line_number + number, datetime.datetime.now())
+        line_number += len(text.splitlines())
     # read1：有数据就返回，不等凑满。用 read 会阻塞到满 1024 字节或 EOF——
     # codex 的 banner 只有 ~170 字节，之后可能思考几十分钟，这期间屏幕、日志、
     # 元数据里的 session id 全是空的（实测父进程 4.06 秒才看到 t=0 就 flush 的
@@ -2210,6 +2239,11 @@ def _tee_until_exit(proc, log, home, task, meta):
     # 实测：codex 变僵尸是 t=0.027s，而那一刻 find_agent_pid 就判 None
     # （僵尸的 cmdline 为空，argv 比对拒绝它），日志还要再长好几秒。
     for chunk in iter(lambda: proc.stdout.read1(1024), b""):
+        if limit_read is None:
+            buffer += chunk
+            lines, buffer = split_complete_lines(buffer)
+            if lines:
+                observe(b"\n".join(lines) + b"\n")
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
         log.write(chunk)
@@ -2220,7 +2254,10 @@ def _tee_until_exit(proc, log, home, task, meta):
             if session_id:
                 meta["session_id"] = session_id
                 write_meta(home, task, meta)
+    if limit_read is None and buffer:
+        observe(buffer)
     proc.wait()
+    return limit_read
 
 
 def _tee_lines(proc, log):
@@ -2360,6 +2397,7 @@ def cmd_run(args):
     # **第一行就拒。** 排在 find_meta / ensure_isolation / new_meta 全部之前，
     # 所以被拒的调用在盘上一个字节都不留。
     _reject_bad_runner_combo(args)
+    runner = args.runner
     workdir = pathlib.Path(args.dir).expanduser().resolve()
     # 入口那道（work_dir）守的是**命令行上那个原始串**，而落进元数据、随后进
     # status 数据行的是 resolve() 之后的真身——软链一跨就绕过去了。实测：
@@ -2384,7 +2422,7 @@ def cmd_run(args):
     # 同一个名字出现在两个隔离目录里——`find_meta` 此后一律拒绝，
     # `status`／`resume`／`stop` 对这个任务全退 2，两份元数据谁也够不着。
     # 排在这里：`find_meta` 是纯读，还没有任何状态变更。
-    if old_meta is not None and old_meta["runner"] != args.runner:
+    if old_meta is not None and old_meta["runner"] != runner:
         reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
                f"跨 runner 没有迁移路径（会话、报告、日志都在那边），换个任务名。")
 
@@ -2394,7 +2432,14 @@ def cmd_run(args):
             reject("没有任何账号有登录态，auto 模式无从分配：\n"
                    + "\n".join(f"  {a} 缺 {auth_source(a)}" for a in account_choices())
                    + "\n先跑 `codex-acct login <账号>`。")
-        account = candidates[0]
+        limits = active_account_limits(candidates, datetime.datetime.now())
+        if len(limits) == len(candidates):
+            runner, account = DEEPSEEK, None
+            print("[sub-agent-runner] " + "、".join(
+                f"{name} 至 {reset:%Y-%m-%d %H:%M}" for name, reset in limits)
+                + "，这一轮交给 DeepSeek")
+        else:
+            account = candidates[0]
     else:
         account = args.account
         # 跨账号同名的护栏**只在强制模式下需要**：同一个名字出现在两个隔离目录里
@@ -2402,7 +2447,7 @@ def cmd_run(args):
         # auto 模式不走这条——它不问任务住在哪（见 accounts_by_availability），
         # 挑中别的账号时在下面**显式**把旧的那份搬过来。
         # deepseek 走不到这一支的拒绝：它只有一个家，`old_home` 相等，条件不成立。
-        if old_meta is not None and old_home != isolation_home(args.runner, account):
+        if old_meta is not None and old_home != isolation_home(runner, account):
             reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
                    f"同名任务跨账号会让 status/resume/stop 指向哪个变得不确定，换个任务名。\n"
                    f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
@@ -2431,13 +2476,13 @@ def cmd_run(args):
     # 这一格对它仍然是有效的：上面那条跨 runner 拒绝保证了，能走到这里的 deepseek
     # 任务 `old_home` 要么是 None（那就真没有上一轮）、要么就是这个家（那就带着
     # 元数据，`find_task_agent_pid` 从磁盘读得到上一轮的 uuid）。
-    home = isolation_home(args.runner, account)
+    home = isolation_home(runner, account)
     for candidate_home in ([home] if old_home in (None, home) else [old_home, home]):
-        if find_task_agent_pid(args.runner, candidate_home, args.task) is not None:
+        if find_task_agent_pid(runner, candidate_home, args.task) is not None:
             reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
                    f"换个名字或先 `sub-agent-runner stop {args.task}`")
 
-    home = ensure_isolation(args.runner, account)
+    home = ensure_isolation(runner, account)
     if old_meta is not None:
         if old_home == home:
             print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
@@ -2462,71 +2507,55 @@ def cmd_run(args):
     # meta 先落成局部变量：deepseek 的 argv 要用它铸好的 session id，
     # **argv 里那个和元数据里那个必须是同一个**——两处各算各的话，PID 反查按
     # 元数据里那个去找，而真跑的是 argv 里那个，于是 status 说不在跑、stop 不发信号。
-    meta = new_meta(args.task, args.runner, account, str(workdir), args.effort, args.skills)
+    meta = new_meta(args.task, runner, account, str(workdir), args.effort, args.skills)
     make_argv = (
-        (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if args.runner == CODEX
+        (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if runner == CODEX
         else (lambda r: build_deepseek_argv(args.effort, meta["session_id"], brief)))
     this_round = run_codex("run", home, args.task, meta, make_argv)
     verdict = judge(this_round)
 
-    # **撞上限只记一笔，不重跑。** v1~v3 在这里换账号重跑，安全论证是「撞上限的
-    # 那一轮 codex 从未拿到响应，零工作量」——269 份现网日志、56 条真·额度错误行
-    # 实测推翻了它：距本轮开头**中位 101 行、最小 41 行、最大 23,630 行**
-    # （1.19 MB，一整轮活干到一半），**0 条落在轮首 12 行以内**。
-    # 额度永远是在任务跑到一半用完的，一次例外都没有；而重跑用的是同一个 --dir、
-    # 同一份 brief、danger-full-access，落在一棵已经被改过的树上；而「这一轮到底
-    # 改没改过文件」没法可靠地知道——唯一的线索是日志文本，而日志正是被污染的
-    # 那个东西。于是「重试」从工具的一个循环，变成了调用方的一次重发，
-    # 而重发是安全的：重发时 auto 已经知道这个账号满了。
-    #
-    # **连带死掉的还有「独立探测」，别再把它捡回来。** v3 设计过一次：撞上限后
-    # 用一个写死在代码里、不含任何额度字样的 prompt 再问那个账号一次，用它
-    # 没被污染的输出决定换不换号。它存在的唯一理由是**让轮内重试变安全**——
-    # 重试没了，它就成了一个零消费者的实体（奥卡姆）。v4 里日志的权力已经收小
-    # 到「排序时往后挪一格」，不值得为此每次失败都多烧一轮 codex 启动。
-    # 真要做更强的判据，起点是 `codex exec --json`（结构化事件是「文本分不清
-    # 来源」的根因解法），不是再探一次。
-    #
-    # 判据不可靠这件事在这里的爆炸半径只有**记录**：误判最多给一个健康账号写条
-    # 限流记录，于是它排到后面——仍然会被选中、仍然会被试，只是顺序差一格。
-    # **证据只有一批：`verdict.detail`。** failed 态下它就是本轮已分类的错误行
-    # （`judge` 三个 failed 构造点全传 `errors`，有测试守着这条契约）。
-    # 不自己再扫一遍整轮文本：扫两遍就有两批行，而「判撞没撞上」和「判几点恢复」
-    # 一旦看的不是同一批，就是 2026-09-22 那个 bug 的形状——污染行排在真错误前面时，
-    # 对整轮文本 search() 取到的是污染那一条，于是一个健康账号被记上 2099 年的
-    # 恢复时间，从此永远排最后。
-    # **只对 codex。** 账号、限流记录、auto 排序全是 codex 的概念；deepseek 走进来
-    # 会往 `~/.claude-subagent` 写一条谁也不读的限流记录（`accounts_by_availability`
-    # 只扫 codex 的家），还会印一句「下次 auto 会先试 X」——而 deepseek 根本没有 auto。
-    if args.runner == CODEX and verdict.state == "failed" and hit_usage_limit(verdict.detail):
-        # 变量名**不叫 `hit`**：本函数开头那个 `hit` 是 `_CONTROL_CHARS.search()`
-        # 的结果。同一个函数里同名两义，是下一次编辑必踩的坑。
-        reset = usage_limit_reset(verdict.detail, now=datetime.datetime.now())
-        # 三路分叉，**不许把第三路并进第二路**：写失败时说「已记下」，
-        # 和 write_usage_limit 自己刚印的那行「写不进…」在同一屏上自相矛盾。
-        if reset is None:
-            record_note = "这几条错误行里没有恢复时间可记"
-        elif write_usage_limit(home, *reset):     # 写失败它自己吞掉并出声
-            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
-        else:
-            record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 没能记下（原因见上一行）"
-        # 下一个账号**算出来，不写死**：记完这一笔之后重新排一次序，第一个就是
-        # 下次会跑的那个。说「下次 auto 会先试」而不是「重跑这条命令会换成」，
-        # 因为后者在强制模式下是假话——重跑的还是 `--account` 指定的那一个。
-        #
-        # **第一个仍是它自己时要换句话。** 那种情形下「下次会先试 <刚撞上限的
-        # 那个>」读起来像是在让人原地重试，而真相是没有更好的选择了。
-        # 判据是 `下一个 == 当前`，不是「只剩一个候选」——后者只是它的一个实例：
-        # 多账号但别的账号恢复得更晚时，第一个同样可能仍是它自己。
-        next_account = accounts_by_availability()[0]
-        whats_next = (f"下次 --account {AUTO} 会先试 {next_account}"
-                      if next_account != account else
-                      f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它")
-        print(f"[sub-agent-runner] {account} 撞上额度上限，{record_note}。{whats_next}。")
+    record_usage_limit(home, meta, this_round, verdict, continuing=False)
 
     _print_verdict(args.task, verdict)
     print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
     return EXIT[verdict.state]
+
+
+def record_usage_limit(home, meta, this_round, verdict, continuing):
+    """run 和两条续跑路径共用记账与下一步提示；只记，不在轮内接力。
+
+    真实限流错误曾在轮首之后中位 101 行、最多 23,630 行出现，任务可能已经改了
+    文件。让 Claude 检查工作目录、补 brief 后重发，不能把「撞限」等同于零工作量。
+    不另起探测任务：选择依据仍是本轮已分类错误和账号现有记录。
+    """
+    if meta["runner"] != CODEX or verdict.state != "failed" or not hit_usage_limit(verdict.detail):
+        return
+    # 先核对实际采用行的身份；时间不能靠相同文字关联，也不能退回收尾时刻。
+    number = usage_limit_line_number(this_round.text)
+    observed = this_round.limit_read
+    reference = observed[1] if observed is not None and observed[0] == number else None
+    reset = usage_limit_reset(verdict.detail, now=reference)
+    if reset is None:
+        record_note = "这几条错误行里没有恢复时间可记"
+    elif reset[0] is None:
+        record_note = "恢复时间没记下（错误行的读取时刻对应不上）"
+    elif write_usage_limit(home, *reset):
+        record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 已记下"
+    else:
+        record_note = f"恢复时间 {reset[0]:%m-%d %H:%M} 没能记下（原因见上一行）"
+    candidates = accounts_by_availability()
+    limits = active_account_limits(candidates, datetime.datetime.now())
+    account = meta["account"]
+    if candidates and len(limits) == len(candidates):
+        whats_next = "codex 号都在限流期内，重跑这条命令（--account auto）会交给 DeepSeek"
+    elif candidates and candidates[0] != account:
+        whats_next = f"下次 --account {AUTO} 会先试 {candidates[0]}"
+    else:
+        whats_next = f"没有恢复得更早的账号，下次 --account {AUTO} 仍会挑中它"
+    print(f"[sub-agent-runner] {account} 撞上额度上限，{record_note}。{whats_next}。")
+    if continuing:
+        print("[sub-agent-runner] 续跑接的是这个号上的会话；要换号或换 DeepSeek，"
+              "只能用 run 重跑（新会话，不带旧上下文）。")
 
 
 def cmd_status(args):
@@ -2550,7 +2579,7 @@ def cmd_status(args):
         # 不在跑时它是外部观察者：手里没有本轮文本，只能看最后一轮，也只该看
         # 最后一轮。它**显式**构造 Round，所以「这是推测」在代码里看得见。
         verdict = (Verdict("running", f"pid={pid} 存活", []) if pid is not None
-                   else judge(Round(report, read_last_round(log))))
+                   else judge(Round(report, read_last_round(log), None)))
         print(status_row(meta, verdict))
         for line in verdict.detail:
             # 缩进保持：首字符是空白 → 与数据行结构性可分，调用方不必猜哪行是任务
@@ -2639,7 +2668,9 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
         (lambda r: build_resume_argv(meta["dir"], meta["session_id"], effort, r, brief))
         if meta["runner"] == CODEX
         else (lambda r: build_deepseek_resume_argv(effort, meta["session_id"], brief)))
-    verdict = judge(run_codex(kind, home, task, meta, make_argv))
+    this_round = run_codex(kind, home, task, meta, make_argv)
+    verdict = judge(this_round)
+    record_usage_limit(home, meta, this_round, verdict, continuing=True)
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 
