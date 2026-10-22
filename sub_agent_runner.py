@@ -247,7 +247,7 @@ def require_background_call():
         reject(FOREGROUND_REFUSAL)
 
 
-def write_bash_call_result(task, code, verdict_line):
+def write_bash_call_result(code, verdict_line):
     # PID 区分一次调用内不同任务的完成记录。先写再退出，end-call 等完才读取，
     # 不需要再登记启动身份，也不需要重跑 status 猜本轮判据。
     call = bash_call()
@@ -256,7 +256,7 @@ def write_bash_call_result(task, code, verdict_line):
             directory = bash_call_directory(call[1])
             directory.mkdir(parents=True, exist_ok=True)
             (directory / f"{os.getpid()}.done").write_text(json.dumps(
-                {"task": task, "exit_code": code, "verdict": verdict_line}, ensure_ascii=False))
+                {"exit_code": code, "verdict": verdict_line}, ensure_ascii=False))
         except OSError as error:
             print(f"[sub-agent-runner] 结论写不进调用目录：{error}", file=sys.stderr)
 
@@ -2431,7 +2431,7 @@ def _print_verdict(task, verdict):
     print("\n" + verdict_line)
     for line in verdict.detail:
         print(f"  {line}")
-    write_bash_call_result(task, EXIT[verdict.state], verdict_line)
+    write_bash_call_result(EXIT[verdict.state], verdict_line)
 
 
 def _reject_bad_runner_combo(args):
@@ -2880,6 +2880,14 @@ def _add_prompt_round_args(sub):
                    help="本轮一个 skill 都不给")
 
 
+class _RunnerArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # 子 parser 同样继承此类：在进入 cmd_* 前被拒，也须由 main 留下调用结论。
+        # 提示仍用 argparse 给出的原因与用法，不另写参数校验。
+        self.print_usage(sys.stderr)
+        reject(f"{self.prog}: error: {message}")
+
+
 def build_parser():
     """命令行契约。
 
@@ -2889,7 +2897,7 @@ def build_parser():
     免费的**，不用自己写一遍校验和提示。
     另一半理由在判据那边：那些是纯函数，单测跑一遍零 codex token。
     """
-    p = argparse.ArgumentParser(
+    p = _RunnerArgumentParser(
         prog="sub-agent-runner",
         description="把执行类任务派给 codex 或 DeepSeek 子代理后台跑。"
                     "用 Bash(run_in_background: true) 启动 run。")
@@ -3000,12 +3008,14 @@ def main():
     # 而 Rejected 就是 SystemExit(2)——漏在 try 外面它会直接逃出去，退出码还是 2
     # 但 message 全丢，调用方拿到一个没有任何解释的 2。对 agent 调用方，
     # 「有码无话」是最救不回来的一种失败。
-    # argparse 自己的参数错误不是 Rejected（它自己已经把话写到 stderr 了），
-    # 照旧原样逃出去，这里不拦。
+    # 参数错误与预检拒绝共用这个出口。即使扫描前已经退出、stderr 又被重定向，
+    # end-call 仍可从记录取到退出码 2 和拒绝原因；查询/停止不发布派活结论。
     try:
         args = build_parser().parse_args()
         return args.func(args)
     except Rejected as e:
+        if len(sys.argv) > 1 and sys.argv[1] in _KINDS:
+            write_bash_call_result(e.code, e.message)
         print(e.message, file=sys.stderr)
         return e.code
 

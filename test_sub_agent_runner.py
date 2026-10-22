@@ -6683,9 +6683,51 @@ class TestBackgroundRunner(_HomeSandbox):
                 records = list(self.runtime.rglob("*.done"))
                 self.assertEqual(len(records), ("run", "resume", "interrupt-and-resume").index(command) + 1)
                 result = json.loads(next(p for p in records if p not in getattr(self, "seen", set())).read_text())
-                self.assertEqual((result["task"], result["exit_code"]), ("t", 1))
+                self.assertEqual(result["exit_code"], 1)
                 self.assertIn("failed", result["verdict"])
                 self.seen = set(records)
+
+    def test_后台预检拒绝也写退出码和原因(self):
+        shared = ca.shared_skill_root()
+        shared.mkdir(parents=True)
+        (shared / "intruder").write_text("破坏隔离")
+        missing_brief = self._argv("run")
+        missing_brief[missing_brief.index("--brief") + 1] = str(self.home / "missing.md")
+        for label, argv, reason in (
+                ("brief", missing_brief, "不是文件"),
+                ("resume", self._argv("resume"), "没有这个任务"),
+                ("interrupt", self._argv("interrupt-and-resume"), "没有这个任务"),
+                ("isolation", self._argv("run"), "隔离不成立")):
+            with self.subTest(label=label):
+                call_id = "preflight-" + label
+                result = subprocess.run([sys.executable, ca.__file__, *argv],
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="background:" + call_id),
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(reason, result.stderr)
+                records = list(ca.bash_call_directory(call_id).glob("*.done"))
+                self.assertEqual(len(records), 1, "提前拒绝没留下调用结论")
+                record = json.loads(records[0].read_text())
+                self.assertEqual(record["exit_code"], 2)
+                self.assertIn(reason, record["verdict"])
+
+    def test_后台参数解析拒绝也写退出码和原因(self):
+        for command in ("run", "resume", "interrupt-and-resume"):
+            with self.subTest(command=command):
+                argv = self._argv(command)
+                argv[argv.index("--effort") + 1] = "ultra"
+                call_id = "arguments-" + command
+                result = subprocess.run([sys.executable, ca.__file__, *argv],
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="background:" + call_id),
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--effort", result.stderr)
+                records = list(ca.bash_call_directory(call_id).glob("*.done"))
+                self.assertEqual(len(records), 1, "argparse 拒绝没留下调用结论")
+                record = json.loads(records[0].read_text())
+                self.assertEqual(record["exit_code"], 2)
+                self.assertIn("--effort", record["verdict"])
+                self.assertIn("ultra", record["verdict"])
 
     def test_没有标记或格式不对仍运行且不写调用目录(self):
         for marker in (None, "foreground", "foreground:", "background:", "invalid:call"):
@@ -6698,11 +6740,12 @@ class TestBackgroundRunner(_HomeSandbox):
                     self.assertEqual(args.func(args), 1)
                 self.assertEqual(list(self.runtime.iterdir()), [])
 
-    def test_status和stop不受前台标记影响(self):
-        for command in ("status", "stop"):
-            with self.subTest(command=command):
+    def test_status和stop不写调用结论也不受前台标记影响(self):
+        for command, mode in ((command, mode) for command in ("status", "stop")
+                              for mode in ("foreground", "background")):
+            with self.subTest(command=command, mode=mode):
                 result = subprocess.run([sys.executable, ca.__file__, *self._argv(command)],
-                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL="foreground:query"),
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL=mode + ":query"),
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("没有这个任务", result.stderr)
@@ -6740,7 +6783,7 @@ class TestBackgroundEndCall(_HomeSandbox):
             "    time.sleep(0.01)\n"
             "code = int(args[args.index('--exit-code') + 1])\n"
             "line = '[sub-agent-runner] ' + task + ': fixture verdict ' + str(code)\n"
-            "runner.write_bash_call_result(task, code, line)\n"
+            "runner.write_bash_call_result(code, line)\n"
             "(state / (task + '.finished')).touch()\n"
             "print(line, flush=True)\n"
             "sys.exit(code)\n")
@@ -6861,6 +6904,33 @@ class TestBackgroundEndCall(_HomeSandbox):
         self.assertEqual(code, 1, output)
         self.assertIn("fast: fixture verdict 1", output)
         self.assertNotIn("等它们跑完", output)
+
+    def test_真实runner扫描前预检或参数拒绝也进通知(self):
+        # wait 确保真实 runner 已退出，echo 又把原命令的退出码变成 0；此时只有
+        # 调用结论能带回拒绝。所有分支均在启动代理之前退 2，且继承模块 PATH 防线。
+        run = ["run", "--task", "t", "--runner", "codex", "--account", "default",
+               "--dir", str(self.home), "--brief", str(self.home / "missing.md"),
+               "--effort", "max", "--no-skill"]
+        invalid = list(run)
+        del invalid[invalid.index("--brief"):invalid.index("--brief") + 2]
+        for label, argv, reason in (
+                ("brief", run, "不是文件"),
+                ("resume", ["resume", "t", "--brief", str(self.home / "missing.md"),
+                            "--effort", "max", "--no-skill"], "没有这个任务"),
+                ("interrupt", ["interrupt-and-resume", "t", "--brief", str(self.home / "missing.md"),
+                               "--effort", "max", "--no-skill"], "没有这个任务"),
+                ("arguments", invalid, "--brief")):
+            with self.subTest(label=label):
+                call_id = "rejected-" + label
+                command = shlex.join([sys.executable, ca.__file__, *argv])
+                body = command + " > /dev/null 2>&1 & wait; echo dispatched"
+                code, output = self._finish(self._start(body, call_id, True))
+                self.assertEqual(code, 1, output)
+                self.assertIn("dispatched", output)
+                self.assertIn(reason, output)
+                self.assertNotIn("等它们跑完", output)
+                self.assertNotIn("end-call 出错", output)
+                self.assertFalse(ca.bash_call_directory(call_id).exists())
 
     def test_一个已失败另一个仍活着_两个结论都汇总(self):
         self._release("fast")

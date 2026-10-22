@@ -139,6 +139,8 @@ def end_call(original_code):
         print(runner.FOREGROUND_REFUSAL)
     worst, seen = "success", set()
     states_by_code = {code: state for state, code in runner._STATES}
+    # 2 是参数/预检拒绝，不是任务状态；调用汇总按失败计，原命令非零仍照旧优先。
+    states_by_code[runner.USAGE_ERROR] = "failed"
     # 必须等完再读全部记录，包括扫描前就已失败退出的任务。正确直接派活也会
     # 多打印一行结论；接受重复，避免另加「是否已经呈现」的状态或启动登记。
     for path in sorted(directory.glob("*.done")):
