@@ -2291,7 +2291,7 @@ class TestAccountChoicesGuards(_HomeSandbox):
                 self.assertIn(name, got.exception.message)
                 self.assertIn(str(d), got.exception.message, "要点名是哪个目录")
                 self.assertIn(str(ca.isolation_home(ca.CODEX, name)), got.exception.message,
-                              "没告诉用户隔离目录也要一起改名，照做之后任务会从 status 消失")
+                              "没告诉用户隔离目录也要一起改名")
                 d.rmdir()
 
     def test_候选各自指向不同的隔离目录(self):
