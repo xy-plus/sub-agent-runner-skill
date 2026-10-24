@@ -88,7 +88,10 @@ def find_call_runners(marker):
                 continue
             argv = [os.fsdecode(part) for part in (process / "cmdline").read_bytes().split(b"\0")[:-1]]
             index = python_script_index(argv)
-            if index is None or index + 1 >= len(argv) or argv[index + 1] not in runner._KINDS:
+            if index is None or index + 1 >= len(argv) or argv[index + 1] not in runner.COMMANDS:
+                continue
+            # 前台查询不发布后台结论；只追踪需要前台拒绝的三种派活入口。
+            if marker.startswith("foreground:") and argv[index + 1] not in runner._KINDS:
                 continue
             script = pathlib.Path(argv[index])
             if not script.is_absolute():

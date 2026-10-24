@@ -512,22 +512,24 @@ class TestRunsOutputDirectory(_RunsSandbox):
                 self.assertEqual(self.snapshot(), before)
 
     def test_invalid_output_publishes_only_background_call_results(self):
-        for output in ([], ["--output-dir", str(self.workdir)]):
-            with self.subTest(output=output), mock.patch.dict(os.environ, {
-                    ca.BASH_CALL_ENV: "background:invalid-output",
-                    "XDG_RUNTIME_DIR": str(self.home / "runtime")}):
-                before = self.snapshot()
-                code, text = self.invoke(self.command("run") + output)
-                self.assertEqual(code, 2, text)
-                records = list(ca.bash_call_directory("invalid-output").glob("*.done"))
-                self.assertEqual(len(records), 1, "目录校验失败仍须留下后台结论")
-                result = json.loads(records[0].read_text())
-                self.assertEqual(result["exit_code"], 2)
-                self.assertIn("--output-dir", result["verdict"])
-                self.assertEqual({path: value for path, value in self.snapshot().items()
-                                  if path.partition("/")[0] != "runtime"},
-                                 {path: value for path, value in before.items()
-                                  if path.partition("/")[0] != "runtime"})
+        for name in ("run", "status", "resume", "interrupt-and-resume", "stop"):
+            for label, output in (("missing", []), ("outside", ["--output-dir", str(self.workdir)])):
+                call_id = f"invalid-output-{name}-{label}"
+                with self.subTest(command=name, case=label), mock.patch.dict(os.environ, {
+                        ca.BASH_CALL_ENV: "background:" + call_id,
+                        "XDG_RUNTIME_DIR": str(self.home / "runtime")}):
+                    before = self.snapshot()
+                    code, text = self.invoke(self.command(name) + output)
+                    self.assertEqual(code, 2, text)
+                    records = list(ca.bash_call_directory(call_id).glob("*.done"))
+                    self.assertEqual(len(records), 1, "目录校验失败仍须留下后台结论")
+                    result = json.loads(records[0].read_text())
+                    self.assertEqual(result["exit_code"], 2)
+                    self.assertIn("--output-dir", result["verdict"])
+                    self.assertEqual({path: value for path, value in self.snapshot().items()
+                                      if path.partition("/")[0] != "runtime"},
+                                     {path: value for path, value in before.items()
+                                      if path.partition("/")[0] != "runtime"})
 
     def test_detached_output_rejection_exits_before_guard_scan_and_still_reports_two(self):
         guard = pathlib.Path(ca.__file__).with_name("background_guard.py")
@@ -540,7 +542,7 @@ class TestRunsOutputDirectory(_RunsSandbox):
             ("inbox", ["--output-dir", str(inbox)], False),
             ("unset-root", ["--output-dir", str(self.output_dir)], True),
         )
-        for name in ("run", "resume", "interrupt-and-resume"):
+        for name in ("run", "status", "resume", "interrupt-and-resume", "stop"):
             for label, output, unset_root in cases:
                 with self.subTest(command=name, case=label):
                     call_id = f"output-{name}-{label}"
@@ -693,7 +695,7 @@ runner, descriptor = sys.argv[1], int(sys.argv[2])
 ctypes.CDLL(None).prctl(15, b"codex" if runner == "codex" else b"claude", 0, 0, 0)
 signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 info = os.open("child-info.json", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=descriptor)
-os.write(info, json.dumps({"pid": os.getpid(), "fd": descriptor}).encode())
+os.write(info, json.dumps({"pid": os.getpid()}).encode())
 os.close(info)
 print("session id: 01a0b408-f718-7ff3-8123-d5202551acba", flush=True)
 while True:
@@ -897,18 +899,25 @@ while True:
         descriptor = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         processes = []
-        marker = "background:runs-task-names"
         try:
-            for command in ("run", "resume", "interrupt-and-resume"):
-                argv = self.command(command) + ["--output-dir", str(self.output_dir)]
-                argv[argv.index("--task") + 1 if command == "run" else 1] = command + "-task"
-                proc = subprocess.Popen([sys.executable, ca.__file__, *argv],
-                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL=marker),
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                processes.append(proc)
-            expected = {"run-task", "resume-task", "interrupt-and-resume-task"}
-            _wait_for(self, lambda: {task for task, _ in guard.find_call_runners(marker).values()} == expected,
-                      "护栏没有从新命令行取到正确任务名")
+            # status 不取写锁；让真实元数据读取停在 FIFO，保证扫描时五个命令都还活着。
+            (self.storage / "tasks").mkdir(parents=True)
+            fifo = self.storage / "tasks/status-task.json"
+            os.mkfifo(fifo)
+            for mode, expected in (
+                    ("background", {"run-task", "status-task", "resume-task", "interrupt-and-resume-task", "stop-task"}),
+                    ("foreground", {"run-task", "resume-task", "interrupt-and-resume-task"})):
+                with self.subTest(mode=mode):
+                    marker = mode + ":runs-task-names"
+                    for command in ("run", "status", "resume", "interrupt-and-resume", "stop"):
+                        argv = self.command(command) + ["--output-dir", str(self.output_dir)]
+                        argv[argv.index("--task") + 1 if command == "run" else 1] = command + "-task"
+                        proc = subprocess.Popen([sys.executable, ca.__file__, *argv],
+                                                env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL=marker),
+                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        processes.append(proc)
+                    _wait_for(self, lambda: {task for task, _ in guard.find_call_runners(marker).values()} == expected,
+                              "护栏没有按调用模式取到正确任务名")
         finally:
             for proc in processes:
                 if proc.poll() is None:
@@ -7177,17 +7186,28 @@ class TestBackgroundRunner(_HomeSandbox):
                     self.assertEqual(args.func(args), 1)
                 self.assertEqual(list(self.runtime.iterdir()), [])
 
-    def test_status和stop不写调用结论也不受前台标记影响(self):
+    def test_status和stop成功不受前台标记影响_后台结论能被护栏收集(self):
+        import background_guard as guard
+        ca.write_meta(self.storage, "t", _full_meta("t", dir=str(self.workdir)))
+        (self.storage / "reports/t.md").write_text("done")
         for command, mode in ((command, mode) for command in ("status", "stop")
                               for mode in ("foreground", "background")):
             with self.subTest(command=command, mode=mode):
-                result = subprocess.run([sys.executable, ca.__file__, *self._argv(command)],
-                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL=mode + ":query"),
-                                        text=True, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode, 2)
-                self.assertIn("没有这个任务", result.stderr)
-                self.assertNotIn("这次 Bash 调用是前台", result.stderr)
-        self.assertEqual(list(self.runtime.iterdir()), [])
+                call_id = f"query-{command}-{mode}"
+                with mock.patch.dict(os.environ, {ca.BASH_CALL_ENV: mode + ":" + call_id}):
+                    result = subprocess.run([sys.executable, ca.__file__, *self._argv(command)],
+                                            text=True, capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertNotIn("这次 Bash 调用是前台", result.stderr)
+                    records = list(ca.bash_call_directory(call_id).glob("*.done"))
+                    if mode == "background":
+                        self.assertEqual(len(records), 1)
+                        self.assertEqual(json.loads(records[0].read_text())["exit_code"], 0)
+                        with _capture_stdout():
+                            self.assertEqual(guard.end_call(0), 0)
+                    else:
+                        self.assertEqual(records, [])
+        self.assertEqual(list(self.runtime.rglob("*.done")), [])
 
 
 class TestBackgroundEndCall(_HomeSandbox):

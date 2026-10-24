@@ -218,6 +218,7 @@ _KINDS = ("run", "resume", "interrupt-and-resume")
 
 # hook 与 runner 共用一次 Bash 调用的协议；不把「加载过 skill」变成启动凭证。
 # 没有有效标记时照常运行，用户明确接受未注册/脚本失效及刻意清标记的边界。
+COMMANDS = _KINDS + ("status", "stop")
 BASH_CALL_ENV = "SUB_AGENT_RUNNER_BASH_CALL"
 FOREGROUND_REFUSAL = ("这次 Bash 调用是前台：会占住对话、跑完也没有通知；"
                       "用 `run_in_background: true` 重新发这条命令")
@@ -2942,12 +2943,16 @@ def main():
     # 但 message 全丢，调用方拿到一个没有任何解释的 2。对 agent 调用方，
     # 「有码无话」是最救不回来的一种失败。
     # 参数错误与预检拒绝共用这个出口。即使扫描前已经退出、stderr 又被重定向，
-    # end-call 仍可从记录取到退出码 2 和拒绝原因；查询/停止不发布派活结论。
+    # end-call 仍可从记录取到退出码 2 和拒绝原因，范围与护栏扫描的五条命令一致。
     try:
         args = build_parser().parse_args()
-        return args.func(args)
+        code = args.func(args)
+        if args.cmd not in _KINDS:
+            # 查询/停止也可能被护栏等待；正常结束同样须留结论，不能被当成异常退出。
+            write_bash_call_result(code, f"[sub-agent-runner] {shlex.join(sys.argv[1:])}：退出码 {code}")
+        return code
     except Rejected as e:
-        if len(sys.argv) > 1 and sys.argv[1] in _KINDS:
+        if len(sys.argv) > 1 and sys.argv[1] in COMMANDS:
             write_bash_call_result(e.code, e.message)
         print(e.message, file=sys.stderr)
         return e.code
