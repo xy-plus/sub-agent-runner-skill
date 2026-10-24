@@ -947,7 +947,7 @@ class TestLegacyRunsMigration(_RunsSandbox):
                 while True:
                     old_wrappers = any(proc.poll() is None for proc in wrappers)
                     old_agents = any(ca.find_task_agent_pid(meta["runner"], self.legacy, meta["task"])
-                                     is not None for _, meta in ca.all_metas(self.legacy))
+                                     is not None for meta in ca.all_metas(self.legacy))
                     if not old_wrappers and not old_agents:
                         break
                     waiting.set()
@@ -2595,10 +2595,9 @@ class TestRunnerAxis(_HomeSandbox):
 
     def test_deepseek的任务status查得到(self):
         ca.write_meta(self.storage, "dst", _full_meta("dst", runner="deepseek", account=None))
-        home, meta = ca.find_meta(self.storage, "dst")
-        self.assertEqual(home, self.storage)
+        meta = ca.find_meta(self.storage, "dst")
         self.assertEqual(meta["runner"], "deepseek")
-        self.assertIn("dst", [meta["task"] for _, meta in ca.all_metas(self.storage)])
+        self.assertIn("dst", [meta["task"] for meta in ca.all_metas(self.storage)])
 
     def test_deepseek隔离目录不建任务文件夹(self):
         home = ca.ensure_isolation(ca.DEEPSEEK, None)
@@ -3528,17 +3527,14 @@ class TestFixedArgs(unittest.TestCase):
 
 
 class TestMeta(_HomeSandbox):
-    def test_元数据从指定产物目录读回_home走返回值不是魔法键(self):
+    def test_元数据从指定产物目录原样读回(self):
         d = self.task_storage(ca.CODEX, "default")
-        ca.write_meta(d, "t1", _full_meta("t1", dir="/abs/x"))
-        home, meta = ca.find_meta(self.storage, "t1")
-        self.assertEqual(meta["dir"], "/abs/x")
-        self.assertEqual(home, d)
-        # 魔法键意味着每个写回元数据的地方都得记得剥掉它
-        self.assertNotIn("_home", meta)
+        meta = _full_meta("t1", dir="/abs/x")
+        ca.write_meta(d, "t1", meta)
+        self.assertEqual(ca.find_meta(self.storage, "t1"), meta)
 
-    def test_查不到返回一对None(self):
-        self.assertEqual(ca.find_meta(self.storage, "不存在的任务"), (None, None))
+    def test_查不到返回None(self):
+        self.assertIsNone(ca.find_meta(self.storage, "不存在的任务"))
 
     def test_元数据缺字段就拒绝_不给默认值圆场(self):
         d = self.task_storage(ca.CODEX, "default")
@@ -3552,19 +3548,22 @@ class TestMeta(_HomeSandbox):
         (other / "tasks").mkdir(parents=True)
         ca.write_meta(self.storage, "t", _full_meta("t", account="default"))
         ca.write_meta(other, "t", _full_meta("t", account="acct2"))
-        self.assertEqual(ca.find_meta(self.storage, "t")[1]["account"], "default")
-        self.assertEqual(ca.find_meta(other, "t")[1]["account"], "acct2")
+        self.assertEqual(ca.find_meta(self.storage, "t")["account"], "default")
+        self.assertEqual(ca.find_meta(other, "t")["account"], "acct2")
 
     def test_列出全部任务(self):
         d = self.task_storage(ca.CODEX, "default")
         for name in ("a", "b"):
             ca.write_meta(d, name, _full_meta(name))
-        self.assertEqual(sorted(m["task"] for _, m in ca.all_metas(self.storage)), ["a", "b"])
+        self.assertEqual(ca.all_metas(self.storage), [_full_meta("a"), _full_meta("b")])
 
     def test_坏元数据单独报告而其他任务仍可见(self):
         (self.storage / "tasks/broken.json").write_text('{"task":"broken"}')
         ca.write_meta(self.storage, "good", _full_meta("good"))
         (self.storage / "reports/good.md").write_text("done")
+        metas = ca.all_metas(self.storage)
+        self.assertIsInstance(metas[0], ca.Rejected)
+        self.assertEqual(metas[1], _full_meta("good"))
         args = ca.build_parser().parse_args(["status", "--output-dir", str(self.output_dir)])
         with _capture_stdout() as output:
             self.assertEqual(ca.cmd_status(args), 2)
@@ -3633,7 +3632,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
         self.assertTrue(leftovers, "前提不成立：没留下残片，这条测不到任何东西")
         # 残片要是被 *.json 扫进去，它自己就成了一份「缺字段的坏元数据」，
         # 而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）
-        self.assertEqual([m["task"] for _, m in ca.all_metas(self.storage)], ["good"],
+        self.assertEqual([m["task"] for m in ca.all_metas(self.storage)], ["good"],
                          f"残片 {leftovers} 被当成任务扫进来了")
 
 
@@ -4702,7 +4701,8 @@ class TestRunGuards(_HomeSandbox):
         所以这里钉两件事：① 入口闸独有的那句下一步建议；
         ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
         """
-        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t", _full_meta("t"))
+        meta = _full_meta("t")
+        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t", meta)
         with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
@@ -4711,6 +4711,7 @@ class TestRunGuards(_HomeSandbox):
         self.assertIn("换个名字或先", message, "入口那道闸独有的下一步建议没了")
         self.assertNotIn("等了", message,
                          "拒绝来自 run_codex 里等满超时那条路，不是入口这道闸")
+        self.assertEqual(ca.all_metas(self.storage), [meta], "拒跑不许增删或修改元数据")
 
     def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
@@ -4951,7 +4952,7 @@ class TestRunnerCLI(_HomeSandbox):
             ca.cmd_run(self._args("deepseek", None, "max"))
         self.assertIn("runner", got.exception.message)
         self.assertTrue(ca.meta_path(codex_home, "t").exists(), "被拒的调用不许动旧元数据")
-        self.assertEqual(ca.find_meta(self.storage, "t")[0], codex_home)
+        self.assertEqual(ca.find_meta(self.storage, "t")["runner"], ca.CODEX)
 
     def test_撞额度上限那一支只对codex(self):
         """deepseek 没有账号维度，`accounts_by_availability()` / `write_usage_limit`
@@ -5144,7 +5145,7 @@ class TestAutoAccountPick(_HomeSandbox):
                     self._run(account, self.FINE)
                 self.assertEqual(got.exception.code, 2)
                 self.assertIn("runner", got.exception.message)
-                self.assertEqual(ca.find_meta(self.storage, "t"), (old_home, old_meta))
+                self.assertEqual(ca.find_meta(self.storage, "t"), old_meta)
                 after = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
                          for path in self.home.rglob("*")}
                 self.assertEqual(after, before)
@@ -5378,16 +5379,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(code, ca.EXIT["failed"])
         self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct3")), self.RESET_AT)
 
-    def test_强制模式下同名任务属于别的账号_仍然拒跑(self):
-        # 这道护栏在强制模式下**原样保留**：同一个名字出现在两个隔离目录里时，
-        # find_meta 数出两份并拒绝，另一份成了再也够不着的孤儿元数据。
-        ca.write_meta(self.task_storage(ca.CODEX, "acct2"), "t",
-                      ca.new_meta("t", ca.CODEX, "acct2", "/tmp", "low", ()))
-        with self.assertRaises(ca.Rejected) as got:
-            ca.cmd_run(self._args("acct3"))
-        self.assertIn("acct2", got.exception.message)
-
-    # ── 迁移 ────────────────────────────────────────────────────────────
+    # ── 换账号 ──────────────────────────────────────────────────────────
 
     def test_auto换账号只更新原产物目录的元数据(self):
         ca.write_meta(self.storage, "t", _full_meta("t", account="acct3"))
@@ -5395,8 +5387,7 @@ class TestAutoAccountPick(_HomeSandbox):
         code = self._run(ca.AUTO, self.FINE)
         self.assertEqual(code, 0)
         self.assertEqual(self.spawned, ["acct2"])
-        home, meta = ca.find_meta(self.storage, "t")
-        self.assertEqual(home, self.storage)
+        meta = ca.find_meta(self.storage, "t")
         self.assertEqual(meta["account"], "acct2")
         self.assertTrue(before.is_file())
         self.assertEqual(len(ca.all_metas(self.storage)), 1)
@@ -5413,51 +5404,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertIn("acct3", self.printed)
         self.assertIn("acct2", self.printed)
 
-    def test_选中的账号上还有活着的codex_要在删旧元数据之前就拒(self):
-        """**I6 回归锁：迁移的 unlink 不许排在一个可能失败的步骤前面。**
-
-        `run_codex` 的注释写着「这一等排在 write_meta / clear_report 之前，
-        所以超时**不留半个状态**……别把它挪到后面去」。迁移路径从**外面**破了它：
-        旧元数据已经删掉、新的还没写，而 `_wait_previous_round_ends` 等满 60 秒
-        之后 `reject` ——任务从 status / stop / resume 三条路上整个消失。
-
-        入口那道闸原本只查 `old_home`，查不到选中的那个 home 上的 codex。
-        为什么查 `find_agent_pid` 就够（而不必把整个 `_wait_previous_round_ends`
-        搬出来）：能走到迁移，说明 `find_meta` 只数出**一份**元数据（两份它当场拒），
-        于是选中的那个 home 上 `tasks/<任务>.json` 必不存在，
-        `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
-        就只剩 `find_agent_pid` 这一条。
-        """
-        ca.write_meta(self.task_storage(ca.CODEX, "acct3"), "t",
-                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
-        选中的报告 = ca._report_path(self.task_storage(ca.CODEX, "acct2"), "t")
-        self.assertEqual(ca.accounts_by_availability()[0], "acct2",
-                         "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
-
-        def 只有acct2上有活的(runner, home, task):
-            return 4242 if ca._report_path(home, task) == 选中的报告 else None
-
-        with mock.patch.object(ca, "find_task_agent_pid", 只有acct2上有活的):
-            with self.assertRaises(ca.Rejected) as got:
-                ca.cmd_run(self._args(ca.AUTO))
-        self.assertIn("还在跑", got.exception.message)
-        self.assertTrue(ca.meta_path(self.storage, "t").exists(),
-                        "拒绝发生在删旧元数据之后——任务在半路上消失了")
-        self.assertEqual(len(ca.all_metas(self.storage)), 1, "元数据既不许没有，也不许有两份")
-
-    def test_任务住的那个账号掉了登录态_也能迁移走(self):
-        """**这条是 v2 的一个反例，上一轮实测到的，留着当回归锁。**
-
-        v2 写过「auto 不需要跨账号同名护栏：任务已有的那个家排在最前，
-        第一轮就对上」。登录态过滤会把该账号整个剔出候选
-        （`accounts_by_availability`），于是「排在最前」根本轮不上：
-        第一轮就写到别的 home，旧的那份还在，`find_meta` 当场数出两份并拒绝
-        ——`status t` / `stop t` 从此全退 2，任务既停不掉也查不了。
-        codex 的 access_token 只活十天，这条路很好走。
-
-        v4 里「排在最前」这个键已经整个删掉了，但迁移这一步必须留着，
-        而且要对**掉了登录态**这种够不着旧账号的情形照样成立。
-        """
+    def test_原账号无登录态时auto仍能换号(self):
         ca.write_meta(self.task_storage(ca.CODEX, "acct3"), "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
@@ -5465,8 +5412,9 @@ class TestAutoAccountPick(_HomeSandbox):
                          "前提不成立：掉了登录态的账号仍在候选里")
         code = self._run(ca.AUTO, self.FINE)
         self.assertEqual(code, ca.EXIT["success"])
-        self.assertEqual(len(ca.all_metas(self.storage)), 1, "不许留下两份元数据")
-        self.assertIn("acct3", self.printed, "要点名是哪个账号够不着了")
+        self.assertEqual(self.spawned, ["acct2"])
+        self.assertEqual(len(ca.all_metas(self.storage)), 1, "换号后仍只有原任务")
+        self.assertIn("acct3", self.printed, "要点名原账号")
 
 
 class TestResumeGuards(_HomeSandbox):

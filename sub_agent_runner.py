@@ -1709,9 +1709,9 @@ def find_meta(home, task):
     """只查指定产物目录；账号由元数据选，与文件位置无关。"""
     path = meta_path(home, task)
     try:
-        return home, _load_meta(path)
+        return _load_meta(path)
     except FileNotFoundError:
-        return None, None
+        return None
 
 
 def all_metas(home):
@@ -1719,11 +1719,11 @@ def all_metas(home):
     out = []
     for path in sorted((home / "tasks").glob("*.json")):
         try:
-            found_home, meta = find_meta(home, path.stem)
+            meta = find_meta(home, path.stem)
             if meta is not None:
-                out.append((found_home, meta))
+                out.append(meta)
         except Rejected as error:
-            out.append((None, error))
+            out.append(error)
     return out
 
 
@@ -2436,7 +2436,7 @@ def cmd_run(args, home, output_fd):
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
-    _, old_meta = find_meta(home, args.task)
+    old_meta = find_meta(home, args.task)
 
     if args.account == AUTO:
         candidates = accounts_by_availability()
@@ -2533,17 +2533,17 @@ def record_usage_limit(home, meta, this_round, verdict, continuing):
 @_with_output_dir
 def cmd_status(args, home, output_fd):
     if args.task:
-        home, meta = find_meta(home, args.task)
+        meta = find_meta(home, args.task)
         if meta is None:
             reject(f"没有这个任务：{args.task}")
-        rows = [(home, meta)]
+        rows = [meta]
     else:
         rows = all_metas(home)
     if not rows:
         print("还没有任何任务")
         return EXIT["success"]
     worst, has_error = "success", False
-    for home, meta in rows:
+    for meta in rows:
         if isinstance(meta, Rejected):
             print(meta.message)
             has_error = True
@@ -2656,7 +2656,7 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills, output_fd)
 @_with_output_dir
 def cmd_resume(args, home, output_fd):
     require_background_call()
-    home, meta = find_meta(home, args.task)
+    meta = find_meta(home, args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     # resume 之前必须确认真的退出了：对还在跑的会话 resume，报的错和 SIGTERM 锁死
@@ -2709,7 +2709,7 @@ def cmd_interrupt_and_resume(args, home, output_fd):
     """
     require_background_call()
     # ────── 五道闸 ──────
-    home, meta = find_meta(home, args.task)                # 1. 任务存在？
+    meta = find_meta(home, args.task)                # 1. 任务存在？
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     check_can_resume(args.task, meta, args.brief)   # 2/3/4/5. session id / 目录 / brief 是文件 / brief 不自带兜底句
@@ -2747,7 +2747,7 @@ def cmd_interrupt_and_resume(args, home, output_fd):
 
 @_with_output_dir
 def cmd_stop(args, home, output_fd):
-    home, meta = find_meta(home, args.task)
+    meta = find_meta(home, args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     pid = find_task_agent_pid(meta["runner"], home, args.task)
