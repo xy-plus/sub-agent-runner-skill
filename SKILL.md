@@ -6,7 +6,7 @@ description: 把任务派给 codex 或 DeepSeek 子代理后台跑，省 claude 
 # sub-agent-runner
 
 **本 skill 一旦激活，默认就不再开 claude 原生子代理了**，
-改用本 skill 调用其他 agent，Prompt 写进 `brief.md`。
+改用本 skill 调用其他 agent，Prompt 写进这件事目录里的 `brief.md`。
 
 命令怎么拼、隔离目录怎么建、进程怎么判活、成败怎么判、信号怎么发，全部由
 `sub_agent_runner.py` 保证，本文件只讲**人／模型才能决定的事**。
@@ -14,9 +14,16 @@ description: 把任务派给 codex 或 DeepSeek 子代理后台跑，省 claude 
 ## 启动：用 `Bash(run_in_background: true)`
 
 ```bash
-sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md --effort max --account auto --no-skill
-sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brief brief.md --effort max     --no-skill
+sub-agent-runner run --task <任务名> --runner codex    --output-dir "$OUTPUT_DIR" --dir /abs/repo --brief "$OUTPUT_DIR/brief.md" --effort max --account auto --no-skill
+sub-agent-runner run --task <任务名> --runner deepseek --output-dir "$OUTPUT_DIR" --dir /abs/repo --brief "$OUTPUT_DIR/brief.md" --effort max     --no-skill
 ```
+
+`OUTPUT_DIR` 是已经建好的 `<RUNS_ROOT>/<项目目录名>/<年月日-时分秒>-<主题>`，
+给的是这件事的目录本身。`RUNS_ROOT` 来自全局 settings 的环境变量；项目目录名
+直接取本会话记录在 `~/.claude/projects/` 下所在的目录名（以 `-` 开头）。
+任务元数据、报告、日志在其中的 `sub-agent-runner/{tasks,reports,logs}/`；
+brief 和 agent 自己的产物放在这件事目录里，工具名子目录归对应工具。
+同一件事可以同时有 `xy-goal/` 契约和多个 runner 任务。
 
 带值参数**一个都别省**（`--account` 例外：它只有 `codex` 要，`deepseek` 给了反而被拒，
 见下表），外加 `--skill`/`--no-skill` 二选一，没有默认值。
@@ -38,8 +45,8 @@ DeepSeek 接入说明以 claude-switch 的 `claude_switch/deepseek.py` 文档字
 `status`／`resume`／`stop`／`interrupt-and-resume` **都不收 `--runner`**（从元数据查出来）。
 组合写错当场退 2 并说清为什么，**不会替你改正**。
 
-任何模式下，**同一个任务名不能换 runner**，要换 runner 就换任务名。
-`--account auto` 只在 codex 账号之间搬同名任务。
+任何模式下，在同一产物目录里，**同一个任务名不能换 runner**，要换 runner 就换任务名。
+`--account auto` 只在 codex 账号之间选号；换号时更新元数据里的账号，任务文件留在原产物目录。
 
 **新任务先用 `--runner codex`**（用户要求，2026-10-03）。
 codex 号全满时，`run` 被拒（退出码 `2`）；这时不等恢复，换个任务名用 `--runner deepseek` 顶上（用户要求，2026-10-23）。
@@ -52,11 +59,15 @@ codex 侧只用 `gpt-6.1-sol`（用户 2026-10-07：「把现在写死的 Luna �
 ## 另外四条命令
 
 ```bash
-sub-agent-runner status [任务名]        # 省略则列出全部
-sub-agent-runner resume <任务名> --brief follow.md --effort max --no-skill
-sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort max --no-skill
-sub-agent-runner stop <任务名>          # 上下文保留，之后还能 resume
+sub-agent-runner status [任务名] --output-dir "$OUTPUT_DIR"  # 省略任务名则列出这个目录里的任务
+sub-agent-runner resume <任务名> --output-dir "$OUTPUT_DIR" --brief "$OUTPUT_DIR/follow.md" --effort max --no-skill
+sub-agent-runner interrupt-and-resume <任务名> --output-dir "$OUTPUT_DIR" --brief "$OUTPUT_DIR/msg.md" --effort max --no-skill
+sub-agent-runner stop <任务名> --output-dir "$OUTPUT_DIR"    # 上下文保留，之后还能 resume
 ```
+
+任务用「产物目录 + 任务名」定位。管理一次性迁移过的旧任务时，`--output-dir` 给
+`<RUNS_ROOT>/<编排者项目目录名>/<年月日-时分秒>-sub-agent-runner-legacy-<账号>/`，
+仍给这件事目录本身，不给里面的 `sub-agent-runner/`。
 
 续跑接的是原来的会话；要换号或换 DeepSeek，用 `run` 重跑，开新会话，不带旧上下文。
 

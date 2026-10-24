@@ -26,22 +26,44 @@ DeepSeek 的 token 和模型由 `claude-deepseek` 每次生成的私有档案经
 不等恢复，换个任务名显式用 `--runner deepseek` 顶上（用户要求，2026-10-23）。
 中途撞限仍以退出码 1 结束，**不自动重跑**，因为那一轮可能已改过文件。
 看过工作目录、必要时补好 brief 后，重发同一条命令即可重新选号；全满仍被拒，
-显式账号名仍只用该号。同一个任务名在任何模式下都不能换 runner；
-auto 只在 codex 账号之间搬元数据，旧家的报告与日志保留，`run` 开新会话、不带旧上下文。
+显式账号名仍只用该号。同一产物目录内，同一个任务名在任何模式下都不能换 runner；
+auto 只在 codex 账号之间选号，换号时更新元数据里的账号；任务文件仍在原产物目录，
+`run` 开新会话、不带旧上下文。
 
 两侧共用同一套任务名、判据、报告和打断／续跑协议：`--runner` 决定派给谁，
 其余四条命令都从元数据查出来，不用再报一遍。
 
 ```bash
-sub-agent-runner run --task <任务名> --runner codex    --dir /abs/repo --brief brief.md \
+OUTPUT_DIR="${RUNS_ROOT:?RUNS_ROOT must be set}/-home-xy-repo/20261024-120000-runner"
+mkdir -p "$OUTPUT_DIR"
+# 把任务说明写进 "$OUTPUT_DIR/brief.md" 后启动：
+sub-agent-runner run --task <任务名> --runner codex    --output-dir "$OUTPUT_DIR" --dir /abs/repo --brief "$OUTPUT_DIR/brief.md" \
                 --effort max --account auto --no-skill
-sub-agent-runner run --task <任务名> --runner deepseek --dir /abs/repo --brief brief.md \
+sub-agent-runner run --task <任务名> --runner deepseek --output-dir "$OUTPUT_DIR" --dir /abs/repo --brief "$OUTPUT_DIR/brief.md" \
                 --effort max --no-skill
-sub-agent-runner status [任务名]
-sub-agent-runner resume <任务名> --brief follow.md --effort max --no-skill
-sub-agent-runner interrupt-and-resume <任务名> --brief msg.md --effort max --no-skill
-sub-agent-runner stop <任务名>
+sub-agent-runner status [任务名] --output-dir "$OUTPUT_DIR"
+sub-agent-runner resume <任务名> --output-dir "$OUTPUT_DIR" --brief "$OUTPUT_DIR/follow.md" --effort max --no-skill
+sub-agent-runner interrupt-and-resume <任务名> --output-dir "$OUTPUT_DIR" --brief "$OUTPUT_DIR/msg.md" --effort max --no-skill
+sub-agent-runner stop <任务名> --output-dir "$OUTPUT_DIR"
 ```
+
+五条命令都给同一个 `--output-dir`：已经存在的
+`<RUNS_ROOT>/<以 - 开头的项目目录名>/<年月日-时分秒>-<主题>/`。
+项目目录名直接取本会话记录在 `~/.claude/projects/` 下所在的目录名，示例里的
+`-home-xy-repo` 和时间主题按本次事情替换。`--dir` 仍是实际工作的仓库或工作树。
+`RUNS_ROOT` 必须已设，路径可以写 `~` 或相对路径，入口会解析为绝对路径。
+
+任务按「产物目录 + 任务名」定位；`status` 省略任务名时只列这个目录里的任务。
+元数据、报告、日志分别在 `sub-agent-runner/tasks/`、`sub-agent-runner/reports/`、
+`sub-agent-runner/logs/`，brief 和 agent 自己的文件也放在这件事目录中，
+工具名子目录归对应工具，因此可以和 `xy-goal/` 契约共处。账号目录只管登录、
+配置、缓存与会话记录。写入命令在 runs 根目录的锁内完成校验和目录句柄交接，
+子代理继承句柄；包装器先退出也能让清理方识别仍在用的事情。
+
+旧任务由合入编排者排空旧包装器和两个后端的子代理后，一次性整体搬迁；本工具
+不在运行时迁移。搬完后管理旧任务，`--output-dir` 给
+`<RUNS_ROOT>/<编排者项目目录名>/<年月日-时分秒>-sub-agent-runner-legacy-<账号>/`，
+不传其中的 `sub-agent-runner/`。元数据字段和内容无需为搬迁改写。
 
 ## 安装
 
@@ -50,11 +72,15 @@ git clone <this repo> ~/.claude/skills/sub-agent-runner
 ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-agent-runner
 ```
 
-仓库须装在 `~/.claude/skills/sub-agent-runner`。然后把下面的 Bash hook 项合并到
-`~/.claude/settings.json` 的 `hooks.PreToolUse` 中，保留已有的其他配置：
+仓库须装在 `~/.claude/skills/sub-agent-runner`。在全局 `~/.claude/settings.json` 的
+`env` 中指定 `RUNS_ROOT`，并把下面的 Bash hook 项合并到 `hooks.PreToolUse`，
+保留已有的其他环境变量和 hook 配置：
 
 ```json
 {
+  "env": {
+    "RUNS_ROOT": "/data/user/xy/runs"
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -90,9 +116,8 @@ hook error，护栏不起作用；已经开着的会话可能要重启才能拿�
 [`codex`](https://github.com/openai/codex) CLI（`--runner codex`）／
 `claude-deepseek`（`--runner deepseek`）。零第三方依赖。
 
-**隔离目录名刻意不跟着改名**：`~/.codex-subagent*` 是现存任务元数据的归属，
-日志里的轮次分隔符和打断标记同理（它们被整行正则匹配）。
-改的只是命令名和文件名——用户敲的是命令名，盘上的东西谁都不该动。
+隔离目录名 `~/.codex-subagent*`、`~/.claude-subagent` 保留，用于各账号的运行环境。
+旧日志里的轮次分隔符和打断标记仍可读取，任务元数据字段不变。
 
 同上：**改名／搬家时，旧命令的 symlink 必须同时废掉。** 只要旧命令还能跑，
 它就还在按老格式写元数据，而少字段的任务会在 `status` 中报错、无法续跑
@@ -111,6 +136,13 @@ hook error，护栏不起作用；已经开着的会话可能要重启才能拿�
 
 ```bash
 python3 -m unittest test_sub_agent_runner -v
+```
+
+整仓测试也可用 `python3 -m unittest discover`。与新版 xy-goal 的联调用例需显式指定
+脚本路径（未指定时跳过，不把旧布局当成联调通过）：
+
+```bash
+XY_GOAL_SCRIPT=/abs/xy-skills/xy-goal/goal.py python3 -m unittest test_sub_agent_runner.TestGoalRunsIntegration -v
 ```
 
 设计上的取舍和踩过的坑都写在代码注释里，贴在防住它的那行旁边——

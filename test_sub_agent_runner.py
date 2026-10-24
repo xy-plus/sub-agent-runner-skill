@@ -96,6 +96,7 @@ interrupt-and-resume、退出码怎么读），正好把这次重写的目的做
 import argparse
 import contextlib
 import datetime
+import fcntl
 import io
 import json
 import os
@@ -352,6 +353,15 @@ def _live_writer(test):
     test.fail("陪练没起来，本测试验证不了任何东西")
 
 
+def _run_round(kind, home, task, meta, make_argv):
+    """底层轮次测试由调用方持有目录句柄；CLI 的握手另用真进程验证。"""
+    descriptor = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return ca.run_codex(kind, home, task, meta, make_argv, descriptor)
+    finally:
+        os.close(descriptor)
+
+
 class _HomeSandbox(unittest.TestCase):
     """把 HOME 整个搬进临时目录。
 
@@ -368,14 +378,24 @@ class _HomeSandbox(unittest.TestCase):
 
     def setUp(self):
         self.home = pathlib.Path(tempfile.mkdtemp())
+        self.runs_root = self.home / "runs"
+        self.output_dir = self.runs_root / "-tests" / "20261024-120000-tests"
+        self.storage = self.output_dir / "sub-agent-runner"
+        for directory in ("tasks", "reports", "logs"):
+            (self.storage / directory).mkdir(parents=True, exist_ok=True)
         self.patches = [
             mock.patch.object(ca.pathlib.Path, "home", staticmethod(lambda: self.home)),
-            mock.patch.dict(os.environ, {"HOME": str(self.home)}),
+            mock.patch.dict(os.environ, {"HOME": str(self.home), "RUNS_ROOT": str(self.runs_root)}),
         ]
         for q in self.patches:
             q.start()
         (self.home / ".codex").mkdir()
         (self.home / ".codex" / "auth.json").write_text("{}")
+
+    def task_storage(self, runner, account):
+        """旧单测同时需要账号隔离与任务文件夹；新契约下两者分别准备。"""
+        ca.ensure_isolation(runner, account)
+        return self.storage
 
     def tearDown(self):
         for q in reversed(self.patches):
@@ -391,6 +411,621 @@ class _HomeSandbox(unittest.TestCase):
                     f.write(log_extra + "\n")
             return mock.DEFAULT
         return spawn
+
+
+class _RunsSandbox(_HomeSandbox):
+    def setUp(self):
+        super().setUp()
+        self.runs_root = self.home / "runs"
+        self.output_dir = self.runs_root / "-home-xy-repo" / "20261024-120000-runner"
+        self.output_dir.mkdir(parents=True)
+        self.storage = self.output_dir / "sub-agent-runner"
+        self.workdir = self.home / "repo"
+        self.workdir.mkdir()
+        self.brief = self.output_dir / "brief.md"
+        self.brief.write_text("执行任务\n")
+        patch = mock.patch.dict(os.environ, {"RUNS_ROOT": str(self.runs_root)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def command(self, name):
+        if name == "run":
+            return ["run", "--task", "t", "--runner", "codex", "--account", "default",
+                    "--dir", str(self.workdir), "--brief", str(self.brief),
+                    "--effort", "max", "--no-skill"]
+        if name in ("resume", "interrupt-and-resume"):
+            return [name, "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"]
+        return [name, "t"]
+
+    def invoke(self, argv):
+        with mock.patch.object(sys, "argv", ["sub-agent-runner", *argv]), \
+                _capture_stdout() as output, contextlib.redirect_stderr(io.StringIO()) as errors:
+            code = ca.main()
+        return code, output["text"] + errors.getvalue()
+
+    def snapshot(self):
+        return {str(path.relative_to(self.home)): (os.readlink(path) if path.is_symlink()
+                else path.read_bytes() if path.is_file() else None)
+                for path in self.home.rglob("*")}
+
+
+class TestRunsOutputDirectory(_RunsSandbox):
+    # 去掉 required=True 会让这些完整的命令进入执行器；不能靠缺其他参数误报成功。
+    def test_all_five_commands_require_output_dir(self):
+        for name in ("run", "status", "resume", "interrupt-and-resume", "stop"):
+            with self.subTest(command=name), _no_codex():
+                before = self.snapshot()
+                code, text = self.invoke(self.command(name))
+                self.assertEqual(code, 2, text)
+                self.assertIn("--output-dir", text)
+                self.assertEqual(self.snapshot(), before)
+
+    # env 若仍由任务存储目录派生，会误用 runs 里的目录当登录目录。
+    def test_run_stores_artifacts_under_output_and_keeps_account_environment(self):
+        def agent(argv, **kwargs):
+            self.assertEqual(kwargs["env"]["CODEX_HOME"], str(self.home / ".codex-subagent"))
+            report = pathlib.Path(argv[argv.index("-o") + 1])
+            self.assertEqual(report, self.output_dir / "sub-agent-runner/reports/t.md")
+            report.write_text("完成\n")
+            return mock.DEFAULT
+
+        with _no_codex() as popen:
+            popen.side_effect = agent
+            code, text = self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
+        self.assertTrue((self.output_dir / "sub-agent-runner/tasks/t.json").is_file())
+        self.assertTrue((self.output_dir / "sub-agent-runner/logs/t.log").is_file())
+        for name in ("tasks", "reports", "logs"):
+            self.assertFalse((self.home / ".codex-subagent" / name).exists())
+
+    # 任何一个入口漏校验都会改元数据、发信号或创建账号目录。
+    def test_invalid_output_is_rejected_without_filesystem_changes(self):
+        missing = self.runs_root / "-home-xy-repo" / "20261024-120001-missing"
+        outside = self.home / ".claude/projects/-home-xy/20261024-120000-runner"
+        wrong_project = self.runs_root / "project" / "20261024-120000-runner"
+        inbox = self.output_dir.parent / "xy-goal-inbox"
+        bad_names = [self.output_dir.parent / name for name in
+                     ("20261024-120000", "20261024-120000-", "2026-10-24-topic", "20261024-12000-topic")]
+        file_output = self.output_dir.parent / "20261024-120000-file"
+        file_output.write_text("not a directory")
+        for path in (outside, wrong_project, inbox, *bad_names):
+            path.mkdir(parents=True)
+        account = self.home / ".codex-subagent"
+        account.mkdir()
+        worktree = self.workdir / ".worktrees/branch"
+        worktree.mkdir(parents=True)
+        for path in (missing, self.workdir, worktree, account, pathlib.Path("/tmp"),
+                     outside, wrong_project, inbox, self.runs_root, self.output_dir.parent,
+                     self.output_dir / "sub-agent-runner", file_output, *bad_names):
+            for name in ("run", "status", "resume", "interrupt-and-resume", "stop"):
+                with self.subTest(path=path, command=name), _no_codex():
+                    before = self.snapshot()
+                    code, text = self.invoke(self.command(name) + ["--output-dir", str(path)])
+                    self.assertEqual(code, 2, text)
+                    self.assertIn("--output-dir", text)
+                    self.assertEqual(self.snapshot(), before)
+
+    def test_runs_root_is_required_for_all_five_commands(self):
+        for name in ("run", "status", "resume", "interrupt-and-resume", "stop"):
+            with self.subTest(command=name), _no_codex(), mock.patch.dict(os.environ):
+                os.environ.pop("RUNS_ROOT", None)
+                before = self.snapshot()
+                code, text = self.invoke(self.command(name) + ["--output-dir", str(self.output_dir)])
+                self.assertEqual(code, 2, text)
+                self.assertIn("RUNS_ROOT", text)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_invalid_output_does_not_publish_background_call_files(self):
+        for output in ([], ["--output-dir", str(self.workdir)]):
+            with self.subTest(output=output), mock.patch.dict(os.environ, {
+                    ca.BASH_CALL_ENV: "background:invalid-output",
+                    "XDG_RUNTIME_DIR": str(self.home / "runtime")}):
+                before = self.snapshot()
+                code, text = self.invoke(self.command("run") + output)
+                self.assertEqual(code, 2, text)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_output_expands_home_and_resolves_relative_paths_and_symlinks(self):
+        link = self.home / "output-link"
+        link.symlink_to(self.output_dir)
+        current = os.getcwd()
+        try:
+            os.chdir(self.home)
+            for path in ("~/output-link", "output-link/../20261024-120000-runner"):
+                with self.subTest(path=path), _no_codex():
+                    code, text = self.invoke(self.command("run") + ["--output-dir", path])
+                    self.assertEqual(code, 1, text)
+                    self.assertTrue((self.storage / "tasks/t.json").is_file())
+        finally:
+            os.chdir(current)
+
+    def test_status_lists_only_the_selected_output_without_creating_directories(self):
+        for directory, task, runner, account in (
+                (self.storage, "local", "codex", "default"),
+                (self.output_dir.parent / "20261024-130000-other/sub-agent-runner", "foreign", "deepseek", None)):
+            (directory / "tasks").mkdir(parents=True)
+            (directory / "reports").mkdir()
+            ca.write_meta(directory, task, _full_meta(task, runner=runner, account=account))
+            (directory / "reports" / f"{task}.md").write_text("done")
+        before = self.snapshot()
+        code, text = self.invoke(["status", "--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
+        self.assertIn("local", text)
+        self.assertNotIn("foreign", text)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_runner_preserves_a_neighboring_goal_contract_byte_for_byte(self):
+        contract = self.output_dir / "xy-goal"
+        (contract / "tasks").mkdir(parents=True)
+        (contract / "tasks/T1.md").write_text("标题: 保留契约事项\n")
+        (contract / "goal.md").write_text("target: 共享这件事\n")
+        before = {p.relative_to(contract): p.read_bytes() for p in contract.rglob("*") if p.is_file()}
+        with _no_codex():
+            self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual({p.relative_to(contract): p.read_bytes() for p in contract.rglob("*") if p.is_file()}, before)
+
+    # 继承必须发生在真正的 Popen 边界，且传的是包装器持有的那个 fd。
+    def test_both_backends_pass_the_open_directory_to_a_python_child(self):
+        real_popen = subprocess.Popen
+        for runner in ("codex", "deepseek"):
+            def spawn(argv, **kwargs):
+                handles = kwargs.get("pass_fds", ())
+                self.assertEqual(len(handles), 1, "子代理必须继承产物目录句柄")
+                handle = handles[0]
+                self.assertEqual(pathlib.Path(os.readlink(f"/proc/self/fd/{handle}")), self.output_dir)
+                root_handle = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    fcntl.flock(root_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(root_handle)
+                script = ("import os,pathlib,sys\n"
+                          "handle = int(sys.argv[1])\n"
+                          "pathlib.Path(sys.argv[2]).write_text(os.readlink(f'/proc/self/fd/{handle}'))\n")
+                return real_popen([sys.executable, "-c", script, str(handle), str(self.output_dir / "child-fd")],
+                                  **kwargs)
+
+            argv = self.command("run")
+            argv[argv.index("--runner") + 1] = runner
+            argv[argv.index("--task") + 1] = runner
+            if runner == "deepseek":
+                index = argv.index("--account")
+                del argv[index:index + 2]
+            with self.subTest(runner=runner), mock.patch.object(ca.subprocess, "Popen", spawn):
+                code, text = self.invoke(argv + ["--output-dir", str(self.output_dir)])
+                self.assertEqual(code, 1, text)  # Python 陪练只测句柄，没有伪造 agent 报告。
+                self.assertEqual((self.output_dir / "child-fd").read_text(), str(self.output_dir))
+
+
+def _holds_directory(pid, directory):
+    """清理方的测试替身：从真实 /proc 看目录句柄，祖先目录也算在用。"""
+    try:
+        entries = pathlib.Path(f"/proc/{pid}/fd").iterdir()
+        for entry in entries:
+            try:
+                target = pathlib.Path(os.readlink(entry))
+                if target == directory or directory in target.parents:
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _wait_for(test, predicate, message):
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.01)
+    test.fail(message)
+
+
+class TestRunsHandshake(_RunsSandbox):
+    CHILD = '''import ctypes,json,os,signal,sys,time
+runner, descriptor = sys.argv[1], int(sys.argv[2])
+ctypes.CDLL(None).prctl(15, b"codex" if runner == "codex" else b"claude", 0, 0, 0)
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+info = os.open("child-info.json", os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=descriptor)
+os.write(info, json.dumps({"pid": os.getpid(), "fd": descriptor}).encode())
+os.close(info)
+print("session id: 01a0b408-f718-7ff3-8123-d5202551acba", flush=True)
+while True:
+    time.sleep(1)
+'''
+
+    def seed(self, runner):
+        for name in ("tasks", "reports", "logs"):
+            (self.storage / name).mkdir(parents=True, exist_ok=True)
+        ca.write_meta(self.storage, "t", _full_meta(
+            "t", runner=runner, account="default" if runner == "codex" else None,
+            dir=str(self.workdir), session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
+
+    def start_wrapper(self, runner, command):
+        if command != "run":
+            self.seed(runner)
+        argv = self.command(command) + ["--output-dir", str(self.output_dir)]
+        if command == "run":
+            argv[argv.index("--runner") + 1] = runner
+            if runner == "deepseek":
+                index = argv.index("--account")
+                del argv[index:index + 2]
+        driver = (
+            "import os,sys,subprocess\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import sub_agent_runner as ca\n"
+            "real_popen, real_isolation = subprocess.Popen, ca.ensure_isolation\n"
+            "def paused_isolation(*args):\n"
+            "    print('handshake', flush=True)\n"
+            "    sys.stdin.readline()\n"
+            "    return real_isolation(*args)\n"
+            "def python_agent(argv, **kwargs):\n"
+            f"    return real_popen([sys.executable, '-c', {self.CHILD!r}, {runner!r}, "
+            "str(kwargs['pass_fds'][0]), *argv[1:]], **kwargs)\n"
+            "ca.ensure_isolation, ca.subprocess.Popen = paused_isolation, python_agent\n"
+            f"sys.argv = ['sub-agent-runner', *{argv!r}]\n"
+            "sys.exit(ca.main())\n")
+        proc = subprocess.Popen([sys.executable, "-c", driver], stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        self.addCleanup(proc.stderr.close)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.stdin.close)
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([proc.stdout], [], [], 0.1)
+            if readable and proc.stdout.readline() == b"handshake\n":
+                break
+            self.assertIsNone(proc.poll(), "包装器未到第一处修改就退出了")
+        else:
+            self.fail("包装器没有完成握手")
+        return proc
+
+    def clean_if_unused(self, pid):
+        descriptor = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
+        trash = self.runs_root / ".runs-cleaner-trash"
+        trash.mkdir(exist_ok=True)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for candidate in (self.output_dir, self.output_dir.parent):
+                if not _holds_directory(pid, candidate):
+                    candidate.rename(trash / candidate.name)
+        finally:
+            os.close(descriptor)
+
+    def test_writer_handshake_precedes_first_change_and_protects_project(self):
+        proc = self.start_wrapper("codex", "run")
+        self.assertFalse(self.storage.exists(), "此时尚未建任何 runner 文件")
+        self.clean_if_unused(proc.pid)
+        self.assertTrue(self.output_dir.is_dir())
+        self.assertTrue(self.output_dir.parent.is_dir())
+        proc.stdin.write(b"continue\n")
+        proc.stdin.flush()
+        info = self.output_dir / "child-info.json"
+        _wait_for(self, info.is_file, "Python 陪练没有启动")
+        child = json.loads(info.read_text())["pid"]
+        self.addCleanup(lambda: os.kill(child, signal.SIGKILL) if ca.find_task_agent_pid(
+            "codex", self.storage, "t") == child else None)
+
+    def test_orphan_keeps_directory_for_both_backends_and_all_spawn_commands(self):
+        original_output = self.output_dir
+        for runner in ("codex", "deepseek"):
+            for command in ("run", "resume", "interrupt-and-resume"):
+                with self.subTest(runner=runner, command=command):
+                    self.output_dir = original_output.parent / f"20261024-130000-{runner}-{command}"
+                    self.output_dir.mkdir()
+                    self.storage = self.output_dir / "sub-agent-runner"
+                    proc = self.start_wrapper(runner, command)
+                    proc.stdin.write(b"continue\n")
+                    proc.stdin.flush()
+                    info = self.output_dir / "child-info.json"
+                    _wait_for(self, info.is_file, "Python 陪练没有启动")
+                    child = json.loads(info.read_text())["pid"]
+                    self.addCleanup(lambda pid=child: os.kill(pid, signal.SIGKILL)
+                                    if ca.pid_alive(pid) and ca._read_stat_fields(pid)[0] != "Z" else None)
+                    _wait_for(self, lambda: ca.find_task_agent_pid(runner, self.storage, "t") == child,
+                              "真实反查没有找到 Python 陪练")
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    self.assertTrue(_holds_directory(child, self.output_dir))
+                    if runner == "deepseek":
+                        self.assertNotIn(str(self.output_dir), " ".join(_argv_of(child)))
+                        self.assertEqual(pathlib.Path(os.readlink(f"/proc/{child}/cwd")), self.workdir)
+                    self.clean_if_unused(child)
+                    self.assertTrue(self.output_dir.is_dir())
+                    code, text = self.invoke(self.command("status") + ["--output-dir", str(self.output_dir)])
+                    self.assertEqual(code, 4, text)
+                    code, text = self.invoke(self.command("stop") + ["--output-dir", str(self.output_dir)])
+                    self.assertEqual(code, 0, text)
+                    _wait_for(self, lambda: ca.find_task_agent_pid(runner, self.storage, "t") is None,
+                              "stop 没有停掉孤儿陪练")
+
+    def test_cleaner_renames_first_and_each_writer_rejects_after_taking_root_lock(self):
+        self.seed("codex")
+        for command in ("run", "resume", "interrupt-and-resume", "stop"):
+            with self.subTest(command=command):
+                descriptor = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                driver = (
+                    "import fcntl,os,sys\n"
+                    f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+                    "import sub_agent_runner as ca\n"
+                    "real_flock = fcntl.flock\n"
+                    "def observed_flock(fd, mode):\n"
+                    "    if mode == fcntl.LOCK_EX: print('locking', flush=True)\n"
+                    "    return real_flock(fd, mode)\n"
+                    "fcntl.flock = observed_flock\n"
+                    f"sys.argv = ['sub-agent-runner', *{self.command(command)!r}, "
+                    f"'--output-dir', {str(self.output_dir)!r}]\n"
+                    "sys.exit(ca.main())\n")
+                proc = subprocess.Popen([sys.executable, "-c", driver], stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE)
+                moved = self.runs_root / ("retired-" + command)
+                before = self.snapshot()
+                try:
+                    readable, _, _ = select.select([proc.stdout], [], [], 5)
+                    self.assertTrue(readable, "没有对根目录取锁")
+                    self.assertEqual(proc.stdout.readline(), b"locking\n")
+                    self.assertIsNone(proc.poll(), "持锁期间包装器不应先退出")
+                    self.assertEqual(self.snapshot(), before, "等锁期间不能改动")
+                    self.output_dir.rename(moved)
+                finally:
+                    os.close(descriptor)
+                try:
+                    _, errors = proc.communicate(timeout=5)
+                    self.assertEqual(proc.returncode, 2, errors.decode())
+                    self.assertFalse(self.output_dir.exists())
+                    self.assertFalse((self.home / ".codex-subagent").exists())
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait()
+                    moved.rename(self.output_dir)
+
+    def test_open_failure_is_under_root_lock_and_leaves_every_writer_unchanged(self):
+        self.seed("codex")
+        real_open = os.open
+        real_check = ca._check_output_dir
+        def check_under_lock(output, root):
+            descriptor = real_open(root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(descriptor)
+            real_check(output, root)
+        def denied(path, flags, *args, **kwargs):
+            if pathlib.Path(path) == self.output_dir:
+                descriptor = real_open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(descriptor)
+                raise PermissionError("directory cannot be opened")
+            return real_open(path, flags, *args, **kwargs)
+        for command in ("run", "resume", "interrupt-and-resume", "stop"):
+            with self.subTest(command=command), mock.patch.object(ca.os, "open", denied), \
+                    mock.patch.object(ca, "_check_output_dir", check_under_lock):
+                before = self.snapshot()
+                code, text = self.invoke(self.command(command) + ["--output-dir", str(self.output_dir)])
+                self.assertEqual(code, 2, text)
+                self.assertEqual(self.snapshot(), before)
+
+    def test_output_descriptor_closes_on_success_and_on_spawn_error(self):
+        for failure in (False, True):
+            with self.subTest(failure=failure), _no_codex() as popen:
+                if failure:
+                    popen.side_effect = RuntimeError("spawn failed")
+                    with self.assertRaisesRegex(RuntimeError, "spawn failed"):
+                        self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
+                else:
+                    self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
+                self.assertFalse(_holds_directory(os.getpid(), self.output_dir))
+
+    def test_background_guard_reads_task_names_with_explicit_output_dir(self):
+        import background_guard as guard
+        descriptor = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        processes = []
+        marker = "background:runs-task-names"
+        try:
+            for command in ("run", "resume", "interrupt-and-resume"):
+                argv = self.command(command) + ["--output-dir", str(self.output_dir)]
+                argv[argv.index("--task") + 1 if command == "run" else 1] = command + "-task"
+                proc = subprocess.Popen([sys.executable, ca.__file__, *argv],
+                                        env=dict(os.environ, SUB_AGENT_RUNNER_BASH_CALL=marker),
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                processes.append(proc)
+            expected = {"run-task", "resume-task", "interrupt-and-resume-task"}
+            _wait_for(self, lambda: {task for task, _ in guard.find_call_runners(marker).values()} == expected,
+                      "护栏没有从新命令行取到正确任务名")
+        finally:
+            for proc in processes:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait()
+            os.close(descriptor)
+
+
+class TestLegacyRunsMigration(_RunsSandbox):
+    """只在临时账号目录演练 spec 第 5 条；运行时代码不含迁移器。"""
+
+    def setUp(self):
+        super().setUp()
+        self.legacy = self.home / "legacy-account"
+        for name in ("tasks", "reports", "logs"):
+            (self.legacy / name).mkdir(parents=True)
+        (self.legacy / "brief-old.md").write_text("old brief")
+        (self.legacy / "reports/t.md").write_text("old report")
+        (self.legacy / "logs/t.log").write_text("old log\n")
+
+    def start_migration(self, wrappers):
+        waiting = threading.Event()
+        self.migration_errors, self.before_move = [], {}
+        def migrate():
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    old_wrappers = any(proc.poll() is None for proc in wrappers)
+                    old_agents = any(ca.find_task_agent_pid(meta["runner"], self.legacy, meta["task"])
+                                     is not None for _, meta in ca.all_metas(self.legacy))
+                    if not old_wrappers and not old_agents:
+                        break
+                    waiting.set()
+                    if time.monotonic() >= deadline:
+                        raise AssertionError("旧写入者没有排空")
+                    time.sleep(0.01)
+                self.before_move.update({str(p.relative_to(self.legacy)): p.read_bytes()
+                                         for p in self.legacy.rglob("*") if p.is_file()})
+                self.storage.mkdir()
+                for name in ("tasks", "reports", "logs"):
+                    (self.legacy / name).rename(self.storage / name)
+                for brief in self.legacy.glob("brief-*.md"):
+                    brief.rename(self.storage / brief.name)
+            except BaseException as error:
+                self.migration_errors.append(error)
+        thread = threading.Thread(target=migrate)
+        thread.start()
+        self.addCleanup(thread.join, 6)
+        self.assertTrue(waiting.wait(5), "迁移没有等待仍在用的旧任务")
+        self.assertFalse(self.storage.exists(), "排空之前就搬了")
+        self.assertTrue((self.legacy / "tasks/t.json").is_file())
+        return thread
+
+    def verify_moved_task(self, thread):
+        thread.join(6)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.migration_errors, [])
+        moved = {str(p.relative_to(self.storage)): p.read_bytes()
+                 for p in self.storage.rglob("*") if p.is_file()}
+        self.assertEqual(moved, self.before_move, "迁移不能改元数据或其他文件的字节")
+        for name in ("tasks", "reports", "logs"):
+            self.assertFalse((self.legacy / name).exists())
+        code, text = self.invoke(self.command("status") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
+        runner = json.loads((self.storage / "tasks/t.json").read_text())["runner"]
+        def resumed(argv, **kwargs):
+            if runner == "codex":
+                (self.storage / "reports/t.md").write_text("resumed")
+            return mock.DEFAULT
+        with _no_codex() as popen:
+            popen.side_effect = resumed
+            popen.return_value.stdout.read1.side_effect = [
+                b'{"type":"result","subtype":"success","result":"resumed"}\n', b""]
+            code, text = self.invoke(self.command("resume") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
+        self.assertIn("resume t", (self.storage / "logs/t.log").read_text())
+        code, text = self.invoke(self.command("stop") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
+
+    def test_drain_waits_for_old_wrapper_to_write_back_session_before_move(self):
+        meta = _full_meta("t", dir=str(self.workdir))
+        driver = (
+            "import pathlib,sys\n"
+            f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
+            "import sub_agent_runner as ca\n"
+            f"home, meta = pathlib.Path({str(self.legacy)!r}), {meta!r}\n"
+            "meta['writer_pid'], meta['writer_start'] = ca._writer_identity()\n"
+            "ca.write_meta(home, 't', meta)\n"
+            "print('first metadata', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "meta['session_id'] = '01a0b408-f718-7ff3-8123-d5202551acba'\n"
+            "ca.write_meta(home, 't', meta)\n")
+        proc = subprocess.Popen([sys.executable, "-c", driver], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.stdin.close)
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        self.assertTrue(select.select([proc.stdout], [], [], 5)[0])
+        self.assertEqual(proc.stdout.readline(), b"first metadata\n")
+        thread = self.start_migration([proc])
+        proc.stdin.write(b"finish\n")
+        proc.stdin.flush()
+        proc.wait(timeout=5)
+        self.verify_moved_task(thread)
+        self.assertEqual(json.loads(self.before_move["tasks/t.json"])["session_id"],
+                         "01a0b408-f718-7ff3-8123-d5202551acba")
+
+    def test_drain_waits_for_orphaned_codex_and_deepseek_before_move(self):
+        original_legacy, original_output = self.legacy, self.output_dir
+        for runner in ("codex", "deepseek"):
+            with self.subTest(runner=runner):
+                self.legacy = original_legacy.parent / ("legacy-" + runner)
+                for name in ("tasks", "reports", "logs"):
+                    (self.legacy / name).mkdir(parents=True)
+                (self.legacy / "brief-old.md").write_text("brief")
+                (self.legacy / "reports/t.md").write_text("old report")
+                (self.legacy / "logs/t.log").write_text("old log\n")
+                self.output_dir = original_output.parent / ("20261024-130000-legacy-" + runner)
+                self.output_dir.mkdir()
+                self.storage = self.output_dir / "sub-agent-runner"
+                session = "01a0b408-f718-7ff3-8123-d5202551acba"
+                ca.write_meta(self.legacy, "t", _full_meta(
+                    "t", runner=runner, account="default" if runner == "codex" else None,
+                    dir=str(self.workdir), session_id=session))
+                needle = str(self.legacy / "reports/t.md") if runner == "codex" else session
+                child = ("import ctypes,signal,sys,time\n"
+                         f"ctypes.CDLL(None).prctl(15, {b'codex' if runner == 'codex' else b'claude'!r}, 0, 0, 0)\n"
+                         "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n"
+                         "print('ready', flush=True)\n"
+                         "while True: time.sleep(1)\n")
+                proc = subprocess.Popen([sys.executable, "-c", child, needle], stdout=subprocess.PIPE)
+                self.addCleanup(proc.stdout.close)
+                self.addCleanup(proc.wait)
+                self.addCleanup(lambda process=proc: process.kill() if process.poll() is None else None)
+                self.assertTrue(select.select([proc.stdout], [], [], 5)[0])
+                self.assertEqual(proc.stdout.readline(), b"ready\n")
+                self.assertEqual(ca.find_task_agent_pid(runner, self.legacy, "t"), proc.pid)
+                thread = self.start_migration([])
+                proc.send_signal(signal.SIGINT)  # 旧包装器已退，按 spec 直接停旧子代理。
+                proc.wait(timeout=5)
+                self.verify_moved_task(thread)
+
+
+class TestGoalRunsIntegration(_RunsSandbox):
+    @unittest.skipUnless("XY_GOAL_SCRIPT" in os.environ,
+                         "需显式指定已接入 runs 的 XY_GOAL_SCRIPT，旧布局不能代替联调")
+    def test_goal_hooks_show_check_update_and_close_alongside_runner(self):
+        script = pathlib.Path(os.environ["XY_GOAL_SCRIPT"]).expanduser().resolve()
+        self.assertTrue(script.is_file(), script)
+        session = "runner-coexist"
+        transcript = self.home / ".claude/projects/-home-xy-repo" / f"{session}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("")
+        def goal(arguments, payload):
+            result = subprocess.run([sys.executable, str(script), "--root", str(self.runs_root), *arguments],
+                                    input=None if payload is None else json.dumps(payload),
+                                    env=dict(os.environ, CLAUDE_CODE_SESSION_ID=session),
+                                    text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            return result.stdout
+        goal(["hook-prompt"], {"session_id": session, "prompt": "验证共存", "transcript_path": str(transcript)})
+        goal(["open", "runner-coexist", "验证共存", "--claude-pid", str(os.getpid())], None)
+        contracts = list(self.runs_root.glob("-*/*/xy-goal/goal.md"))
+        self.assertEqual(len(contracts), 1, "必须是 spec-xy-goal 定义的新布局")
+        self.output_dir = contracts[0].parent.parent
+        self.storage = self.output_dir / "sub-agent-runner"
+        self.brief = self.output_dir / "brief.md"
+        self.brief.write_text("执行任务")
+        task = goal(["add", "--title", "验证", "--criteria", "通过", "--state", "在办",
+                     "--pointer", "无", "--source", "1"], None).strip()
+        with _no_codex():
+            self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
+        goal(["hook-prompt"], {"session_id": session, "prompt": "补充说明", "transcript_path": str(transcript)})
+        goal(["update", task, "--source", "2"], None)
+        goal(["show"], None)
+        goal(["check"], None)
+        goal(["accept", task, "--verdict", "通过"], None)
+        runner_files = {p.relative_to(self.storage): p.read_bytes() for p in self.storage.rglob("*") if p.is_file()}
+        goal(["close"], None)
+        self.assertFalse(contracts[0].exists())
+        self.assertEqual({p.relative_to(self.storage): p.read_bytes() for p in self.storage.rglob("*") if p.is_file()}, runner_files)
+        code, text = self.invoke(self.command("stop") + ["--output-dir", str(self.output_dir)])
+        self.assertEqual(code, 0, text)
 
 
 class TestModuleCompilesClean(unittest.TestCase):
@@ -553,7 +1188,7 @@ class TestRoundBoundary(unittest.TestCase):
         log.write_bytes("上一轮的尾巴\n".encode())
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
+            text = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         self.assertEqual(text, "本轮的内容\n")
 
     def test_后来的轮次不能把前一轮判瞎_这是P1的回归锁(self):
@@ -566,7 +1201,7 @@ class TestRoundBoundary(unittest.TestCase):
                 log, ca.INTERRUPT_MARK + "\n",
                 ca.round_separator("interrupt-and-resume", "t", "2026-09-19T00:00:01")
                 + "\n干净收尾\n")
-            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            rd = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(ca.INTERRUPT_MARK, log.read_text(), "前提不成立：打断标记没写进日志")
 
         self.assertEqual(ca.judge(rd).state, "interrupted")
@@ -582,7 +1217,7 @@ class TestRoundBoundary(unittest.TestCase):
                 log, "本轮干净\n",
                 ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n",
                 ERR_FATAL + "\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
+            text = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         self.assertEqual(text, "本轮干净\n")
         self.assertEqual(ca.runtime_error_lines(text), [],
                          "后一轮的致命错误被算到了前一轮头上")
@@ -599,7 +1234,7 @@ class TestRoundBoundary(unittest.TestCase):
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(
                 log, 源码行 + "\n", ca.INTERRUPT_MARK + "\n")
-            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            rd = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertIn(源码行, rd.text, "本轮文本被那行源码切断了")
         self.assertEqual(ca.judge(rd).state, "interrupted")
 
@@ -613,7 +1248,7 @@ class TestRoundBoundary(unittest.TestCase):
         self.assertIn(ca.INTERRUPT_MARK, 源码行, "前提不成立：样本行里没有打断标记")
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, 源码行 + "\n")
-            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            rd = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual(ca.judge(rd).state, "failed")
 
     def test_codex最后一块输出没有换行时_痕迹仍然落在行首(self):
@@ -640,7 +1275,7 @@ class TestRoundBoundary(unittest.TestCase):
 
         with _no_codex() as popen:
             popen.side_effect = spawn
-            rd = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            rd = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertTrue(ca.has_interrupt_mark(rd.text),
                         "痕迹被接在半行后面，整行匹配认不出它")
         self.assertEqual(ca.judge(rd).state, "interrupted")
@@ -656,7 +1291,7 @@ class TestRoundBoundary(unittest.TestCase):
         log.write_bytes(尾巴.encode())
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮的内容\n")
-            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertNotIn(尾巴, ca.read_last_round(log),
                          "分隔符没落在行首，上一轮的尾巴被算进了这一轮")
 
@@ -668,7 +1303,7 @@ class TestRoundBoundary(unittest.TestCase):
         log.write_bytes("上一轮写了很多中文内容\n".encode())
         with _no_codex() as popen:
             popen.side_effect = self._spawn_writing(log, "本轮第一行\n")
-            text = ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
+            text = _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"]).text
         raw = log.read_bytes()
         self.assertNotEqual(len(raw), len(raw.decode()),
                             "前提不成立：日志里没有多字节字符，这条测不到错位")
@@ -682,7 +1317,7 @@ class TestRoundBoundary(unittest.TestCase):
             with self.subTest(bad=bad):
                 with _no_codex() as popen:
                     with self.assertRaises(ValueError):
-                        ca.run_codex(bad, d, "t", _full_meta("t"), lambda r: ["codex"])
+                        _run_round(bad, d, "t", _full_meta("t"), lambda r: ["codex"])
                     popen.assert_not_called()
                 self.assertFalse(ca.meta_path(d, "t").exists(), "元数据已经落盘了")
                 self.assertFalse(ca._log_path(d, "t").exists(), "日志已经写了")
@@ -745,9 +1380,9 @@ class TestRoundBoundaryWiring(_HomeSandbox):
 
     def test_status_and_resume_owner_agree_on_first_orphan(self):
         # 只替换外部 spawn；首次孤儿在真实拥有者与观察者入口都应返回 0。
-        home = ca.ensure_isolation(ca.CODEX, "default")
+        home = self.task_storage(ca.CODEX, "default")
         resume_args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         ca.write_meta(home, "t", _full_meta("t", session_id="s1",
                                           dir=str(self.workdir), effort="max"))
         real_judge = ca.judge
@@ -766,17 +1401,17 @@ class TestRoundBoundaryWiring(_HomeSandbox):
                 home, "干完了\n", ERR_ORPHAN_REAL + "\n" + ERR_ORPHAN_OTHER + "\n")
             owner_rc = ca.cmd_resume(resume_args)
             with mock.patch.object(ca, "judge", side_effect=observe):
-                observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+                observer_rc = ca.cmd_status(ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)]))
         self.assertEqual([owner_rc, observer_rc], [0, 0])
         self.assertEqual(owner, observer)
         self.assertEqual(owner[0].state, "success")
         self.assertEqual(owner[0].detail, ["干完了"])
 
     def test_run收尾用的是run_codex回传的本轮文本(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "_print_verdict", side_effect=lambda t, v: seen.update(v=v)):
@@ -786,10 +1421,10 @@ class TestRoundBoundaryWiring(_HomeSandbox):
                       "run 接成了 read_last_round：被后来的一轮判瞎了")
 
     def test_resume收尾用的是run_codex回传的本轮文本(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         seen = {}
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
@@ -802,10 +1437,10 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         # judge 在「还在跑」这一支根本不碰 round_text，而 status 正是轮询用的
         # 热路径。实测 read_last_round：0.83MB 约 10ms、8.3MB 约 100ms，
         # 不带任务名时还要乘任务数——读出来再丢掉是白烧。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         ca._log_path(d, "t").write_text("随便什么\n")
-        args = ca.build_parser().parse_args(["status", "t"])
+        args = ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca, "read_last_round") as r:
             self.assertEqual(ca.cmd_status(args), 4)   # 绝对值：还在跑就是 4
@@ -818,13 +1453,13 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         # 这里 spy 的是 judge 而不是 _print_verdict：cmd_status 自己排版、
         # 根本不走 _print_verdict（patch 它只会拿到空列表，是条空测试）。
         # spy 还顺手把**传给判据的那段文本**也钉住了——这正是「谁用哪种边界」的本体。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
         log.write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n"
                        + ca.INTERRUPT_MARK + "\n"
                        + ca.round_separator("resume", "t", "2026-09-19T00:00:01") + "\n干净收尾\n")
-        args = ca.build_parser().parse_args(["status", "t"])
+        args = ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)])
         seen, texts, real_judge = [], [], ca.judge
 
         def spy(rd):
@@ -1646,7 +2281,7 @@ class TestAccountOrder(_HomeSandbox):
         skills 恒为 tuple——不是 list。`_require_skill_paths` 是一道硬闸，
         传 [] 当场 ValueError。
         """
-        ca.write_meta(ca.isolation_home(ca.CODEX, "acct3"), "t",
+        ca.write_meta(self.storage, "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "high", ()))
         self._limit("acct3", datetime.datetime(2099, 12, 31))
         self.assertEqual(ca.accounts_by_availability()[0], "acct2",
@@ -1735,7 +2370,7 @@ class TestIsolation(_HomeSandbox):
 
     def test_首次使用自动建齐目录与配置(self):
         d = ca.ensure_isolation(ca.CODEX, "acct2")
-        for sub in ("skills", "plugins", "tasks", "reports", "logs"):
+        for sub in ("skills", "plugins"):
             with self.subTest(sub=sub):
                 self.assertTrue((d / sub).is_dir())
         self.assertTrue((d / "config.toml").is_file())
@@ -1882,32 +2517,20 @@ class TestRunnerAxis(_HomeSandbox):
         self.assertEqual(ca.isolation_home(ca.CODEX, "default").name, ".codex-subagent")
         self.assertEqual(ca.isolation_home(ca.CODEX, "acct2").name, ".codex-subagent-acct2")
 
-    def test_扫描根包含deepseek的家(self):
-        # **不加这一条，deepseek 任务对 status/resume/stop 整体不可见。**
-        roots = ca.isolation_roots()
-        self.assertIn(ca.isolation_home(ca.DEEPSEEK, None), roots)
-        for a in ca.account_choices():
-            self.assertIn(ca.isolation_home(ca.CODEX, a), roots)
 
     def test_deepseek的任务status查得到(self):
-        home = ca.isolation_home(ca.DEEPSEEK, None)
-        (home / "tasks").mkdir(parents=True)
-        ca.write_meta(home, "dst", ca.new_meta("dst", ca.DEEPSEEK, None, "/tmp", "max", ()))
-        got_home, got_meta = ca.find_meta("dst")
-        self.assertEqual(got_home, home)
-        self.assertEqual(got_meta["runner"], ca.DEEPSEEK)
-        self.assertIn("dst", [m["task"] for _, m in ca.all_metas()])
+        ca.write_meta(self.storage, "dst", _full_meta("dst", runner="deepseek", account=None))
+        home, meta = ca.find_meta(self.storage, "dst")
+        self.assertEqual(home, self.storage)
+        self.assertEqual(meta["runner"], "deepseek")
+        self.assertIn("dst", [meta["task"] for _, meta in ca.all_metas(self.storage)])
 
-    def test_deepseek的隔离只建三个子目录_少一个就是tee里的FileNotFoundError(self):
-        d = ca.ensure_isolation(ca.DEEPSEEK, None)
-        self.assertEqual(d, self.home / ".claude-subagent")
-        for sub in ("tasks", "reports", "logs"):
-            with self.subTest(sub=sub):
-                self.assertTrue((d / sub).is_dir())
-        # 这三条不变量是 codex 专属：deepseek 的 auth 走环境变量里的 token，
-        # 没有 auth.json；共享扫描根 ~/.agents/skills 是 codex 的扫描根。
-        self.assertFalse((d / "auth.json").exists())
-        self.assertFalse((d / "config.toml").exists())
+    def test_deepseek隔离目录不建任务文件夹(self):
+        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.assertEqual(home, self.home / ".claude-subagent")
+        self.assertTrue(home.is_dir())
+        for name in ("tasks", "reports", "logs", "auth.json", "config.toml"):
+            self.assertFalse((home / name).exists(), name)
 
     def test_deepseek不受codex的共享扫描根约束(self):
         # ~/.agents/skills 是 **codex** 的扫描根，claude 根本不看它。
@@ -2405,7 +3028,7 @@ class TestFindTaskAgentPid(_HomeSandbox):
     def test_codex的needle是报告路径_元数据不在也查得到(self):
         # 这条不能丢：元数据被手删、而上一轮的 codex 还占着会话时，
         # 「元数据不在就放行」会让新一轮当场撞上它的写锁。
-        home = ca.ensure_isolation(ca.CODEX, "default")
+        home = self.task_storage(ca.CODEX, "default")
         report = ca._report_path(home, "t")
         self.assertFalse(ca.meta_path(home, "t").exists(), "前提：这个任务没有元数据")
         with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy:
@@ -2413,7 +3036,7 @@ class TestFindTaskAgentPid(_HomeSandbox):
         spy.assert_called_once_with(ca.CODEX, report)
 
     def test_deepseek的needle是元数据里的session_id(self):
-        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        home = self.task_storage(ca.DEEPSEEK, None)
         meta = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
         ca.write_meta(home, "t", meta)
         with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy:
@@ -2423,7 +3046,7 @@ class TestFindTaskAgentPid(_HomeSandbox):
     def test_deepseek没有元数据就没有needle可查(self):
         # 不对称，而且是外部约束造成的：codex 的 needle 由 (home, task) 派生，
         # deepseek 的 session id 只住在元数据里。老实答「查不到」，不瞎猜。
-        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        home = self.task_storage(ca.DEEPSEEK, None)
         with mock.patch.object(ca, "find_agent_pid", side_effect=AssertionError("不该问")):
             self.assertIsNone(ca.find_task_agent_pid(ca.DEEPSEEK, home, "从来没有过的任务"))
 
@@ -2437,7 +3060,7 @@ class TestWaitUsesOnDiskSessionId(_HomeSandbox):
     """
 
     def test_等的是磁盘上那一轮的uuid_不是本轮新铸的(self):
-        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        home = self.task_storage(ca.DEEPSEEK, None)
         上一轮 = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
         ca.write_meta(home, "t", 上一轮)
         本轮 = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
@@ -2467,7 +3090,7 @@ class TestDeepseekTaskIsReachable(_HomeSandbox):
         super().setUp()
         # **不许写成 `self.home = …`**：`_HomeSandbox` 的 `Path.home()` patch 是
         # `lambda: self.home`，盖掉它整个沙箱就指到隔离目录里去了（静默）。
-        self.d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.d = self.task_storage(ca.DEEPSEEK, None)
         self.meta = ca.new_meta("dst", ca.DEEPSEEK, None, "/tmp", "max", ())
         ca.write_meta(self.d, "dst", self.meta)
 
@@ -2475,7 +3098,7 @@ class TestDeepseekTaskIsReachable(_HomeSandbox):
         out = io.StringIO()
         with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy, \
              contextlib.redirect_stdout(out):
-            self.assertEqual(ca.cmd_status(argparse.Namespace(task="dst")), ca.EXIT["running"])
+            self.assertEqual(ca.cmd_status(argparse.Namespace(task="dst", output_dir=self.output_dir)), ca.EXIT["running"])
         spy.assert_called_once_with(ca.DEEPSEEK, self.meta["session_id"])
         self.assertIn("dst", out.getvalue())
         self.assertIn("deepseek", out.getvalue(), "status 得看得出这个任务派给了谁")
@@ -2485,7 +3108,7 @@ class TestDeepseekTaskIsReachable(_HomeSandbox):
         with mock.patch.object(ca, "find_agent_pid", return_value=4242) as spy, \
              mock.patch.object(ca, "interrupt_agent") as kill, \
              contextlib.redirect_stdout(out):
-            self.assertEqual(ca.cmd_stop(argparse.Namespace(task="dst")), ca.EXIT["success"])
+            self.assertEqual(ca.cmd_stop(argparse.Namespace(task="dst", output_dir=self.output_dir)), ca.EXIT["success"])
         spy.assert_called_once_with(ca.DEEPSEEK, self.meta["session_id"])
         self.assertEqual(kill.call_args[0][0], 4242)
 
@@ -2514,7 +3137,7 @@ class TestInterruptedAfterProcessStops(_HomeSandbox):
     """
 
     def test_进程真停了之后status才说interrupted(self):
-        home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        home = self.task_storage(ca.DEEPSEEK, None)
         meta = ca.new_meta("t", ca.DEEPSEEK, None, "/tmp", "max", ())
         ca.write_meta(home, "t", meta)
         log = ca._log_path(home, "t")
@@ -2524,7 +3147,7 @@ class TestInterruptedAfterProcessStops(_HomeSandbox):
         fake = _fake_agent(tmp, "claude")
         mark = tmp / "keep.txt"
         mark.write_text("")
-        args = ca.build_parser().parse_args(["status", "t"])
+        args = ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)])
         proc = subprocess.Popen([str(fake), "-f", str(mark), meta["session_id"]],
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
@@ -2592,12 +3215,12 @@ class TestDeepseekWiring(_HomeSandbox):
     def _run(self, events, runner=None, trailing=b""):
         runner = ca.DEEPSEEK if runner is None else runner
         account = None if runner == ca.DEEPSEEK else "default"
-        d = ca.ensure_isolation(runner, account)
+        d = self.task_storage(runner, account)
         meta = ca.new_meta("t", runner, account, str(self.workdir), "max", ())
         output = ("\n".join(events) + "\n").encode() + trailing
         with _fake_agent_proc(output) as popen, \
              mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
-            round_ = ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+            round_ = _run_round("run", d, "t", meta, lambda r: ["假的"])
         return d, meta, popen, round_
 
     # ── ① 隔离真的接上了 ────────────────────────────────────────────
@@ -2606,7 +3229,7 @@ class TestDeepseekWiring(_HomeSandbox):
         # 它看得见整台机器上所有的 skill/MCP/hook，spec 的隔离承诺当场是空的。
         d, _, popen, _ = self._run([self.INIT, self.OK])
         env = popen.call_args.kwargs["env"]
-        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(d))
+        self.assertEqual(env["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-subagent"))
         self.assertEqual(env.get("CODEX_HOME"), os.environ.get("CODEX_HOME"))
 
     def test_继承模型变量时仍传入隔离目录(self):
@@ -2615,7 +3238,7 @@ class TestDeepseekWiring(_HomeSandbox):
         with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5",
                                           "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku"}):
             d, _, popen, _ = self._run([self.OK])
-        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(d))
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-subagent"))
 
     # ── ② 工作目录真的接上了 ────────────────────────────────────────
     def test_工作目录走cwd_产物才落在dir里(self):
@@ -2655,14 +3278,14 @@ class TestDeepseekWiring(_HomeSandbox):
         codex 那一支有 `TestWrapperSpeaksImmediately` 守着同一件事，
         deepseek 这一支在这条之前是裸的。
         """
-        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        d = self.task_storage(ca.DEEPSEEK, None)
         meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
         屏幕 = io.BytesIO()
         假stdout = mock.MagicMock()
         假stdout.buffer = 屏幕
         with _fake_agent_proc(("\n".join([self.INIT, self.OK]) + "\n").encode()), \
              mock.patch.object(ca.sys, "stdout", 假stdout):
-            ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+            _run_round("run", d, "t", meta, lambda r: ["假的"])
         printed = 屏幕.getvalue().decode()
         self.assertIn(self.INIT, printed, "tee 没往屏幕写——终端上一个字都看不到")
         self.assertIn(self.OK, printed)
@@ -2735,7 +3358,7 @@ class TestDeepseekWiring(_HomeSandbox):
                         "失败时 detail 是空的＝调用方拿不到任何线索")
 
     def test_打断标记在日志里时judge给interrupted(self):
-        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        d = self.task_storage(ca.DEEPSEEK, None)
         meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
         output = ("\n".join([self.INIT, self.INT]) + "\n").encode()
         with _fake_agent_proc(output) as popen, \
@@ -2746,7 +3369,7 @@ class TestDeepseekWiring(_HomeSandbox):
                 return popen.return_value
             popen.side_effect = 先留痕
             with mock.patch.object(ca.os, "kill"):
-                round_ = ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+                round_ = _run_round("run", d, "t", meta, lambda r: ["假的"])
         self.assertEqual(ca.judge(round_).state, "interrupted")
         self.assertEqual(ca.EXIT[ca.judge(round_).state], 130)
 
@@ -2768,12 +3391,12 @@ class TestDeepseekWiring(_HomeSandbox):
 
     # ── 两侧共有的那几件事一件没丢 ─────────────────────────────────
     def test_元数据落盘_分隔符写了_报告清过(self):
-        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        d = self.task_storage(ca.DEEPSEEK, None)
         ca._report_path(d, "t").write_text("上一轮的旧报告")
         meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
         with _fake_agent_proc(("\n".join([self.INT]) + "\n").encode()), \
              mock.patch.object(ca.sys, "stdout", mock.MagicMock()):
-            ca.run_codex("run", d, "t", meta, lambda r: ["假的"])
+            _run_round("run", d, "t", meta, lambda r: ["假的"])
         self.assertTrue(ca.meta_path(d, "t").exists())
         self.assertTrue(ca._log_path(d, "t").read_text().startswith(ca.ROUND_MARK))
         self.assertFalse(ca._report_path(d, "t").exists(),
@@ -2830,40 +3453,48 @@ class TestFixedArgs(unittest.TestCase):
 
 
 class TestMeta(_HomeSandbox):
-    def test_元数据写入后能跨隔离目录查回来_home走返回值不是魔法键(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+    def test_元数据从指定产物目录读回_home走返回值不是魔法键(self):
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t1", _full_meta("t1", dir="/abs/x"))
-        home, meta = ca.find_meta("t1")
+        home, meta = ca.find_meta(self.storage, "t1")
         self.assertEqual(meta["dir"], "/abs/x")
         self.assertEqual(home, d)
         # 魔法键意味着每个写回元数据的地方都得记得剥掉它
         self.assertNotIn("_home", meta)
 
     def test_查不到返回一对None(self):
-        self.assertEqual(ca.find_meta("不存在的任务"), (None, None))
+        self.assertEqual(ca.find_meta(self.storage, "不存在的任务"), (None, None))
 
     def test_元数据缺字段就拒绝_不给默认值圆场(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.meta_path(d, "broken").write_text('{"task": "broken"}')
         with self.assertRaises(ca.Rejected) as cm:
-            ca.find_meta("broken")
+            ca.find_meta(self.storage, "broken")
         self.assertIn("缺字段", cm.exception.message)
 
-    def test_同名任务出现在两个隔离目录就拒绝_不许猜(self):
-        # 这条路很好走：auto 挑中另一个账号 → 同一个任务名在两个隔离目录里各一份
-        (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
-        (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
-        for account in ("default", "acct2"):
-            ca.write_meta(ca.ensure_isolation(ca.CODEX, account), "clash", _full_meta("clash", account=account))
-        with self.assertRaises(ca.Rejected) as cm:
-            ca.find_meta("clash")
-        self.assertIn("多个隔离目录", cm.exception.message)
+    def test_不同产物目录的同名任务分别读取(self):
+        other = self.output_dir.parent / "20261024-130000-other" / "sub-agent-runner"
+        (other / "tasks").mkdir(parents=True)
+        ca.write_meta(self.storage, "t", _full_meta("t", account="default"))
+        ca.write_meta(other, "t", _full_meta("t", account="acct2"))
+        self.assertEqual(ca.find_meta(self.storage, "t")[1]["account"], "default")
+        self.assertEqual(ca.find_meta(other, "t")[1]["account"], "acct2")
 
     def test_列出全部任务(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         for name in ("a", "b"):
             ca.write_meta(d, name, _full_meta(name))
-        self.assertEqual(sorted(m["task"] for _, m in ca.all_metas()), ["a", "b"])
+        self.assertEqual(sorted(m["task"] for _, m in ca.all_metas(self.storage)), ["a", "b"])
+
+    def test_坏元数据单独报告而其他任务仍可见(self):
+        (self.storage / "tasks/broken.json").write_text('{"task":"broken"}')
+        ca.write_meta(self.storage, "good", _full_meta("good"))
+        (self.storage / "reports/good.md").write_text("done")
+        args = ca.build_parser().parse_args(["status", "--output-dir", str(self.output_dir)])
+        with _capture_stdout() as output:
+            self.assertEqual(ca.cmd_status(args), 2)
+        self.assertIn("good", output["text"])
+        self.assertIn("broken.json", output["text"])
 
 
 class TestWriteMetaIsAtomic(_HomeSandbox):
@@ -2879,7 +3510,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
     """
 
     def test_并发读永远读不到半截json(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         meta = _full_meta("t", session_id="01a0b408-f718-7ff3-8123-d5202551acba")
         ca.write_meta(d, "t", meta)
         q = ca.meta_path(d, "t")
@@ -2916,7 +3547,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
         实测这个突变**存活**过。这里改成让 os.replace 崩掉，残片就是实现
         真正用的那个名字。
         """
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "good", _full_meta("good"))
         tasks = ca.meta_path(d, "good").parent
         before = {q.name for q in tasks.iterdir()}
@@ -2927,7 +3558,7 @@ class TestWriteMetaIsAtomic(_HomeSandbox):
         self.assertTrue(leftovers, "前提不成立：没留下残片，这条测不到任何东西")
         # 残片要是被 *.json 扫进去，它自己就成了一份「缺字段的坏元数据」，
         # 而那条的爆炸半径是整个 status 列表（见 REQUIRED_META_KEYS 上方）
-        self.assertEqual([m["task"] for _, m in ca.all_metas()], ["good"],
+        self.assertEqual([m["task"] for _, m in ca.all_metas(self.storage)], ["good"],
                          f"残片 {leftovers} 被当成任务扫进来了")
 
 
@@ -2992,10 +3623,10 @@ class TestMetaShape(_HomeSandbox):
         # 相等而不是包含：少一个字段任务就够不着了；多塞一个 **codex 的** pid 又会
         # 破坏「codex 存活必须每次现查」那条设计意图（存下来的 PID 会过期、会被复用）。
         # writer 的那一对是例外，理由见 test_字段清单的绝对值。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(set(json.loads(ca.meta_path(d, "t").read_text())),
@@ -3010,10 +3641,10 @@ class TestMetaShape(_HomeSandbox):
         self.assertEqual(ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", ())["skills"], ())
 
     def test_run落盘的writer身份就是本进程(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex():
             ca.cmd_run(args)
         落盘 = json.loads(ca.meta_path(d, "t").read_text())
@@ -3026,26 +3657,26 @@ class TestMetaShape(_HomeSandbox):
         读回来的——沿用的话，下一条命令一问「上一轮那个进程还在吗」，答的是**上上轮**
         那个进程的事。所以盖章的地方必须是 `run_codex`（三条路的唯一交汇点）。
         """
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         with _no_codex():
-            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         落盘 = json.loads(ca.meta_path(d, "t").read_text())
         self.assertNotEqual(落盘["writer_pid"], GONE_PID, "沿用了传进来那份的陈旧身份")
         self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity())
 
     def test_run落盘的skills就是命令行给的那几条(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         skill = self.home / "tdd_SKILL.md"
         skill.write_text("---\nname: tdd\n---\n")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(skill)])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(skill)] + ["--output-dir", str(self.output_dir)])
         with _no_codex():
             ca.cmd_run(args)
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
 
     def test_resume刷新skills_元数据描述的是最后一次调用(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         first, second = self.home / "a_SKILL.md", self.home / "b_SKILL.md"
         for q in (first, second):
             q.write_text("---\nname: x\n---\n")
@@ -3053,7 +3684,7 @@ class TestMetaShape(_HomeSandbox):
                                          skills=[str(first)]))
         args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--skill", str(second)])
+             "--skill", str(second)] + ["--output-dir", str(self.output_dir)])
         with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
         meta = json.loads(ca.meta_path(d, "t").read_text())
@@ -3063,13 +3694,13 @@ class TestMetaShape(_HomeSandbox):
     def test_interrupt_and_resume也把skills接了进去(self):
         # _resume_round 是两条路共用的，但接线是各自的：这条命令传成 [] 或漏传，
         # 上面那条测试一个字都测不出来。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         skill = self.home / "c_SKILL.md"
         skill.write_text("---\nname: x\n---\n")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--skill", str(skill)])
+             "--skill", str(skill)] + ["--output-dir", str(self.output_dir)])
         with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_interrupt_and_resume(args)
         self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [str(skill)])
@@ -3191,7 +3822,7 @@ class TestPreviousWriterAlive(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation(ca.CODEX, "default")
+        self.d = self.task_storage(ca.CODEX, "default")
 
     def _写盘(self, **over):
         ca.write_meta(self.d, "t", _full_meta("t", **over))
@@ -3542,8 +4173,6 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "「deepseek 的 effort 只有 max」这条契约没了")
         self.assertRegex(skill, r"任何模式下[^\n]*同一个任务名不能换 runner",
                          "跨 runner 在任何模式下都需换任务名")
-        self.assertRegex(skill, r"--account auto`[^\n]*只在 codex 账号之间搬同名任务",
-                         "auto 只能在 codex 账号之间搬同名任务")
         # `--account auto` 的对外契约。钉的是**配对**不是「auto 出现过」——
         # 只钉词的话，把「账号」整行删掉，启动示例里的 `--account auto` 还在，
         # 照样全绿（这正是本文件开头第 5 条踩过的坑）。四条各钉一个家：
@@ -3725,7 +4354,7 @@ class TestParser(_HomeSandbox):
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
-                parser.parse_args(argv)
+                parser.parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_effort五个档位都收(self):
         parser = ca.build_parser()
@@ -3733,7 +4362,7 @@ class TestParser(_HomeSandbox):
             with self.subTest(effort=e):
                 args = parser.parse_args(["run", "--task", "t", "--dir", "/tmp",
                                           "--brief", "b.md", "--effort", e,
-                                          "--runner", "codex", "--account", "default", "--no-skill"])
+                                          "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
                 self.assertEqual(args.effort, e)
 
     def test_effort只收这五个档位(self):
@@ -3743,7 +4372,7 @@ class TestParser(_HomeSandbox):
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
-                                   "--effort", bad, "--runner", "codex", "--account", "default", "--no-skill"])
+                                   "--effort", bad, "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def test_任务名校验挂在五个子命令上_结构上绕不过(self):
         parser = ca.build_parser()
@@ -3755,13 +4384,13 @@ class TestParser(_HomeSandbox):
                      ["interrupt-and-resume", "a|b", "--brief", "b.md", "--effort", "max",
                       "--no-skill"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
-                parser.parse_args(argv)
+                parser.parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_resume和stop不收account_账号是查出来的(self):
         parser = ca.build_parser()
         with self.assertRaises(SystemExit):
             parser.parse_args(["resume", "t", "--brief", "b.md", "--effort", "max",
-                               "--no-skill", "--account", "default"])
+                               "--no-skill", "--account", "default"] + ["--output-dir", str(self.output_dir)])
 
     def test_不提供会造成误用的参数(self):
         """这六个参数是**刻意不提供**的，各有各的理由：
@@ -3785,7 +4414,7 @@ class TestParser(_HomeSandbox):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["run", "--task", "t", "--dir", "/tmp", "--brief", "b.md",
                                    "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill",
-                                   bad, "x"])
+                                   bad, "x"] + ["--output-dir", str(self.output_dir)])
 
 
 class TestInterruptAndResumeParser(_HomeSandbox):
@@ -3801,25 +4430,25 @@ class TestInterruptAndResumeParser(_HomeSandbox):
             i = argv.index(missing)
             del argv[i:i + 2]
             with self.subTest(missing=missing), self.assertRaises(SystemExit):
-                parser.parse_args(argv)
+                parser.parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_effort五档正反都验(self):
         parser = ca.build_parser()
         for e in ca.EFFORTS:
             with self.subTest(effort=e):
                 args = parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                          "--effort", e, "--no-skill"])
+                                          "--effort", e, "--no-skill"] + ["--output-dir", str(self.output_dir)])
                 self.assertEqual(args.effort, e)
         for bad in ("中等", "ultra", "minimal"):
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", bad, "--no-skill"])
+                                   "--effort", bad, "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def test_不收account_账号是查出来的(self):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
                                           "--effort", "max", "--no-skill",
-                                          "--account", "default"])
+                                          "--account", "default"] + ["--output-dir", str(self.output_dir)])
 
     def test_不提供任何旋钮_没有第二种正确行为(self):
         # 每个旋钮都是一个让调用方做错的机会：
@@ -3832,13 +4461,13 @@ class TestInterruptAndResumeParser(_HomeSandbox):
         for bad in ["--now", "--wait", "--force", "--timeout", "--message", "--account"]:
             with self.subTest(bad=bad), self.assertRaises(SystemExit):
                 parser.parse_args(["interrupt-and-resume", "t", "--brief", "b.md",
-                                   "--effort", "max", "--no-skill", bad, "x"])
+                                   "--effort", "max", "--no-skill", bad, "x"] + ["--output-dir", str(self.output_dir)])
 
     def test_子命令接到的确实是这条命令的实现(self):
         # TestInterruptAndResumeOrder 是直接拿 Namespace 调命令体的，接错了函数它测不出来。
         # 这里是命令行到实现之间唯一那根线。
         args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "max", "--no-skill"])
+            ["interrupt-and-resume", "t", "--brief", "b.md", "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         self.assertIs(args.func, ca.cmd_interrupt_and_resume)
         self.assertEqual((args.task, args.brief, args.effort), ("t", "b.md", "max"))
 
@@ -3873,7 +4502,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd), self.assertRaises(SystemExit):
-                parser.parse_args(self._argv(cmd))
+                parser.parse_args(self._argv(cmd) + ["--output-dir", str(self.output_dir)])
 
     def test_三条命令都不许同时给(self):
         # 正面控制是**必须的**：单给任一个都过得去，下面那个拒绝才确实来自互斥。
@@ -3882,15 +4511,15 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
-                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill") + ["--output-dir", str(self.output_dir)]).skills, ())
                 with self.assertRaises(SystemExit):
-                    parser.parse_args(self._argv(cmd, "--skill", str(self.skill_a), "--no-skill"))
+                    parser.parse_args(self._argv(cmd, "--skill", str(self.skill_a), "--no-skill") + ["--output-dir", str(self.output_dir)])
 
     def test_no_skill解析成空白名单(self):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
-                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill")).skills, ())
+                self.assertEqual(parser.parse_args(self._argv(cmd, "--no-skill") + ["--output-dir", str(self.output_dir)]).skills, ())
 
     def test_两支都给不可变序列_args_skills只有一种类型(self):
         """`args.skills` 的类型只能有**一种**，而且哪一支都改不动。
@@ -3902,8 +4531,8 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         统一成 tuple：两条软约定（别原地改、别拿 `== []` 比）一起消失。
         """
         parser = ca.build_parser()
-        empty = parser.parse_args(self._argv("run", "--no-skill")).skills
-        one = parser.parse_args(self._argv("run", "--skill", str(self.skill_a))).skills
+        empty = parser.parse_args(self._argv("run", "--no-skill") + ["--output-dir", str(self.output_dir)]).skills
+        one = parser.parse_args(self._argv("run", "--skill", str(self.skill_a)) + ["--output-dir", str(self.output_dir)]).skills
         self.assertEqual(empty, ())
         self.assertEqual(one, (str(self.skill_a),))
         for got in (empty, one):
@@ -3911,7 +4540,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
                 got.append("/x/SKILL.md")
         # 跨 parse 不许渗：拼在一个共享对象上的话，第二次会带上第一次那条
         self.assertEqual(
-            parser.parse_args(self._argv("resume", "--skill", str(self.skill_b))).skills,
+            parser.parse_args(self._argv("resume", "--skill", str(self.skill_b)) + ["--output-dir", str(self.output_dir)]).skills,
             (str(self.skill_b),), "上一次 parse 的 --skill 渗过来了")
 
     def test_skill可重复且保持给定顺序(self):
@@ -3919,7 +4548,7 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
                 args = parser.parse_args(self._argv(
-                    cmd, "--skill", str(self.skill_a), "--skill", str(self.skill_b)))
+                    cmd, "--skill", str(self.skill_a), "--skill", str(self.skill_b)) + ["--output-dir", str(self.output_dir)])
                 self.assertEqual(args.skills, (str(self.skill_a), str(self.skill_b)))
 
     def test_status和stop不收这两个参数_它们不带prompt(self):
@@ -3929,10 +4558,10 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         parser = ca.build_parser()
         for cmd in ("status", "stop"):
             with self.subTest(cmd=cmd):
-                self.assertEqual(parser.parse_args([cmd, "t"]).task, "t")
+                self.assertEqual(parser.parse_args([cmd, "t"] + ["--output-dir", str(self.output_dir)]).task, "t")
                 for flag in ("--no-skill", "--skill"):
                     with self.subTest(flag=flag), self.assertRaises(SystemExit):
-                        parser.parse_args([cmd, "t", flag, str(self.skill_a)])
+                        parser.parse_args([cmd, "t", flag, str(self.skill_a)] + ["--output-dir", str(self.output_dir)])
 
     def test_dir的控制字符校验真的挂在命令行上(self):
         # 纯函数写对、parser 没挂 type= 的话，bug 原样还在——这是唯一那根线。
@@ -3940,21 +4569,21 @@ class TestSkillWhitelistFlags(_HomeSandbox):
         # 版本上这条也绿（整条命令本来就被拒），永远不会红。
         parser = ca.build_parser()
         good = self._argv("run", "--no-skill")
-        self.assertEqual(parser.parse_args(good).dir, "/tmp", "前提不成立：好的那条都过不去")
+        self.assertEqual(parser.parse_args(good + ["--output-dir", str(self.output_dir)]).dir, "/tmp", "前提不成立：好的那条都过不去")
         bad = list(good)
         bad[bad.index("--dir") + 1] = "/tmp/a\tb"
         with self.assertRaises(SystemExit):
-            parser.parse_args(bad)
+            parser.parse_args(bad + ["--output-dir", str(self.output_dir)])
 
     def test_skill的路径校验真的挂在命令行上(self):
         parser = ca.build_parser()
         for cmd in self.PROMPT_CMDS:
             with self.subTest(cmd=cmd):
                 good = self._argv(cmd, "--skill", str(self.skill_a))
-                self.assertEqual(parser.parse_args(good).skills, (str(self.skill_a),),
+                self.assertEqual(parser.parse_args(good + ["--output-dir", str(self.output_dir)]).skills, (str(self.skill_a),),
                                  "前提不成立：好的那条都过不去，坏的被拒就说明不了任何事")
                 with self.assertRaises(SystemExit):
-                    parser.parse_args(self._argv(cmd, "--skill", "relative/SKILL.md"))
+                    parser.parse_args(self._argv(cmd, "--skill", "relative/SKILL.md") + ["--output-dir", str(self.output_dir)])
 
 
 class TestRunGuards(_HomeSandbox):
@@ -3969,7 +4598,7 @@ class TestRunGuards(_HomeSandbox):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
                 "--brief", over.get("brief", str(self.brief)), "--effort", "max",
                 "--runner", "codex", "--account", "default", "--no-skill"]
-        return ca.build_parser().parse_args(argv)
+        return ca.build_parser().parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_dir不是目录就拒跑(self):
         with self.assertRaises(ca.Rejected) as cm:
@@ -3998,7 +4627,7 @@ class TestRunGuards(_HomeSandbox):
         所以这里钉两件事：① 入口闸独有的那句下一步建议；
         ② 拒绝里**没有**超时那条路的措辞。后者是确定性的，不靠计时。
         """
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t", _full_meta("t"))
+        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t", _full_meta("t"))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_run(self._args(task="t"))
@@ -4011,13 +4640,13 @@ class TestRunGuards(_HomeSandbox):
     def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct2"), "t", _full_meta("t", account="acct2"))
+        ca.write_meta(self.task_storage(ca.CODEX, "acct2"), "t", _full_meta("t", account="acct2"))
         with self.assertRaises(ca.Rejected) as cm:
             ca.cmd_run(self._args(task="t"))
         self.assertIn("acct2", cm.exception.message)
 
     def test_开跑前删掉上一轮的报告_否则旧报告会被判成本轮成功(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
         with _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
@@ -4032,7 +4661,7 @@ class TestRunGuards(_HomeSandbox):
         os.chdir(self.home)
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", "repo", "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         def grab(*a, **k):
             seen["argv"] = a[0]
             return mock.DEFAULT       # 别写成 `x or mock.DEFAULT`：x 是真值时就把它返回去了
@@ -4067,9 +4696,9 @@ class TestRunGuards(_HomeSandbox):
         # 「每次 run/resume 都校验」是两条路，上一轮只补了 resume。
         # 这条没人守的话，config.toml 被软链回主配置、auth.json 指错账号，
         # 主路径上全查不出来——而主路径才是绝大多数运行走的那条。
-        d = ca.ensure_isolation(ca.CODEX, "default")
-        (d / "config.toml").unlink()
-        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        d = self.task_storage(ca.CODEX, "default")
+        (ca.isolation_home(ca.CODEX, "default") / "config.toml").unlink()
+        (ca.isolation_home(ca.CODEX, "default") / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
         with self.assertRaises(ca.Rejected) as cm:
             ca.cmd_run(self._args(task="t"))
         self.assertIn("软链", cm.exception.message)
@@ -4078,7 +4707,7 @@ class TestRunGuards(_HomeSandbox):
         # 刻意不一律拒绝：工具没有清理命令，一律拒绝等于任务名一次性，
         # tasks/ 只能手工去删。已结束 + 同账号这一格是安全的——报告会被清掉、
         # 日志是追加的，历史不丢。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex() as popen:
             ca.cmd_run(self._args(task="t"))
@@ -4089,7 +4718,7 @@ class TestRunGuards(_HomeSandbox):
         #   清报告在 spawn 之后 -> codex 收尾写下的报告会被紧接着的 unlink 删掉
         #   写元数据在 spawn 之后 -> 中途炸了就留下一个没人管的孤儿 codex
         #   写分隔符在 spawn 之后 -> 同上，而且判据会把上一轮的错误算到这一轮头上
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         (d / "reports" / "t.md").write_text("上一轮的报告")
         (d / "logs" / "t.log").write_text("上一轮的日志\n")
         seen = {}
@@ -4106,7 +4735,7 @@ class TestRunGuards(_HomeSandbox):
         self.assertEqual(seen, {"旧报告还在": False, "元数据已落盘": True, "分隔符已写入": True})
 
     def test_日志是追加的_上一轮的内容不会被冲掉(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         (d / "logs" / "t.log").write_text("上一轮的日志\n")
         with _no_codex():
             ca.cmd_run(self._args(task="t"))
@@ -4156,13 +4785,13 @@ class TestRunnerCLI(_HomeSandbox):
                 "--runner", runner, "--no-skill"]
         if account is not None:
             argv += ["--account", account]
-        return ca.build_parser().parse_args(argv)
+        return ca.build_parser().parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_runner必填(self):
         with self.assertRaises(SystemExit):
             ca.build_parser().parse_args(
                 ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-                 "--effort", "max", "--account", "default", "--no-skill"])
+                 "--effort", "max", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def test_runner不在白名单argparse就拦下(self):
         with self.assertRaises(SystemExit):
@@ -4205,7 +4834,7 @@ class TestRunnerCLI(_HomeSandbox):
         self.assertIn("账号", got.exception.message, "钉住是哪一条拒绝在说话")
         self.assertFalse((self.home / ".claude-subagent").exists(),
                          "被拒的调用不许建隔离目录——ensure_isolation 是第一个落盘的动作")
-        self.assertEqual(ca.all_metas(), [], "也不许落任何元数据")
+        self.assertEqual(ca.all_metas(self.storage), [], "也不许落任何元数据")
 
     def test_resume和stop都不收runner(self):
         # runner 从元数据查出来，不让调用方再报一遍（报错了就指向另一个隔离目录）。
@@ -4213,7 +4842,7 @@ class TestRunnerCLI(_HomeSandbox):
                       "--no-skill", "--runner", "codex"],
                      ["stop", "t", "--runner", "codex"]):
             with self.subTest(cmd=argv[0]), self.assertRaises(SystemExit):
-                ca.build_parser().parse_args(argv)
+                ca.build_parser().parse_args(argv + ["--output-dir", str(self.output_dir)])
 
     def test_每次run都铸新uuid_落元数据_argv用的就是它(self):
         """实测复用同一个 session-id：`Error: Session ID … is already in use.` 退 1。
@@ -4226,7 +4855,7 @@ class TestRunnerCLI(_HomeSandbox):
         for _ in range(2):
             with _no_codex() as popen:
                 ca.cmd_run(self._args("deepseek", None, "max"))
-            meta = json.loads(ca.meta_path(ca.isolation_home(ca.DEEPSEEK, None), "t").read_text())
+            meta = json.loads(ca.meta_path(self.storage, "t").read_text())
             argv = popen.call_args.args[0]
             self.assertEqual(argv[argv.index("--session-id") + 1], meta["session_id"],
                              "argv 里那个和元数据里那个不是同一个")
@@ -4241,20 +4870,20 @@ class TestRunnerCLI(_HomeSandbox):
     def test_同名任务不许跨runner复用(self):
         # DeepSeek 遇到 Codex 同名任务也拒绝，不能创建第二份元数据；
         # auto 与显式 Codex 遇到同名 DeepSeek 的方向见 TestAutoAccountPick。
-        codex_home = ca.ensure_isolation(ca.CODEX, "default")
+        codex_home = self.task_storage(ca.CODEX, "default")
         ca.write_meta(codex_home, "t", ca.new_meta("t", ca.CODEX, "default", "/tmp", "low", ()))
         with self.assertRaises(ca.Rejected) as got:
             ca.cmd_run(self._args("deepseek", None, "max"))
         self.assertIn("runner", got.exception.message)
         self.assertTrue(ca.meta_path(codex_home, "t").exists(), "被拒的调用不许动旧元数据")
-        self.assertEqual(ca.find_meta("t")[0], codex_home)
+        self.assertEqual(ca.find_meta(self.storage, "t")[0], codex_home)
 
     def test_撞额度上限那一支只对codex(self):
         """deepseek 没有账号维度，`accounts_by_availability()` / `write_usage_limit`
         对它没有意义——走进去会往 `~/.claude-subagent` 写一条谁也用不上的限流记录，
         而 `status` 的 auto 排序根本不看那个目录。
         """
-        d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        d = self.task_storage(ca.DEEPSEEK, None)
         # 让这一轮判 failed，且错误行里带额度字样
         假事件 = ('{"type":"result","subtype":"error_during_execution","is_error":true,'
                   '"result":"' + ERR_USER_LAYER_REAL.replace('"', "'") + '"}')
@@ -4274,13 +4903,13 @@ class TestDeepseekResume(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
         self.brief.write_text("接着干")
-        self.d = ca.ensure_isolation(ca.DEEPSEEK, None)
+        self.d = self.task_storage(ca.DEEPSEEK, None)
         self.meta = ca.new_meta("t", ca.DEEPSEEK, None, str(self.workdir), "max", ())
         ca.write_meta(self.d, "t", self.meta)
 
     def test_resume用的是resume_argv并带上元数据里的uuid(self):
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
@@ -4291,7 +4920,7 @@ class TestDeepseekResume(_HomeSandbox):
 
     def test_resume不许把uuid换掉_那就成了新会话(self):
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex(), mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
         落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
@@ -4302,16 +4931,16 @@ class TestDeepseekResume(_HomeSandbox):
         # ensure_isolation，记成 "deepseek" 的话会指向 ~/.codex-subagent-deepseek
         # 并因缺 auth 拒跑。
         args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_resume(args)
-        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.d))
+        self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], str(self.home / ".claude-subagent"))
 
     def test_interrupt_and_resume也走同一条(self):
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--no-skill"])
+             "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with _no_codex() as popen, \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             ca.cmd_interrupt_and_resume(args)
@@ -4372,7 +5001,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def _args(self, account, task="t"):
         return ca.build_parser().parse_args(
             ["run", "--task", task, "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", account, "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", account, "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def _spawn_says(self, popen, text):
         """让这一轮吐 `text`，然后 EOF。
@@ -4405,7 +5034,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def test_全满时拒绝_列出恢复时间且不改任务状态或启动代理(self):
         for account, year in (("default", 2099), ("acct2", 2098), ("acct3", 2097)):
             self._limit(account, datetime.datetime(year, 1, 1))
-        old_home = ca.isolation_home(ca.CODEX, "acct3")
+        old_home = self.storage
         ca.write_meta(old_home, "t", _full_meta("t", account="acct3"))
         (old_home / "reports" / "t.md").write_text("old report")
         (old_home / "logs" / "t.log").write_text("old log")
@@ -4426,7 +5055,7 @@ class TestAutoAccountPick(_HomeSandbox):
                 self.assertEqual(self.spawned, [], "全满拒绝不许启动任何代理")
 
     def test_同名DeepSeek任务在auto和显式账号下都拒绝且状态不变(self):
-        old_home = ca.ensure_isolation(ca.DEEPSEEK, None)
+        old_home = self.task_storage(ca.DEEPSEEK, None)
         old_meta = _full_meta("t", runner="deepseek", account=None, dir=str(self.workdir))
         ca.write_meta(old_home, "t", old_meta)
         (old_home / "reports" / "t.md").write_text("old report")
@@ -4440,7 +5069,7 @@ class TestAutoAccountPick(_HomeSandbox):
                     self._run(account, self.FINE)
                 self.assertEqual(got.exception.code, 2)
                 self.assertIn("runner", got.exception.message)
-                self.assertEqual(ca.find_meta("t"), (old_home, old_meta))
+                self.assertEqual(ca.find_meta(self.storage, "t"), (old_home, old_meta))
                 after = {path.relative_to(self.home): path.read_bytes() if path.is_file() else None
                          for path in self.home.rglob("*")}
                 self.assertEqual(after, before)
@@ -4615,10 +5244,10 @@ class TestAutoAccountPick(_HomeSandbox):
         # 调 cmd_status 而不是只调 find_meta：要钉的是调用方看得见的那一面。
         self._run(ca.AUTO, self.LIMIT_LINE)
         with _capture_stdout() as printed:
-            ca.cmd_status(ca.build_parser().parse_args(["status", "t"]))
+            ca.cmd_status(ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)]))
         self.assertIn("t", printed["text"])
         with _capture_stdout() as printed:
-            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+            ca.cmd_status(ca.build_parser().parse_args(["status"] + ["--output-dir", str(self.output_dir)]))
         self.assertNotIn("还没有任何任务", printed["text"])
 
     def test_限流记录写不进去_不影响本轮结论_而且不许说已记下(self):
@@ -4654,7 +5283,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(code, 130)
         self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "被打断的轮次不许被记成撞上限")
-        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct2"), "t").exists(),
+        self.assertTrue(ca.meta_path(self.storage, "t").exists(),
                         "被打断的任务元数据必须留着——下一步是 resume")
 
     def test_不是额度问题_不记限流也不删元数据(self):
@@ -4662,7 +5291,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertEqual(code, ca.EXIT["failed"])
         self.assertIsNone(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "acct2")),
                           "普通失败不许被记成账号限流")
-        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct2"), "t").exists())
+        self.assertTrue(ca.meta_path(self.storage, "t").exists())
         self.assertNotIn("额度", self.printed)
 
     # ── 强制指定账号 ────────────────────────────────────────────────────
@@ -4677,7 +5306,7 @@ class TestAutoAccountPick(_HomeSandbox):
     def test_强制模式下同名任务属于别的账号_仍然拒跑(self):
         # 这道护栏在强制模式下**原样保留**：同一个名字出现在两个隔离目录里时，
         # find_meta 数出两份并拒绝，另一份成了再也够不着的孤儿元数据。
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct2"), "t",
+        ca.write_meta(self.task_storage(ca.CODEX, "acct2"), "t",
                       ca.new_meta("t", ca.CODEX, "acct2", "/tmp", "low", ()))
         with self.assertRaises(ca.Rejected) as got:
             ca.cmd_run(self._args("acct3"))
@@ -4685,44 +5314,29 @@ class TestAutoAccountPick(_HomeSandbox):
 
     # ── 迁移 ────────────────────────────────────────────────────────────
 
-    def test_任务原本在别的账号_auto显式迁移_元数据只剩一份(self):
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
-                      ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
-        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home(ca.CODEX, "acct3"),
-                         "前提不成立：任务没住进 acct3")
+    def test_auto换账号只更新原产物目录的元数据(self):
+        ca.write_meta(self.storage, "t", _full_meta("t", account="acct3"))
+        before = ca.meta_path(self.storage, "t")
         code = self._run(ca.AUTO, self.FINE)
-        self.assertEqual(self.spawned, ["acct2"], "auto 按恢复时间挑，不沿用旧家")
-        self.assertEqual(code, ca.EXIT["success"])
-        self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
-        self.assertEqual(ca.find_meta("t")[0], ca.isolation_home(ca.CODEX, "acct2"))
-        self.assertIn("acct3", self.printed, "要点名从哪个账号搬过来的")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.spawned, ["acct2"])
+        home, meta = ca.find_meta(self.storage, "t")
+        self.assertEqual(home, self.storage)
+        self.assertEqual(meta["account"], "acct2")
+        self.assertTrue(before.is_file())
+        self.assertEqual(len(ca.all_metas(self.storage)), 1)
+        for account in ("acct2", "acct3"):
+            self.assertFalse((ca.isolation_home(ca.CODEX, account) / "tasks").exists())
 
-    def test_迁移提示不许声称旧账号的报告被删掉_因为它没被删(self):
-        """**这条钉的是一句曾经的假话。**
-
-        原来那句「任务名 t 复用，上一轮的报告会被删掉、日志会被追加」在同一个
-        账号里是真的；跨账号时全是假的——`clear_report` 只动**这一轮要写的那个**
-        报告（新 home 的），旧 home 的 `reports/` 和 `logs/` 一个字节都没碰。
-        v3 的跨账号护栏注释里就写过「那句提示在跨账号时还是假话」，
-        v4 把护栏在 auto 模式下拆了，就不能把那句假话留下。
-        """
-        旧 = ca.ensure_isolation(ca.CODEX, "acct3")
-        ca.write_meta(旧, "t", ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
-        (旧 / "reports" / "t.md").write_text("上一轮的报告\n")
-        (旧 / "logs" / "t.log").write_text("上一轮的日志\n")
-
+    def test_auto换账号仍清原报告并追加原日志(self):
+        ca.write_meta(self.storage, "t", _full_meta("t", account="acct3"))
+        (self.storage / "reports/t.md").write_text("old report")
+        (self.storage / "logs/t.log").write_text("old log\n")
         self._run(ca.AUTO, self.FINE)
-
-        self.assertEqual((旧 / "reports" / "t.md").read_text(), "上一轮的报告\n",
-                         "旧账号的报告必须原样留着")
-        self.assertEqual((旧 / "logs" / "t.log").read_text(), "上一轮的日志\n",
-                         "旧账号的日志必须原样留着")
-        迁移行 = [l for l in self.printed.splitlines() if "acct3" in l]
-        self.assertTrue(迁移行, "前提不成立：根本没打印迁移提示")
-        for line in 迁移行:
-            self.assertNotIn("报告会被删掉", line, "这句在跨账号时是假话")
-        self.assertRegex("\n".join(迁移行), r"留在|原处|不动",
-                         "要说清旧账号的产物留在原处，否则调用方以为它们没了")
+        self.assertEqual((self.storage / "reports/t.md").read_text(), "干完了\n")
+        self.assertTrue((self.storage / "logs/t.log").read_text().startswith("old log\n"))
+        self.assertIn("acct3", self.printed)
+        self.assertIn("acct2", self.printed)
 
     def test_选中的账号上还有活着的codex_要在删旧元数据之前就拒(self):
         """**I6 回归锁：迁移的 unlink 不许排在一个可能失败的步骤前面。**
@@ -4739,9 +5353,9 @@ class TestAutoAccountPick(_HomeSandbox):
         `_previous_writer_alive` 第一步就返回 False——那边唯一还能挡住的
         就只剩 `find_agent_pid` 这一条。
         """
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
+        ca.write_meta(self.task_storage(ca.CODEX, "acct3"), "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
-        选中的报告 = ca._report_path(ca.ensure_isolation(ca.CODEX, "acct2"), "t")
+        选中的报告 = ca._report_path(self.task_storage(ca.CODEX, "acct2"), "t")
         self.assertEqual(ca.accounts_by_availability()[0], "acct2",
                          "前提不成立：auto 选的不是 acct2，这条测的就不是迁移")
 
@@ -4752,9 +5366,9 @@ class TestAutoAccountPick(_HomeSandbox):
             with self.assertRaises(ca.Rejected) as got:
                 ca.cmd_run(self._args(ca.AUTO))
         self.assertIn("还在跑", got.exception.message)
-        self.assertTrue(ca.meta_path(ca.isolation_home(ca.CODEX, "acct3"), "t").exists(),
+        self.assertTrue(ca.meta_path(self.storage, "t").exists(),
                         "拒绝发生在删旧元数据之后——任务在半路上消失了")
-        self.assertEqual(len(ca.all_metas()), 1, "元数据既不许没有，也不许有两份")
+        self.assertEqual(len(ca.all_metas(self.storage)), 1, "元数据既不许没有，也不许有两份")
 
     def test_任务住的那个账号掉了登录态_也能迁移走(self):
         """**这条是 v2 的一个反例，上一轮实测到的，留着当回归锁。**
@@ -4769,14 +5383,14 @@ class TestAutoAccountPick(_HomeSandbox):
         v4 里「排在最前」这个键已经整个删掉了，但迁移这一步必须留着，
         而且要对**掉了登录态**这种够不着旧账号的情形照样成立。
         """
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "acct3"), "t",
+        ca.write_meta(self.task_storage(ca.CODEX, "acct3"), "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
         self.assertNotIn("acct3", ca.accounts_by_availability(),
                          "前提不成立：掉了登录态的账号仍在候选里")
         code = self._run(ca.AUTO, self.FINE)
         self.assertEqual(code, ca.EXIT["success"])
-        self.assertEqual(len(ca.all_metas()), 1, "不许留下两份元数据")
+        self.assertEqual(len(ca.all_metas(self.storage)), 1, "不许留下两份元数据")
         self.assertIn("acct3", self.printed, "要点名是哪个账号够不着了")
 
 
@@ -4790,7 +5404,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def _args(self, task):
         return ca.build_parser().parse_args(
-            ["resume", task, "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", task, "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def test_任务不存在就报错(self):
         # 任务名必须先过 task_name 的字符集，所以这里用合法但不存在的名字，
@@ -4800,7 +5414,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertIn("没有这个任务", cm.exception.message)
 
     def test_还在跑就拒绝resume_写锁冲突和SIGTERM锁死长得一样(self):
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t",
+        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t",
                       _full_meta("t", session_id="s1", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             with self.assertRaises(ca.Rejected) as cm:
@@ -4808,7 +5422,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertIn("还在跑", cm.exception.message)
 
     def test_没有session_id就拒绝(self):
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t2",
+        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t2",
                       _full_meta("t2", dir=str(self.workdir)))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
@@ -4818,7 +5432,7 @@ class TestResumeGuards(_HomeSandbox):
     def test_工作目录没了就拒绝_run校验了resume也得校验(self):
         # worktree 被删后照样拼命令，codex 会以 os error 2 当场崩——
         # 和 `--cd` 给相对路径同款症状，而 run 那条路是被人话拒绝的
-        ca.write_meta(ca.ensure_isolation(ca.CODEX, "default"), "t4",
+        ca.write_meta(self.task_storage(ca.CODEX, "default"), "t4",
                       _full_meta("t4", session_id="s1", dir=str(self.home / "已经删了的worktree")))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             with self.assertRaises(ca.Rejected) as cm:
@@ -4830,10 +5444,10 @@ class TestResumeGuards(_HomeSandbox):
         # resume 这条路上不查的话，config.toml 被软链回主配置、auth.json 指错
         # 账号，全都查不出来——而这种失效是静默的：跑起来一切正常，
         # 只是 codex 看得见它不该看见的东西。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t5", _full_meta("t5", session_id="s1", dir=str(self.workdir)))
-        (d / "config.toml").unlink()
-        (d / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
+        (ca.isolation_home(ca.CODEX, "default") / "config.toml").unlink()
+        (ca.isolation_home(ca.CODEX, "default") / "config.toml").symlink_to(self.home / ".codex" / "config.toml")
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
             with self.assertRaises(ca.Rejected) as cm:
                 ca.cmd_resume(self._args("t5"))
@@ -4841,7 +5455,7 @@ class TestResumeGuards(_HomeSandbox):
 
     def test_resume会刷新started_at_元数据描述的是最后一次调用(self):
         # 完整的轮次历史在日志的分隔符里，元数据只描述最后一次
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t6", _full_meta("t6", session_id="s1", dir=str(self.workdir),
                                           started_at="2020-01-01T00:00:00"))
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
@@ -4850,7 +5464,7 @@ class TestResumeGuards(_HomeSandbox):
         self.assertNotEqual(meta["started_at"], "2020-01-01T00:00:00")
 
     def test_resume开跑前也要删报告_秒死于写锁时才不会误判成功(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t3", _full_meta("t3", session_id="s1", dir=str(self.workdir)))
         (d / "reports" / "t3.md").write_text("上一轮的报告")
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), _no_codex():
@@ -4873,7 +5487,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "msg.md"
         self.brief.write_text("顺便把 X 也改了")
-        self.d = ca.ensure_isolation(ca.CODEX, "default")
+        self.d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(self.d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         ca._log_path(self.d, "t").write_text(
             ca.round_separator("run", "t", "2026-09-19T00:00:00") + "\n")
@@ -4886,7 +5500,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         """
         return argparse.Namespace(
             task=task, brief=str(self.brief if brief is None else brief), effort="low",
-            skills=())
+            skills=(), output_dir=self.output_dir)
 
     def test_在跑时顺序是先打断再续跑(self):
         order = []
@@ -5058,7 +5672,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         return seen["argv"][-1]
 
     def _meta_for_resume(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         return d
 
@@ -5066,7 +5680,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -5076,7 +5690,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         ca.ensure_isolation(ca.CODEX, "default")
         args = ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(self.skill)])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(self.skill)] + ["--output-dir", str(self.output_dir)])
         brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
                         f"codex 实际收到的是：{brief[:60]!r}")
@@ -5090,7 +5704,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self._meta_for_resume()
         args = ca.build_parser().parse_args(
             ["resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--skill", str(self.skill)])
+             "--skill", str(self.skill)] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
         self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
@@ -5102,7 +5716,7 @@ class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
         self._meta_for_resume()
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--no-skill"])
+             "--no-skill"] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             brief = self._brief_codex_actually_got(
                 lambda: ca.cmd_interrupt_and_resume(args))
@@ -5163,7 +5777,7 @@ class TestStatusIsSplittable(_HomeSandbox):
                 self.assertEqual(row.split(maxsplit=4)[3], code)
 
     def test_明细行有缩进_数据行没有(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         # 有报告时 C 是转述输出；用未知 target 的 B 保持 suspect，继续验证格式。
         ca._log_path(d, "t").write_text(ca.round_separator("run", "t", "2026-09-19T00:00:00")
@@ -5172,7 +5786,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         screen = io.StringIO()
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(screen):
-            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+            ca.cmd_status(ca.build_parser().parse_args(["status"] + ["--output-dir", str(self.output_dir)]))
         lines = [l for l in screen.getvalue().splitlines() if l]
         data = [l for l in lines if not l[0].isspace()]
         detail = [l for l in lines if l[0].isspace()]
@@ -5196,7 +5810,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         # account_choices() 在入口拒（见 TestIsolation），而 status 第二列读的是
         # tasks/<task>.json 里的 account 字段——_load_meta 只校验**键**在不在，
         # 值长什么样一概不管，所以这一道是独立的第二个入口，不是重复防御。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", account="bad acct"))
         self.assertEqual(ca._load_meta(ca.meta_path(d, "t"))["account"], "bad acct",
                          "前提不成立：元数据这一侧居然校验了 account 的值，那就不是真的洞")
@@ -5230,7 +5844,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         # 刻意选 interrupted 这一支：它的 reason **真的含空格**，端到端走一遍才算
         # 把「reason 排在最后」这件事钉住。选 failed 那一支测不到——它的 reason
         # （「报告缺失或为空＝没正常收尾」）一个空格都没有。
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         for name in ("alpha", "beta"):
             ca.write_meta(d, name, _full_meta(name, dir="/abs/repo"))
             ca._log_path(d, name).write_text(
@@ -5239,7 +5853,7 @@ class TestStatusIsSplittable(_HomeSandbox):
         screen = io.StringIO()
         with mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              contextlib.redirect_stdout(screen):
-            ca.cmd_status(ca.build_parser().parse_args(["status"]))
+            ca.cmd_status(ca.build_parser().parse_args(["status"] + ["--output-dir", str(self.output_dir)]))
         data = [l for l in screen.getvalue().splitlines() if l and not l[0].isspace()]
         self.assertEqual([l.split(maxsplit=4)[0] for l in data], ["alpha", "beta"])
         for line in data:
@@ -5269,20 +5883,20 @@ class TestExitCodeContract(_HomeSandbox):
     def _run_args(self):
         return ca.build_parser().parse_args(
             ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"])
+             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def _resume_args(self):
         return ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            ["resume", "t", "--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
 
     def _run(self, report_text, log_extra=""):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         with _no_codex() as popen:
             popen.side_effect = self._spawner(d, report_text, log_extra)
             return ca.cmd_run(self._run_args())
 
     def _resume(self, report_text, log_extra=""):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         with _no_codex() as popen, mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
@@ -5317,11 +5931,11 @@ class TestExitCodeContract(_HomeSandbox):
         self.assertEqual(self._resume("干完了", self.UNCLASSIFIED), 3)
 
     def _interrupt_and_resume(self, report_text, log_extra=""):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
         args = ca.build_parser().parse_args(
             ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--no-skill"])
+             "--no-skill"] + ["--output-dir", str(self.output_dir)])
         # 没在跑：这条路不发信号，直接续跑——验的是「续跑那一轮的判据结论就是退出码」
         with _no_codex() as popen, mock.patch.object(ca, "find_task_agent_pid", return_value=None):
             popen.side_effect = self._spawner(d, report_text, log_extra)
@@ -5349,14 +5963,14 @@ class TestExitCodeContract(_HomeSandbox):
         self.assertEqual(self._run(None, ca.INTERRUPT_MARK), 130)
 
     def test_status_还在跑退出4_否则status_and_deploy会提前部署(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
-        args = ca.build_parser().parse_args(["status", "t"])
+        args = ca.build_parser().parse_args(["status", "t"] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=99999):
             self.assertEqual(ca.cmd_status(args), 4)
 
     def test_status_一个任务都没有时退出0_查询没查到不是失败(self):
-        args = ca.build_parser().parse_args(["status"])
+        args = ca.build_parser().parse_args(["status"] + ["--output-dir", str(self.output_dir)])
         self.assertEqual(ca.cmd_status(args), 0)
 
     def test_多任务取最该拦住调用方的那个(self):
@@ -5396,7 +6010,7 @@ class TestRunCodexOwnsReportPath(unittest.TestCase):
             return ["codex"]
 
         with _no_codex():
-            ca.run_codex("run", d, "t", _full_meta("t"), make_argv)
+            _run_round("run", d, "t", _full_meta("t"), make_argv)
         self.assertEqual(seen["给调用方的"], str(ca._report_path(d, "t")))
 
     def test_跑完之后信号处置被还原(self):
@@ -5410,14 +6024,14 @@ class TestRunCodexOwnsReportPath(unittest.TestCase):
         watched = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
         before = {s: signal.getsignal(s) for s in watched}
         with _no_codex():
-            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+            _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual({s: signal.getsignal(s) for s in watched}, before)
 
-    def test_环境变量由home派生_调用方传不进一个对不上的(self):
+    def test_环境变量由元数据账号选取而非产物路径(self):
         d = self._dir()
         with _no_codex() as popen:
-            ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
-        self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(d))
+            _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        self.assertEqual(popen.call_args.kwargs["env"]["CODEX_HOME"], str(ca.isolation_home(ca.CODEX, "default")))
 
 
 class TestSignalSafety(unittest.TestCase):
@@ -5429,7 +6043,7 @@ class TestSignalSafety(unittest.TestCase):
             (d / sub).mkdir()
         popen.return_value.stdout.read1.return_value = b""
         popen.return_value.wait.return_value = 0
-        ca.run_codex("run", d, "t", _full_meta("t"), lambda r: ["codex"])
+        _run_round("run", d, "t", _full_meta("t"), lambda r: ["codex"])
 
     def test_codex起在独立会话里_组信号打不到它(self):
         with mock.patch.object(ca.subprocess, "Popen") as popen:
@@ -5480,7 +6094,7 @@ class TestRunCodexStreaming(unittest.TestCase):
             "import sub_agent_runner as ca;"
             f"d = pathlib.Path({str(d)!r});"
             f"ca.run_codex('run', d, 't', {_full_meta('t')!r},"
-            f" lambda r: [sys.executable, '-c', {fake_codex!r}])"
+            f" lambda r: [sys.executable, '-c', {fake_codex!r}], os.open(d, os.O_RDONLY | os.O_DIRECTORY))"
         )
         # 屏幕这一路也接到文件上一起验。接的是文件不是 tty，Python 默认块缓冲，
         # 所以「这行现在就能读到」只可能来自 sys.stdout.buffer.flush()——
@@ -5714,7 +6328,7 @@ class TestWaitPreviousRoundEnds(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation(ca.CODEX, "default")
+        self.d = self.task_storage(ca.CODEX, "default")
 
     def _写盘(self, **over):
         ca.write_meta(self.d, "t", _full_meta("t", **over))
@@ -5844,7 +6458,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
 
     def setUp(self):
         super().setUp()
-        self.d = ca.ensure_isolation(ca.CODEX, "default")
+        self.d = self.task_storage(ca.CODEX, "default")
 
     def test_等的是磁盘上那份_不是传进来的meta(self):
         """**本版头号回归锁。**
@@ -5873,7 +6487,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
         with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex():
-            ca.run_codex("run", self.d, "t", 活的, lambda r: ["codex"])
+            _run_round("run", self.d, "t", 活的, lambda r: ["codex"])
         self.assertLess(time.monotonic() - started, 0.3,
                         "等了——说明读的是参数那份，而那一份记的根本不是上一轮的写者")
 
@@ -5888,12 +6502,12 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
         with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0.3), \
              mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex():
-            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+            _run_round("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
             落盘 = json.loads(ca.meta_path(self.d, "t").read_text())
             self.assertEqual((落盘["writer_pid"], 落盘["writer_start"]), ca._writer_identity(),
                              "前提不成立：第一轮没把本进程的身份盖上去，第二轮就不会等自己")
             started = time.monotonic()
-            ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+            _run_round("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertLess(time.monotonic() - started, 0.3, "第二轮在等自己")
 
     def test_超时就拒绝_且不留半个状态(self):
@@ -5911,7 +6525,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
              mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
              _no_codex() as popen:
             with self.assertRaises(ca.Rejected) as cm:
-                ca.run_codex("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
+                _run_round("run", self.d, "t", _full_meta("t"), lambda r: ["codex"])
         self.assertEqual(cm.exception.code, 2, "护栏拒绝走 2，不许和判据结论撞码")
         popen.assert_not_called()
         self.assertEqual(报告.read_text(), "上一轮的报告", "clear_report 跑了")
@@ -5933,7 +6547,7 @@ class TestRunCodexWaitsForPreviousRound(_HomeSandbox):
                      mock.patch.object(ca, "find_task_agent_pid", return_value=None), \
                      _no_codex():
                     with self.assertRaises(ca.Rejected) as cm:
-                        ca.run_codex(kind, self.d, "t", _full_meta("t"), lambda r: ["codex"])
+                        _run_round(kind, self.d, "t", _full_meta("t"), lambda r: ["codex"])
                 self.assertIn(期望, cm.exception.message)
                 self.assertIn("包装器还在读", cm.exception.message, "没说清谁还没停")
 
@@ -5946,13 +6560,13 @@ class TestEveryInterruptPathLeavesAMark(_HomeSandbox):
     """
 
     def test_stop这条路也留痕(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
         log = ca._log_path(d, "t")
         # 非空日志，理由见 TestInterruptCodex.HEAD 上面那段
         head = ROUND_SEP_SAMPLE + "\nsession id: 01a0b408-f718-7ff3-8123-d5202551acba\n"
         log.write_text(head)
-        args = ca.build_parser().parse_args(["stop", "t"])
+        args = ca.build_parser().parse_args(["stop", "t"] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
@@ -6016,9 +6630,9 @@ class TestWrapperSpeaksImmediately(unittest.TestCase):
 
 class TestStop(_HomeSandbox):
     def test_只发SIGINT_绝不发SIGTERM(self):
-        d = ca.ensure_isolation(ca.CODEX, "default")
+        d = self.task_storage(ca.CODEX, "default")
         ca.write_meta(d, "t", _full_meta("t"))
-        args = ca.build_parser().parse_args(["stop", "t"])
+        args = ca.build_parser().parse_args(["stop", "t"] + ["--output-dir", str(self.output_dir)])
         with mock.patch.object(ca, "find_task_agent_pid", return_value=4242), \
              mock.patch.object(ca.os, "kill") as k:
             ca.cmd_stop(args)
@@ -6088,7 +6702,7 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
             f"sys.path.insert(0, {str(pathlib.Path(ca.__file__).parent)!r})\n"
             "import sub_agent_runner as ca\n"
             f"ca.run_codex('run', pathlib.Path({str(d)!r}), 't', {_full_meta('t')!r},"
-            f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}])\n"
+            f" lambda r: [sys.executable, '-c', {self.FAKE_CODEX!r}, {str(mark)!r}], os.open({str(d)!r}, os.O_RDONLY | os.O_DIRECTORY))\n"
         )
         # 包装器自己起在独立会话里，这样 killpg 只打到它那一组，不会波及测试进程
         proc = subprocess.Popen([sys.executable, "-c", driver],
@@ -6154,7 +6768,7 @@ class TestQuotaReadTime(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
         self.brief.write_text("继续干活")
-        self.task_home = ca.ensure_isolation(ca.CODEX, "default")
+        self.task_home = self.task_storage(ca.CODEX, "default")
         real_datetime = datetime.datetime
 
         class Clock(real_datetime):
@@ -6178,7 +6792,7 @@ class TestQuotaReadTime(_HomeSandbox):
                 "t", dir=str(self.workdir), session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
             argv = [kind, "t"]
         args = ca.build_parser().parse_args(
-            argv + ["--brief", str(self.brief), "--effort", "max", "--no-skill"])
+            argv + ["--brief", str(self.brief), "--effort", "max", "--no-skill"] + ["--output-dir", str(self.output_dir)])
         iterator = iter(chunks)
 
         def read(size):
@@ -6203,7 +6817,7 @@ class TestQuotaReadTime(_HomeSandbox):
                     chunks.append((datetime.datetime(2026, 10, 22, 19), later))
                 chunks.append((datetime.datetime(2026, 10, 22, 19), b""))
                 self._run_chunks("run", chunks)
-                self.assertEqual(ca.read_usage_limit(self.task_home),
+                self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")),
                                  datetime.datetime(2026, 10, 22, 6))
 
     def test_ANSI和跨块行以收齐的时刻为参照(self):
@@ -6214,13 +6828,13 @@ class TestQuotaReadTime(_HomeSandbox):
             (datetime.datetime(2026, 10, 21, 19), raw[:cut]),
             (datetime.datetime(2026, 10, 22, 5), raw[cut:]),
             (datetime.datetime(2026, 10, 22, 19), b"")])
-        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")), datetime.datetime(2026, 10, 22, 6))
 
     def test_无换行的最后一行也在EOF被收齐(self):
         self._run_chunks("run", [
             (datetime.datetime(2026, 10, 22, 5), self.LIMIT.encode()),
             (datetime.datetime(2026, 10, 22, 5, 1), b"")])
-        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")), datetime.datetime(2026, 10, 22, 6))
 
     def test_输出flush不能把已经读到的错误行时间拖晚(self):
         clock = self.clock
@@ -6241,7 +6855,7 @@ class TestQuotaReadTime(_HomeSandbox):
              ("    fixture: " + self.LIMIT + "\nERROR: hit your usage limit\n").encode()),
             (datetime.datetime(2026, 10, 22, 5), (self.LIMIT + "\n").encode()),
             (datetime.datetime(2026, 10, 22, 19), b"")])
-        self.assertEqual(ca.read_usage_limit(self.task_home), datetime.datetime(2026, 10, 22, 6))
+        self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")), datetime.datetime(2026, 10, 22, 6))
 
     def test_读取时刻行号对不上时不记无日期消息_带日期仍记(self):
         tee = ca._tee_until_exit
@@ -6253,11 +6867,11 @@ class TestQuotaReadTime(_HomeSandbox):
         for line, want in ((self.LIMIT, None),
                            (ERR_USER_LAYER_REAL, datetime.datetime(2026, 9, 25, 17, 4))):
             with self.subTest(line=line), mock.patch.object(ca, "_tee_until_exit", mismatched):
-                ca.usage_limit_path(self.task_home).unlink(missing_ok=True)
+                ca.usage_limit_path(ca.isolation_home(ca.CODEX, "default")).unlink(missing_ok=True)
                 output = self._run_chunks("run", [
                     (datetime.datetime(2026, 10, 22, 5), (line + "\n").encode()),
                     (datetime.datetime(2026, 10, 22, 19), b"")])
-                self.assertEqual(ca.read_usage_limit(self.task_home), want)
+                self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")), want)
                 if want is None:
                     self.assertIn("恢复时间没记下", output)
 
@@ -6267,322 +6881,17 @@ class TestQuotaReadTime(_HomeSandbox):
                 output = self._run_chunks(kind, [
                     (datetime.datetime(2026, 10, 22, 5), (self.LIMIT + "\n").encode()),
                     (datetime.datetime(2026, 10, 22, 5, 1), b"")])
-                self.assertEqual(ca.read_usage_limit(self.task_home),
+                self.assertEqual(ca.read_usage_limit(ca.isolation_home(ca.CODEX, "default")),
                                  datetime.datetime(2026, 10, 22, 6))
                 self.assertIn("重跑这条命令（--account auto）会被拒", output)
                 self.assertIn("run", output)
                 self.assertIn("新会话", output)
 
 
-class TestTaskMigration(_HomeSandbox):
-    """换家必须保有唯一的元数据，并在读者确认归属后才能操作隔离目录。"""
-
-    def setUp(self):
-        super().setUp()
-        self.old_home = ca.ensure_isolation(ca.CODEX, "default")
-        account_dir = self.home / ".codex-accounts" / "acct2"
-        account_dir.mkdir(parents=True)
-        (account_dir / "auth.json").write_text("{}")
-        self.new_home = ca.ensure_isolation(ca.CODEX, "acct2")
-        self.workdir = self.home / "repo"
-        self.workdir.mkdir()
-        self.brief = self.home / "brief.md"
-        self.brief.write_text("干活")
-        self.old_meta = _full_meta("t", dir=str(self.workdir),
-                                   session_id="01a0b408-f718-7ff3-8123-d5202551acba")
-        ca.write_meta(self.old_home, "t", self.old_meta)
-        ca.write_usage_limit(self.old_home, datetime.datetime(2099, 1, 1), "fixture")
-
-    def _args(self):
-        return ca.build_parser().parse_args([
-            "run", "--task", "t", "--runner", "codex", "--account", "auto",
-            "--dir", str(self.workdir), "--brief", str(self.brief),
-            "--effort", "max", "--no-skill"])
-
-    def _run(self):
-        def spawn(argv, **kwargs):
-            proc = mock.MagicMock()
-            pathlib.Path(argv[argv.index("-o") + 1]).write_text("done")
-            raw = b"done\n"
-            proc.stdout = io.BytesIO(raw)
-            return proc
-
-        with _capture_stdout() as output, mock.patch.object(ca.subprocess, "Popen", spawn):
-            code = ca.cmd_run(self._args())
-        return code, output["text"]
-
-    def test_auto在账号间往返_旧产物保留_status显示新账号(self):
-        (self.old_home / "logs" / "t.log").write_text("old log")
-        (self.old_home / "reports" / "t.md").write_text("old report")
-        self.assertEqual(self._run()[0], 0)
-        home, meta = ca.find_meta("t")
-        self.assertEqual((home, meta["runner"], meta["account"]),
-                         (self.new_home, "codex", "acct2"))
-        self.assertFalse(ca.meta_path(self.old_home, "t").exists())
-        self.assertEqual(len(ca.all_metas()), 1)
-        self.assertEqual((self.old_home / "logs" / "t.log").read_text(), "old log")
-        self.assertEqual((self.old_home / "reports" / "t.md").read_text(), "old report")
-        with _capture_stdout() as output:
-            self.assertEqual(ca.cmd_status(argparse.Namespace(task="t")), 0)
-        self.assertEqual(output["text"].split()[1], "codex:acct2")
-        new_log = (self.new_home / "logs" / "t.log").read_bytes()
-        ca.usage_limit_path(self.old_home).unlink()
-        ca.write_usage_limit(self.new_home, datetime.datetime(2099, 1, 1), "fixture")
-        try:
-            self.assertEqual(self._run()[0], 0)
-        except ca.Rejected as error:
-            self.fail("auto 应能从 acct2 换回 default：" + error.message)
-        home, meta = ca.find_meta("t")
-        self.assertEqual((home, meta["runner"], meta["account"]),
-                         (self.old_home, "codex", "default"))
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-        self.assertEqual((self.new_home / "logs" / "t.log").read_bytes(), new_log)
-
-    def test_brief校验在换家之前_旧元数据一个字节不动(self):
-        self.brief.write_text("不得使用任何 skill")
-        before = ca.meta_path(self.old_home, "t").read_bytes()
-        with self.assertRaises(ca.Rejected):
-            self._run()
-        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
-        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-
-    def test_旧家agent还在跑就拒绝且不换家(self):
-        def agent(runner, home, task):
-            return 4242 if (runner, home) == ("codex", self.old_home) else None
-
-        with mock.patch.object(ca, "find_task_agent_pid", agent):
-            with self.assertRaises(ca.Rejected) as got:
-                self._run()
-        self.assertIn("还在跑", got.exception.message)
-        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-
-    def test_旧writer尚未结束就拒绝且不换家(self):
-        self.old_meta.update(_live_writer(self))
-        ca.write_meta(self.old_home, "t", self.old_meta)
-        before = ca.meta_path(self.old_home, "t").read_bytes()
-        with self.assertRaises(ca.Rejected) as got:
-            self._run()
-        self.assertRegex(got.exception.message, "writer|收尾")
-        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-
-    def test_rename失败时原文件不变_不启动代理(self):
-        before = ca.meta_path(self.old_home, "t").read_bytes()
-        with mock.patch.object(ca.os, "rename", side_effect=OSError("rename failed")):
-            with self.assertRaises(ca.Rejected) as got:
-                self._run()
-        self.assertIn("rename", got.exception.message)
-        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-
-    def test_写新内容失败时挪回旧家且内容不变(self):
-        before = ca.meta_path(self.old_home, "t").read_bytes()
-        replace = ca.os.replace
-
-        def fail_new(src, dst):
-            if dst == ca.meta_path(self.new_home, "t"):
-                raise OSError("new write failed")
-            return replace(src, dst)
-
-        with mock.patch.object(ca.os, "replace", fail_new):
-            try:
-                self._run()
-            except (ca.Rejected, OSError) as error:
-                self.assertIsInstance(error, ca.Rejected, "写失败要给出可操作的拒绝说明")
-            else:
-                self.fail("新内容写失败却继续派活")
-        self.assertTrue(ca.meta_path(self.old_home, "t").exists())
-        self.assertEqual(ca.meta_path(self.old_home, "t").read_bytes(), before)
-        self.assertFalse(ca.meta_path(self.new_home, "t").exists())
-        self.assertEqual(ca.find_meta("t")[0], self.old_home)
-
-    def test_写新和挪回都失败后_各入口拒用不一致的目录(self):
-        rename = ca.os.rename
-
-        def fail_rollback(src, dst):
-            if dst == ca.meta_path(self.old_home, "t"):
-                raise OSError("rollback failed")
-            return rename(src, dst)
-
-        with mock.patch.object(ca.os, "rename", fail_rollback), \
-                mock.patch.object(ca.os, "replace", side_effect=OSError("write failed")):
-            try:
-                with self.assertRaises(ca.Rejected) as got:
-                    self._run()
-            except OSError:
-                self.fail("迁移失败未给出元数据位置与恢复说明")
-        self.assertIn(str(ca.meta_path(self.new_home, "t")), got.exception.message)
-        self.assertFalse(ca.meta_path(self.old_home, "t").exists())
-        self.assertTrue(ca.meta_path(self.new_home, "t").exists())
-        for command in ("status", "resume", "interrupt-and-resume", "stop", "run"):
-            with self.subTest(command=command), \
-                    mock.patch.object(ca, "find_task_agent_pid", side_effect=AssertionError("用了错误的家")):
-                args = self._args() if command == "run" else ca.build_parser().parse_args(
-                    [command, "t"] + ([] if command in ("status", "stop") else
-                                      ["--brief", str(self.brief), "--effort", "max", "--no-skill"]))
-                with self.assertRaises(ca.Rejected) as got:
-                    args.func(args)
-                self.assertIn(str(self.old_home / "tasks"), got.exception.message)
-                self.assertIn(str(self.new_home / "tasks"), got.exception.message)
-                self.assertRegex(got.exception.message, "挪回|移回")
 
 
-class TestMetadataReaders(_HomeSandbox):
-    def setUp(self):
-        super().setUp()
-        self.default_home = ca.ensure_isolation(ca.CODEX, "default")
-        account_dir = self.home / ".codex-accounts" / "acct2"
-        account_dir.mkdir(parents=True)
-        (account_dir / "auth.json").write_text("{}")
-        self.acct2_home = ca.ensure_isolation(ca.CODEX, "acct2")
-        self.default_meta = _full_meta("t")
-        self.acct2_meta = _full_meta("t", account="acct2")
 
-    def _move(self, old, new, meta):
-        os.rename(ca.meta_path(old, "t"), ca.meta_path(new, "t"))
-        ca.write_meta(new, "t", meta)
 
-    def test_新任务零份立即只重扫一次_不等一秒(self):
-        with mock.patch.object(ca, "isolation_roots", wraps=ca.isolation_roots) as roots, \
-                mock.patch.object(ca.time, "sleep", side_effect=AssertionError("新任务不该等")):
-            self.assertEqual(ca.find_meta("brand-new"), (None, None))
-        self.assertEqual(roots.call_count, 2)
-
-    def test_读取旧家后rename_重扫不能误判两份(self):
-        ca.write_meta(self.default_home, "t", self.default_meta)
-        load = ca._load_meta
-        moved = False
-
-        def load_and_move(path):
-            nonlocal moved
-            meta = load(path)
-            if path == ca.meta_path(self.default_home, "t") and not moved:
-                moved = True
-                self._move(self.default_home, self.acct2_home, self.acct2_meta)
-            return meta
-
-        with mock.patch.object(ca, "_load_meta", load_and_move):
-            try:
-                found = ca.find_meta("t")
-            except ca.Rejected as error:
-                self.fail(error.message)
-        self.assertEqual(found, (self.acct2_home, self.acct2_meta))
-
-    def test_读完acct2旧家后换到default_resume不重建旧元数据(self):
-        # 新家在扫描顺序中更早，读完旧家后再搬走，就不会在本轮扫出两份。
-        # 注入的只是迁移时刻；rename、写新内容、续跑和元数据落盘都走真实代码。
-        for meta in (self.acct2_meta, self.default_meta):
-            meta.update(dir=str(self.home), session_id="01a0b408-f718-7ff3-8123-d5202551acba")
-        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
-        brief = self.home / "brief.md"
-        brief.write_text("继续干活")
-        args = ca.build_parser().parse_args([
-            "resume", "t", "--brief", str(brief), "--effort", "max", "--no-skill"])
-        load = ca._load_meta
-        moved = False
-
-        def load_and_move(path):
-            nonlocal moved
-            meta = load(path)
-            if path == ca.meta_path(self.acct2_home, "t") and not moved:
-                moved = True
-                self._move(self.acct2_home, self.default_home, self.default_meta)
-            return meta
-
-        with mock.patch.object(ca, "_load_meta", load_and_move), \
-                _fake_agent_proc(b"done\n") as agent, _capture_stdout():
-            self.assertEqual(ca.cmd_resume(args), 1)
-        self.assertFalse(ca.meta_path(self.acct2_home, "t").exists(), "续跑重建了已搬走的旧家")
-        self.assertEqual(agent.call_args.kwargs["env"]["CODEX_HOME"], str(self.default_home),
-                         "续跑仍用了旧账号的隔离环境")
-        paths = [path for home in ca.isolation_roots() for path in (home / "tasks").glob("t.json")]
-        self.assertEqual(paths, [ca.meta_path(self.default_home, "t")])
-        self.assertEqual(ca.find_meta("t")[1]["account"], "default")
-
-    def test_读取后原位置内容已变_重扫取新内容(self):
-        ca.write_meta(self.default_home, "t", self.default_meta)
-        current = dict(self.default_meta, started_at="2026-10-22T12:00:00")
-        load = ca._load_meta
-        changed = False
-
-        def load_and_change(path):
-            nonlocal changed
-            meta = load(path)
-            if not changed:
-                changed = True
-                ca.write_meta(self.default_home, "t", current)
-            return meta
-
-        with mock.patch.object(ca, "_load_meta", load_and_change):
-            self.assertEqual(ca.find_meta("t"), (self.default_home, current))
-
-    def test_读新家前rename_瞬时零份立即重扫(self):
-        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
-        exists = pathlib.Path.exists
-        moved = False
-
-        def move_before_old_exists(path):
-            nonlocal moved
-            if path == ca.meta_path(self.acct2_home, "t") and not moved:
-                moved = True
-                self._move(self.acct2_home, self.default_home, self.default_meta)
-            return exists(path)
-
-        with mock.patch.object(pathlib.Path, "exists", move_before_old_exists):
-            self.assertEqual(ca.find_meta("t"), (self.default_home, self.default_meta))
-
-    def test_exists和read之间rename_不能抛裸文件不存在(self):
-        ca.write_meta(self.default_home, "t", self.default_meta)
-        load = ca._load_meta
-        moved = False
-
-        def move_before_read(path):
-            nonlocal moved
-            if path == ca.meta_path(self.default_home, "t") and not moved:
-                moved = True
-                self._move(self.default_home, self.acct2_home, self.acct2_meta)
-            return load(path)
-
-        with mock.patch.object(ca, "_load_meta", move_before_read):
-            try:
-                found = ca.find_meta("t")
-            except (FileNotFoundError, ca.Rejected) as error:
-                self.fail(str(error))
-        self.assertEqual(found, (self.acct2_home, self.acct2_meta))
-
-    def test_rename到新家但未写完_等待内容与位置一致(self):
-        ca.write_meta(self.default_home, "t", self.default_meta)
-        os.rename(ca.meta_path(self.default_home, "t"), ca.meta_path(self.acct2_home, "t"))
-
-        def finish():
-            time.sleep(0.15)
-            ca.write_meta(self.acct2_home, "t", self.acct2_meta)
-
-        writer = threading.Thread(target=finish)
-        writer.start()
-        self.addCleanup(writer.join)
-        self.assertEqual(ca.find_meta("t"), (self.acct2_home, self.acct2_meta))
-
-    def test_持续多份列出路径与内容所指的家_其他任务仍显示(self):
-        ca.write_meta(self.default_home, "t", self.default_meta)
-        ca.write_meta(self.acct2_home, "t", self.acct2_meta)
-        ca.write_meta(self.default_home, "good", _full_meta("good"))
-        (self.default_home / "reports" / "good.md").write_text("finished")
-        with self.assertRaises(ca.Rejected) as got:
-            ca.find_meta("t")
-        for path in (self.default_home / "tasks" / "t.json", self.acct2_home / "tasks" / "t.json"):
-            self.assertIn(str(path), got.exception.message)
-        self.assertRegex(got.exception.message, "删掉|删除")
-        with _capture_stdout() as output, contextlib.redirect_stderr(io.StringIO()) as errors:
-            try:
-                code = ca.cmd_status(argparse.Namespace(task=None))
-            except ca.Rejected as error:
-                self.fail("坏任务不该让整个列表拒绝：" + error.message)
-        self.assertEqual(code, 2)
-        self.assertIn("good", output["text"])
-        self.assertIn("t.json", output["text"] + errors.getvalue())
 
 
 class TestModuleBashCallIsolation(_HomeSandbox):
@@ -6701,7 +7010,7 @@ class TestBackgroundRunner(_HomeSandbox):
                  "--dir", str(self.workdir)] if command == "run" else [command, "t"])
         if command in ("run", "resume", "interrupt-and-resume"):
             args += ["--brief", str(self.brief), "--effort", "max", "--no-skill"]
-        return args
+        return args + ["--output-dir", str(self.output_dir)]
 
     def test_前台三个启动入口都在状态变更前拒绝_调用只留一份拒绝标记(self):
         before = {p.relative_to(self.home) for p in self.home.rglob("*")}
@@ -6735,7 +7044,7 @@ class TestBackgroundRunner(_HomeSandbox):
     def test_后台三入口结束都写实际结论(self):
         for command in ("run", "resume", "interrupt-and-resume"):
             with self.subTest(command=command):
-                home = ca.ensure_isolation(ca.CODEX, "default")
+                home = self.task_storage(ca.CODEX, "default")
                 ca.write_meta(home, "t", _full_meta("t", dir=str(self.workdir),
                               session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
                 with mock.patch.dict(os.environ, {"SUB_AGENT_RUNNER_BASH_CALL": "background:" + command}), \
@@ -6985,7 +7294,7 @@ class TestBackgroundEndCall(_HomeSandbox):
                 ("arguments", invalid, "--brief")):
             with self.subTest(label=label):
                 call_id = "rejected-" + label
-                command = shlex.join([sys.executable, ca.__file__, *argv])
+                command = shlex.join([sys.executable, ca.__file__, *argv, "--output-dir", str(self.output_dir)])
                 body = command + " > /dev/null 2>&1 & wait; echo dispatched"
                 code, output = self._finish(self._start(body, call_id, True))
                 self.assertEqual(code, 2, output)

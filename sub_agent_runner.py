@@ -10,9 +10,9 @@
 只按 runner 取事实。
 `cmd_run` 选择执行者与 argv builder，auto 在全部有登录态的 codex 号都有限流记录
 且未到期时，在任何任务状态变更前拒绝（退出码 2），逐个列出账号与恢复时间。
-换 DeepSeek 由调用方按 SKILL.md 换任务名、显式派活；auto 只在 codex 账号间搬元数据。
+换 DeepSeek 由调用方按 SKILL.md 换任务名、显式派活；auto 只在 codex 账号间选号。
 run 和续跑共用 `record_usage_limit`，只记账与提示，不在轮内接力。
-status/resume/stop 从唯一且归属一致的元数据查实际执行者。
+任务文件按产物目录与任务名定位，账号只决定运行环境；status/resume/stop 从元数据查执行者。
 
 后台事实由 `background_guard.py mark-call` 传入；三个启动入口运行时拒绝前台。
 shell 退出时 end-call 等待本次调用脱离的 runner 并收齐结论，不另造通知通道。
@@ -21,15 +21,17 @@ shell 退出时 end-call 等待本次调用脱离的 runner 并收齐结论，�
 成败判据、续跑、停止全部由本文件保证。约束写在代码里而不是文档里，
 是因为文档只能靠调用方记住，而记不住的代价在 SKILL.md 的历史里写满了。
 
-**工具改名了（`codex-sub-agent` → `sub-agent-runner`），盘上的东西一个没改：**
+**工具改名后仍保留旧日志的标记与账号隔离目录名：**
 隔离目录名 `~/.codex-subagent*`、`ROUND_MARK`、`INTERRUPT_MARK` 的文本。
 它们写在每一份现存日志和 260 份现存元数据里，被整行正则匹配——
 一次全局 sed 会让所有旧日志的轮次边界和打断痕迹当场认不出来。
-不对称是刻意的：**用户敲的是命令名，盘上的东西谁都不该动。**
+接入 runs 只搬任务文件的位置，元数据字段和日志格式不变。
 有测试钉着（`TestOnDiskContract`）。
 """
 import argparse
 import datetime
+import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -54,6 +56,10 @@ class Rejected(SystemExit):
     def __init__(self, message):
         self.message = message
         super().__init__(USAGE_ERROR)
+
+
+class OutputDirectoryError(Rejected):
+    """入口未通过，连 Bash 调用结论文件也不能写。"""
 
 
 def reject(message):
@@ -1023,14 +1029,9 @@ RUNNERS = (CODEX, DEEPSEEK)
 def account_choices():
     """账号可选项由实际目录扫描得出，不硬编码——加了账号就自动认。
 
-    扫到坏名字就**拒跑**，不静默跳过：跳过的话这个账号的隔离目录对
-    `find_meta`／`all_metas` 也一起消失，住在里面的任务从此 status 看不见、
-    而同名 run 又会当它不存在——正是这次改动要消灭的那种静默失效。
-
-    **代价要说清：拒绝半径是整个 CLI。** 本函数挂在 `build_parser()` 的
-    `choices=` 上，所以一个坏目录名会让 `status`／`stop` 也退 2——**连正在跑的
-    任务都停不了**，只能先把那个目录改名。选这一半是因为另一半更坏（静默失效
-    没有任何信号），而这一半的修法是一条 `mv`，且 stderr 直接点名是哪个目录。
+    扫到坏名字就拒跑，不静默忽略账号：名字进入 status 的第二列，不能含空白。
+    本函数挂在 build_parser() 的 choices= 上，因此一个坏名字会让整个 CLI 退 2，
+    错误消息必须点名账号目录。
     """
     accounts_dir = pathlib.Path.home() / ".codex-accounts"
     extra = sorted(q.name for q in accounts_dir.iterdir() if q.is_dir()) if accounts_dir.is_dir() else []
@@ -1040,43 +1041,20 @@ def account_choices():
             reject(f"账号目录名 {accounts_dir / name} 含空白或控制字符 {hit.group()!r}"
                    f"（第 {hit.start()} 个字符）。账号名会进 status 数据行的第二列，"
                    f"那一列是按空白切分的边界。改掉这个目录名再跑。")
-        # 拒跑而不是静默去重：静默去重会让住在那个目录里的任务从 status 里消失，
-        # 正是本函数上面那段注释反复强调要避免的静默失效。
         if name in RESERVED_ACCOUNT_NAMES:
             reject(f"账号目录 {accounts_dir / name} 占用了保留名 {name!r}。\n"
-                   f"`default` 是主账号的固定名，`{AUTO}` 是 --account 的模式词。\n"
-                   f"实测后果：目录叫 default 时候选里会出现两个 default、"
-                   f"两次指向同一个隔离目录，find_meta 会对同一份元数据数出两份并误拒；"
-                   f"目录叫 {AUTO} 时这个账号再也没法被明确指定。\n"
-                   f"改名要改**两个**：账号目录 {accounts_dir / name}，"
-                   f"以及它的隔离目录 {isolation_home(CODEX, name)}。\n"
-                   f"只改前一个的话，住在后一个里的任务之后再也扫不到"
-                   f"——status 看不见、stop 停不掉，而且没有任何报错。")
+                   f"`default` 与主账号共用隔离目录，`{AUTO}` 是 --account 的模式词。\n"
+                   f"改名时同时处理账号目录 {accounts_dir / name} 和隔离目录 "
+                   f"{isolation_home(CODEX, name)}，并核对已有任务元数据中的账号名。")
     return [DEFAULT_ACCOUNT] + extra
 
 
 def isolation_home(runner, account):
-    """这个任务住哪个隔离目录。**由 `(runner, account)` 一对值决定。**
+    """由 (runner, account) 选择登录、配置、缓存与会话记录的隔离目录。
 
-    拆成两个参数各传各的，正是「好 API 难被误用」要消掉的那种缝：
-    `account` 只有 codex 才有意义，deepseek 传任何非 `None` 都是调用方搞混了，
-    所以这里当场 `ValueError` 而不是把它拼进目录名
-    （拼进去就得到 `~/.codex-subagent-deepseek` 这个不存在的账号目录，
-    随后在 `ensure_isolation` 里因缺 auth 拒跑——报的错和真正的原因隔着两层）。
-
-    **目录名一个都不改。** `~/.codex-subagent*` 是 260 份现存元数据里的归属，
-    2026-09-23 迁移时实测三个目录共 260 份。命令名改成 `sub-agent-runner`、
-    目录名不动——**这条不对称是刻意的**：用户敲的是命令名，盘上的东西谁都不该动。
-
-    每个账号一个隔离目录，任务的全部产物都落在这里。
-
-    **落点在 `$HOME` 下，不在被改的那个仓库里**，这是判据不是习惯：
-    `tasks/`、`reports/`、`logs/` 全在仓库外，过程文件就进不了 git，
-    谁 `git add -A` 都收不到它。
-    从前报告写在 `--cd` 那个仓里、靠 `tmp_codex_` 前缀加一句 brief 叮嘱来防，
-    2026-09-13 破了：子代理把 380 行的 `tmp_codex_final_ban_spec_review.json`
-    提交进了分支，**而它的收尾自述里写着「未提交 tmp_codex_*」**。
-    软约定拦不住，换成结构上够不着才拦得住。
+    任务文件在 runs 的 sub-agent-runner/ 里，不由这里选择位置。
+    deepseek 没有账号维度，传非 None 就是调用方搞混了，直接拒绝。
+    隔离目录名保留，以继续使用已有账号的配置和会话记录。
     """
     base = pathlib.Path.home()
     if runner == DEEPSEEK:
@@ -1087,19 +1065,6 @@ def isolation_home(runner, account):
     if runner != CODEX:
         raise ValueError(f"runner 必须是 {RUNNERS} 之一，收到 {runner!r}")
     return base / ".codex-subagent" if account == DEFAULT_ACCOUNT else base / f".codex-subagent-{account}"
-
-
-def isolation_roots():
-    """所有可能住着任务的隔离目录。**`find_meta` 和 `all_metas` 都走这里。**
-
-    原来它们各自写 `for account in account_choices(): isolation_home(account)`，
-    而 deepseek 的家不对应任何账号——**不收进来，deepseek 任务对
-    `status`／`resume`／`stop` 整体不可见**，而那是静默的：任务跑着、报告在盘上，
-    工具却说没有这个任务。抽成一个函数而不是在两处各加一行，是因为
-    「哪些目录住着任务」必须只有一个家：漏掉其中一处的后果是
-    `status` 列得出、`resume` 却说没有这个任务。
-    """
-    return [isolation_home(CODEX, a) for a in account_choices()] + [isolation_home(DEEPSEEK, None)]
 
 
 def auth_source(account):
@@ -1132,9 +1097,6 @@ def ensure_isolation(runner, account):
     指向一个空目录照跑）。把 codex 的不变量套到 deepseek 上，就是把一条外部事实
     当成了普遍规律，后果是 deepseek 一轮都跑不起来。
 
-    两侧**唯一共有**的是 `tasks`/`reports`/`logs` 三个子目录：少一个就是 tee
-    循环里的 `FileNotFoundError`，包装器中途死掉、子进程变孤儿（见下）。
-
     **它挡的是动机，不是能力**——这条必须写明白，否则下一个人会拿它去推错结论。
     2026-09-19 实测：`collaboration.spawn_agent` 等六个工具**恒在**，
     `--disable multi_agent` **无效**（加与不加，codex 报的工具清单逐字相同）；
@@ -1151,17 +1113,11 @@ def ensure_isolation(runner, account):
     奥卡姆。留着一条错理由比没有理由更危险。
     """
     d = isolation_home(runner, account)
-    # tasks/reports/logs 必须先建好：目录不存在时 codex 不会自己建，`-o` 静默
-    # 写失败（log 末尾只留一行 Failed to write last message file），而判据是
-    # “报告没出现＝没正常收尾”——一次成功的运行会被判成失败。2026-09-13 连踩两次。
-    # deepseek 侧同样要：`_tee_until_exit` 往 logs/ 里写，`finish_deepseek_round`
-    # 往 reports/ 里写，缺哪个都是同一个 `FileNotFoundError`。
-    # skills/plugins 只有 codex 用（CODEX_HOME 的布局），deepseek 不建。
-    for sub in (("skills", "plugins", "tasks", "reports", "logs") if runner == CODEX
-                else ("tasks", "reports", "logs")):
-        (d / sub).mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     if runner == DEEPSEEK:
         return d
+    for sub in ("skills", "plugins"):
+        (d / sub).mkdir(exist_ok=True)
 
     # 拒跑而不是打印警告：隔离的前提一旦被破坏，本工具的核心承诺就是空的，
     # 而警告会被淹没在几千行 codex 输出里没人看见。
@@ -1738,7 +1694,6 @@ def new_meta(task, runner, account, workdir, effort, skills):
 # 迁移之后真的又用它写出了两份缺 `runner` 的元数据，后果是整个 `status` 列表一起
 # 陪葬（见上面那段爆炸半径），所以旧命令真正死掉之后又补跑了一遍。
 # **加字段／搬目录／改命令名之前先问一句：还有没有别的东西在写这份格式。**
-# 核对的手段只有一个：`all_metas()` 的数量与 `status` 列出来的行数必须相等。
 #
 # 读回来就校验，之后所有地方放心裸下标；`.get(键, 默认值)` 是默认缺省值，
 # 正是本工具要消灭的东西。
@@ -1753,73 +1708,23 @@ def _load_meta(path):
     return meta
 
 
-def find_meta(task):
-    """跨所有隔离目录按任务名找，返回 (home, meta)；查不到返回 (None, None)。
-
-    账号是查出来的，不是让调用方再报一遍的。
-    home 走返回值，不塞进 meta 里当 `_home` 魔法键：魔法键意味着每个写回元数据
-    的地方都得记得把它剥掉，而「必须记得」正是这个工具存在的理由本身。
-
-    rename 在磁盘上保有唯一一份，却不是扫描多个目录的快照：扫描可能跨过移动，
-    看见零份、两份或已消失的路径；移动后写新内容前，位置也可能暂时与内容矛盾。
-    只有唯一且归属一致、扫描结束后原位置内容仍未变才作答；否则反向换家可能
-    先扫过空的新家、再读到随后被搬走的旧家。正常新任务零份只立即重扫一次。
-    持续不一致时宁可拒绝，也不能让续跑沿用旧账号的隔离环境或重建旧家的元数据。
-    同一个 runner 的账号间迁移也有这些窗口；取消跨 runner 迁移不等于可以取消重扫。
-    """
-    deadline, empty_seen = time.monotonic() + 1, False
-    while True:
-        found, vanished = [], []
-        for home in isolation_roots():
-            path = meta_path(home, task)
-            if path.exists():
-                try:
-                    found.append((home, _load_meta(path)))
-                except FileNotFoundError:
-                    vanished.append(path)
-        if len(found) == 1 and not vanished:
-            home, meta = found[0]
-            if isolation_home(meta["runner"], meta["account"]) == home:
-                path = meta_path(home, task)
-                try:
-                    if _load_meta(path) == meta:
-                        return home, meta
-                except FileNotFoundError:
-                    vanished.append(path)
-        if not found and not vanished:
-            if empty_seen:
-                return None, None
-            empty_seen = True
-            continue
-        if time.monotonic() >= deadline:
-            locations = []
-            for home, meta in found:
-                expected = isolation_home(meta["runner"], meta["account"])
-                locations.append(f"  {meta_path(home, task)} → 内容所指的家 {expected}，"
-                                 f"应放在 {meta_path(expected, task)}")
-            locations += [f"  {path} → 读取时消失" for path in vanished]
-            reject(f"任务名 {task} 在多个隔离目录中出现或内容与所在的家不一致，"
-                   "重扫 1 秒后仍无法确定归属：\n" + "\n".join(locations)
-                   + "\n恢复办法：把元数据文件挪回内容所指的家的 tasks/ 下，"
-                   "或删掉多出的那份元数据，再重试。")
-        time.sleep(0.05)
+def find_meta(home, task):
+    """只查指定产物目录；账号由元数据选，与文件位置无关。"""
+    path = meta_path(home, task)
+    try:
+        return home, _load_meta(path)
+    except FileNotFoundError:
+        return None, None
 
 
-def all_metas():
-    # 先收任务名，再逐任务经同一个一致性读者；一个坏任务不会致盲整个列表。
-    tasks = set()
-    for home in isolation_roots():
-        tasks_dir = home / "tasks"
-        if not tasks_dir.is_dir():
-            continue
-        for p in sorted(tasks_dir.glob("*.json")):
-            tasks.add(p.stem)
+def all_metas(home):
+    # 坏任务单独报告，其他任务仍可见；原子写入留下的 .json.tmp 不在列表里。
     out = []
-    for task in sorted(tasks):
+    for path in sorted((home / "tasks").glob("*.json")):
         try:
-            home, meta = find_meta(task)
+            found_home, meta = find_meta(home, path.stem)
             if meta is not None:
-                out.append((home, meta))
+                out.append((found_home, meta))
         except Rejected as error:
             out.append((None, error))
     return out
@@ -2096,15 +2001,15 @@ def _wait_previous_round_ends(runner, home, task, timeout, poll_interval):
         time.sleep(poll_interval)
 
 
-def run_codex(kind, home, task, meta, make_argv):
+def run_codex(kind, home, task, meta, make_argv, output_fd):
     """唯一的 spawn 入口。**返回一个 `Round`**：报告路径 + 本轮日志文本
     （codex 退出那一刻的快照）。
 
     开跑前必须做的三件事全在这里，调用方不需要记住顺序：
     ① 元数据落盘 ② 删掉上一轮的报告 ③ 日志追加一行本轮分隔符。
 
-    **报告路径由本函数拥有**，回传给 `make_argv` 去拼命令；`env` 也由 `home`
-    派生。原签名收现成的 `argv` 和 `env`，自己却又重新推导一遍报告路径去删，
+    **报告路径由本函数拥有**，回传给 `make_argv` 去拼命令；`env` 从元数据的
+    runner/account 选出的隔离目录派生。原签名收现成的 `argv` 和 `env`，自己却又重新推导一遍报告路径去删，
     于是留下三条没人保证的「必须记得对齐」：argv 里 `-o` 指的那个文件、被删掉
     的那个文件、元数据文件名指的那个任务，得是同一个。三条一起错时它一声不吭
     ——clear_report 删了别的文件（防陈旧报告这条 P0 静默失效）、日志分隔符说谎、
@@ -2125,7 +2030,8 @@ def run_codex(kind, home, task, meta, make_argv):
     # 没有 CODEX_HOME 只是用错配置目录，deepseek 那侧没有 CLAUDE_CONFIG_DIR
     # 就是**完全没有隔离**——子代理看得见整台机器上所有的 skill/MCP/hook，
     # 本工具的核心承诺当场是空的。
-    env = codex_env(home) if runner == CODEX else deepseek_env(home)
+    account_home = isolation_home(runner, meta["account"])
+    env = codex_env(account_home) if runner == CODEX else deepseek_env(account_home)
 
     # 开跑前的三件事，全部在 spawn **之前**做完：任何一件炸了，codex 都还没起来，
     # 不会留下一个没人管的孤儿进程。
@@ -2173,6 +2079,9 @@ def run_codex(kind, home, task, meta, make_argv):
     # resume 路上的 meta 是 `_load_meta` 从磁盘读回来的，里面是**上一轮**包装器的
     # 身份，那个进程早就死了——不盖章，下一条命令问的就是上上轮那个进程的事。
     meta["writer_pid"], meta["writer_start"] = _writer_identity()
+    # 握手已完成才建工具私有目录；两个后端都须在 spawn 前备齐。
+    for directory in ("tasks", "reports", "logs"):
+        (home / directory).mkdir(parents=True, exist_ok=True)
     write_meta(home, task, meta)
     clear_report(report)
 
@@ -2239,7 +2148,7 @@ def run_codex(kind, home, task, meta, make_argv):
         cwd = meta["dir"] if runner == DEEPSEEK else None
         proc = subprocess.Popen(argv, env=env, cwd=cwd, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+                                start_new_session=True, pass_fds=(output_fd,))
 
         def forward_as_sigint(signum, frame):
             # 无论包装器被谁、用什么信号停，codex 收到的永远是 INT，上下文永远可 resume，
@@ -2448,10 +2357,7 @@ def _reject_bad_runner_combo(args):
     **一律退 2 并说清为什么，不静默改正。** 这是本工具对参数组合的约束，
     静默纠正会让调用方以为自己传的参数生效了。DeepSeek 的模型由档案锁定。
 
-    「排在任何状态变更之前」这条的检验方式**不是**「排在那段删旧元数据的迁移分支
-    之前」——那半句不可达：迁移分支的门是 `--account auto`，而这两条与 auto 互斥
-    （deepseek 给任何 account 都拒，codex 不给 account 也拒）。真正可检验的
-    判据是**盘上什么都没多出来**：`ensure_isolation` 是第一个落盘的动作。
+    盘上不应多出任务或账号文件：ensure_isolation 是 run 的第一个落盘动作。
     """
     if args.runner == DEEPSEEK:
         if args.account is not None:
@@ -2464,7 +2370,57 @@ def _reject_bad_runner_combo(args):
                f"没有隐式选中的账号——选错账号要花钱才发现。")
 
 
-def cmd_run(args):
+def _check_output_dir(output_dir, runs_root):
+    if (output_dir.parent.parent != runs_root
+            or not output_dir.parent.name.startswith("-")
+            or re.fullmatch(r"[0-9]{8}-[0-9]{6}-.+", output_dir.name) is None):
+        raise OutputDirectoryError(
+            f"--output-dir {output_dir} 必须是 {runs_root}/<以 - 开头的项目目录>/"
+            "<年月日-时分秒-主题> 这一层")
+    if not output_dir.is_dir():
+        raise OutputDirectoryError(f"--output-dir {output_dir} 不是已存在的目录")
+
+
+def _with_output_dir(command):
+    """五个入口共用校验；写入入口在根锁内打开句柄，退出时才关闭。
+
+    锁的是 RUNS_ROOT 目录本身，不能另建锁文件。子代理继承同一个目录句柄，
+    包装器意外先退出也仍能被清理方识别为在用。status 只读，不参与写入握手。
+    """
+    @functools.wraps(command)
+    def checked(args):
+        if "RUNS_ROOT" not in os.environ or not os.environ["RUNS_ROOT"]:
+            raise OutputDirectoryError("RUNS_ROOT 必须已设，不能猜测 runs 根目录")
+        runs_root = pathlib.Path(os.environ["RUNS_ROOT"]).expanduser().resolve()
+        output_dir = pathlib.Path(args.output_dir).expanduser().resolve()
+        home = output_dir / "sub-agent-runner"
+        if command.__name__ == "cmd_status":
+            _check_output_dir(output_dir, runs_root)
+            return command(args, home, None)
+        try:
+            root_fd = os.open(runs_root, os.O_RDONLY | os.O_DIRECTORY)
+        except OSError as error:
+            raise OutputDirectoryError(f"RUNS_ROOT {runs_root} 打不开：{error}")
+        try:
+            fcntl.flock(root_fd, fcntl.LOCK_EX)
+            _check_output_dir(output_dir, runs_root)
+            try:
+                output_fd = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
+            except OSError as error:
+                raise OutputDirectoryError(f"--output-dir {output_dir} 打不开：{error}")
+        finally:
+            # 显式解锁，即使进程里还有其他根目录句柄也不把锁带进整轮执行。
+            fcntl.flock(root_fd, fcntl.LOCK_UN)
+            os.close(root_fd)
+        try:
+            return command(args, home, output_fd)
+        finally:
+            os.close(output_fd)
+    return checked
+
+
+@_with_output_dir
+def cmd_run(args, home, output_fd):
     require_background_call()
     # 参数组合检查仍排在任何任务状态变更之前；前台拒绝只会留下调用级标记。
     _reject_bad_runner_combo(args)
@@ -2486,7 +2442,7 @@ def cmd_run(args):
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
 
-    old_home, old_meta = find_meta(args.task)
+    _, old_meta = find_meta(home, args.task)
 
     if args.account == AUTO:
         candidates = accounts_by_availability()
@@ -2497,7 +2453,7 @@ def cmd_run(args):
         limits = active_account_limits(candidates, datetime.datetime.now())
         if len(limits) == len(candidates):
             # 用户要求（2026-10-23）：全满就拒绝，不在工具里换 DeepSeek。
-            # 必须先于 ensure_isolation、迁移和 run_codex，连旧任务也不能改动；
+            # 必须先于 ensure_isolation 和 run_codex，连旧任务也不能改动；
             # SKILL.md 负责让调用方不等恢复、换名显式派 DeepSeek。
             reject("codex 号都在限流期内，auto 模式拒绝分配：\n"
                    + "\n".join(f"  {name} 至 {reset:%Y-%m-%d %H:%M}" for name, reset in limits))
@@ -2505,65 +2461,37 @@ def cmd_run(args):
     else:
         account = args.account
 
-    # 同名任务不能换 runner；auto 只在 codex 账号之间搬元数据。
-    home = isolation_home(runner, account)
+    # 同一产物目录里的同名任务不能换 runner；换账号只影响元数据与运行环境。
     if old_meta is not None:
         if old_meta["runner"] != runner:
-            reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{old_home}）。\n"
+            reject(f"任务名 {args.task} 已经属于 runner {old_meta['runner']}（{home}）。\n"
                    "同名任务不能换 runner，换个任务名。")
-        if old_home != home and args.account != AUTO:
-            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{old_home}）。\n"
-                   f"要换账号就用 --account {AUTO}，它会把元数据搬过来。")
+        if old_meta["account"] != account and args.account != AUTO:
+            reject(f"任务名 {args.task} 已经属于账号 {old_meta['account']}（{home}）。\n"
+                   f"要换账号就用 --account {AUTO}，它会更新元数据里的账号。")
 
-    # 所有会拒绝的检查必须在动文件之前；agent 已停但旧 writer 还在排管道时，
-    # 也不能搬走它还会写回的元数据。
+    # 先拒绝还在跑的任务；上一轮 writer 的排干由 run_codex 在写新元数据前等待。
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
-    homes = [home] if old_home in (None, home) else [old_home, home]
-    for candidate_home in homes:
-        if find_task_agent_pid(runner, candidate_home, args.task) is not None:
-            reject(f"任务名 {args.task} 还在跑（{candidate_home}），"
-                   f"换个名字或先 `sub-agent-runner stop {args.task}`")
-    if old_home is not None and old_home != home and _previous_writer_alive(old_home, args.task):
-        reject(f"任务 {args.task} 旧家的 writer 还在收尾（{old_home}），稍后重试。")
+    if find_task_agent_pid(runner, home, args.task) is not None:
+        reject(f"任务名 {args.task} 还在跑（{home}），"
+               f"换个名字或先 `sub-agent-runner stop {args.task} --output-dir {home.parent}`")
 
-    home = ensure_isolation(runner, account)
+    ensure_isolation(runner, account)
     meta = new_meta(args.task, runner, account, str(workdir), args.effort, args.skills)
     if old_meta is not None:
-        if old_home == home:
-            print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
-                  "上一轮的报告会被删掉、日志会被追加")
-        else:
-            # 同一文件系统的一次 rename 保证磁盘上恰好一份；读者负责重扫跨过
-            # rename 的扫描和位置/内容的短暂不一致。不能先删旧或先造第二份。
-            old_path, new_path = meta_path(old_home, args.task), meta_path(home, args.task)
-            try:
-                os.rename(old_path, new_path)
-            except OSError as error:
-                reject(f"任务 {args.task} 元数据 rename 失败（{error}），仍在 {old_path}。")
-            try:
-                write_meta(home, args.task, meta)
-            except OSError as error:
-                try:
-                    os.rename(new_path, old_path)
-                except OSError as rollback_error:
-                    reject(f"任务 {args.task} 写新内容失败（{error}），挪回也失败"
-                           f"（{rollback_error}）；元数据仍在 {new_path}，内容所指的家是"
-                           f" {old_home}。把文件挪回 {old_path} 后重试。")
-                reject(f"任务 {args.task} 写新内容失败（{error}），已挪回 {old_path}，"
-                       "原内容未变。")
+        print(f"[sub-agent-runner] 提示：任务名 {args.task} 复用，"
+              "上一轮的报告会被删掉、日志会被追加")
+        if old_meta["account"] != account:
             print(f"[sub-agent-runner] 任务 {args.task} 原本在账号 {old_meta['account']}，"
-                  f"本次改用账号 {account}："
-                  f"元数据搬过来，旧家的报告和日志留在 {old_home} 原处不动。")
-            # 新内容由本进程写入；run_codex 的 _previous_writer_alive 判自己已停，
-            # 不会等自己。旧家已在上面确认 writer 与 agent 都结束。
+                  f"本次改用账号 {account}，任务文件仍在 {home}。")
 
     make_argv = (
         (lambda r: build_run_argv(str(workdir), args.effort, r, brief)) if runner == CODEX
         else (lambda r: build_deepseek_argv(args.effort, meta["session_id"], brief)))
-    this_round = run_codex("run", home, args.task, meta, make_argv)
+    this_round = run_codex("run", home, args.task, meta, make_argv, output_fd)
     verdict = judge(this_round)
 
-    record_usage_limit(home, meta, this_round, verdict, continuing=False)
+    record_usage_limit(isolation_home(runner, account), meta, this_round, verdict, continuing=False)
 
     _print_verdict(args.task, verdict)
     print(f"  报告 {_report_path(home, args.task)}\n  日志 {_log_path(home, args.task)}")
@@ -2608,14 +2536,15 @@ def record_usage_limit(home, meta, this_round, verdict, continuing):
               "只能用 run 重跑（新会话，不带旧上下文）。")
 
 
-def cmd_status(args):
+@_with_output_dir
+def cmd_status(args, home, output_fd):
     if args.task:
-        home, meta = find_meta(args.task)
+        home, meta = find_meta(home, args.task)
         if meta is None:
             reject(f"没有这个任务：{args.task}")
         rows = [(home, meta)]
     else:
-        rows = all_metas()
+        rows = all_metas(home)
     if not rows:
         print("还没有任何任务")
         return EXIT["success"]
@@ -2690,7 +2619,7 @@ def check_can_resume(task, meta, brief_path):
     check_brief_has_no_guard(brief_file.read_text())
 
 
-def _resume_round(kind, home, meta, task, brief_path, effort, skills):
+def _resume_round(kind, home, meta, task, brief_path, effort, skills, output_fd):
     """两条路共用的续跑动作：`resume` 和 `interrupt-and-resume`。
 
     名字是 `_resume_round` 不是 `_resume_with`：`with` 没说清 with 什么，
@@ -2722,16 +2651,18 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills):
         (lambda r: build_resume_argv(meta["dir"], meta["session_id"], effort, r, brief))
         if meta["runner"] == CODEX
         else (lambda r: build_deepseek_resume_argv(effort, meta["session_id"], brief)))
-    this_round = run_codex(kind, home, task, meta, make_argv)
+    this_round = run_codex(kind, home, task, meta, make_argv, output_fd)
     verdict = judge(this_round)
-    record_usage_limit(home, meta, this_round, verdict, continuing=True)
+    record_usage_limit(isolation_home(meta["runner"], meta["account"]), meta,
+                       this_round, verdict, continuing=True)
     _print_verdict(task, verdict)
     return EXIT[verdict.state]
 
 
-def cmd_resume(args):
+@_with_output_dir
+def cmd_resume(args, home, output_fd):
     require_background_call()
-    home, meta = find_meta(args.task)
+    home, meta = find_meta(home, args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     # resume 之前必须确认真的退出了：对还在跑的会话 resume，报的错和 SIGTERM 锁死
@@ -2751,10 +2682,11 @@ def cmd_resume(args):
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
                f"等它结束，或用 `sub-agent-runner interrupt-and-resume {args.task}`。")
     return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
-                         args.skills)
+                         args.skills, output_fd)
 
 
-def cmd_interrupt_and_resume(args):
+@_with_output_dir
+def cmd_interrupt_and_resume(args, home, output_fd):
     """打断当前轮，然后用新消息续跑。
 
     它独有的收益有两条，**都和「等」无关**（等上一轮收尾已经是 run_codex 的事，
@@ -2782,7 +2714,7 @@ def cmd_interrupt_and_resume(args):
     """
     require_background_call()
     # ────── 五道闸 ──────
-    home, meta = find_meta(args.task)                      # 1. 任务存在？
+    home, meta = find_meta(home, args.task)                # 1. 任务存在？
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     check_can_resume(args.task, meta, args.brief)   # 2/3/4/5. session id / 目录 / brief 是文件 / brief 不自带兜底句
@@ -2815,11 +2747,12 @@ def cmd_interrupt_and_resume(args):
     # 打断只是手段，调用方要的是「新消息跑出什么结果」；而护栏拒绝走 2，
     # 与判据结论不撞码，所以这两件事在退出码上始终分得开。
     return _resume_round("interrupt-and-resume", home, meta, args.task, args.brief,
-                         args.effort, args.skills)
+                         args.effort, args.skills, output_fd)
 
 
-def cmd_stop(args):
-    home, meta = find_meta(args.task)
+@_with_output_dir
+def cmd_stop(args, home, output_fd):
+    home, meta = find_meta(home, args.task)
     if meta is None:
         reject(f"没有这个任务：{args.task}")
     pid = find_task_agent_pid(meta["runner"], home, args.task)
@@ -2885,10 +2818,11 @@ def _add_prompt_round_args(sub):
 
 class _RunnerArgumentParser(argparse.ArgumentParser):
     def error(self, message):
-        # 子 parser 同样继承此类：在进入 cmd_* 前被拒，也须由 main 留下调用结论。
+        # 子 parser 同样继承此类；产物目录参数失败时不能写调用结论。
         # 提示仍用 argparse 给出的原因与用法，不另写参数校验。
         self.print_usage(sys.stderr)
-        reject(f"{self.prog}: error: {message}")
+        error = OutputDirectoryError if "--output-dir" in message else Rejected
+        raise error(f"{self.prog}: error: {message}")
 
 
 def build_parser():
@@ -2910,7 +2844,7 @@ def build_parser():
     # 选中的账号／难度／白名单都是最容易被误用的地方
     r = sub.add_parser("run", help="起一个新任务")
     r.add_argument("--task", required=True, type=task_name,
-                   help="任务名，全局唯一（PID 反查和产物命名都靠它）")
+                   help="任务名，在同一产物目录内唯一（PID 反查和产物命名都靠它）")
     r.add_argument("--dir", required=True, type=work_dir,
                    help="子代理的工作目录，自动转绝对路径")
     r.add_argument("--brief", required=True, help="brief 文件路径（只收文件，不收内联字符串）")
@@ -2932,7 +2866,7 @@ def build_parser():
     _add_prompt_round_args(r)
     r.set_defaults(func=cmd_run)
 
-    s = sub.add_parser("status", help="看任务状态；省略任务名则列出全部")
+    s = sub.add_parser("status", help="看任务状态；省略任务名则列出此产物目录里的任务")
     s.add_argument("task", nargs="?", type=task_name)
     s.set_defaults(func=cmd_status)
 
@@ -2962,6 +2896,10 @@ def build_parser():
     k = sub.add_parser("stop", help="停一个任务（只发 SIGINT）")
     k.add_argument("task", type=task_name)
     k.set_defaults(func=cmd_stop)
+    for command in (r, s, m, j, k):
+        command.add_argument("--output-dir", required=True,
+                             type=lambda value: pathlib.Path(value).expanduser().resolve(),
+                             help="runs 里这件事的目录（必须已经存在）")
     return p
 
 
@@ -3017,7 +2955,8 @@ def main():
         args = build_parser().parse_args()
         return args.func(args)
     except Rejected as e:
-        if len(sys.argv) > 1 and sys.argv[1] in _KINDS:
+        if (not isinstance(e, OutputDirectoryError)
+                and len(sys.argv) > 1 and sys.argv[1] in _KINDS):
             write_bash_call_result(e.code, e.message)
         print(e.message, file=sys.stderr)
         return e.code
