@@ -416,7 +416,6 @@ class _HomeSandbox(unittest.TestCase):
 class _RunsSandbox(_HomeSandbox):
     def setUp(self):
         super().setUp()
-        self.runs_root = self.home / "runs"
         self.output_dir = self.runs_root / "-home-xy-repo" / "20261024-120000-runner"
         self.output_dir.mkdir(parents=True)
         self.storage = self.output_dir / "sub-agent-runner"
@@ -424,9 +423,6 @@ class _RunsSandbox(_HomeSandbox):
         self.workdir.mkdir()
         self.brief = self.output_dir / "brief.md"
         self.brief.write_text("执行任务\n")
-        patch = mock.patch.dict(os.environ, {"RUNS_ROOT": str(self.runs_root)})
-        patch.start()
-        self.addCleanup(patch.stop)
 
     def command(self, name):
         if name == "run":
@@ -515,7 +511,7 @@ class TestRunsOutputDirectory(_RunsSandbox):
                 self.assertIn("RUNS_ROOT", text)
                 self.assertEqual(self.snapshot(), before)
 
-    def test_invalid_output_does_not_publish_background_call_files(self):
+    def test_invalid_output_publishes_only_background_call_results(self):
         for output in ([], ["--output-dir", str(self.workdir)]):
             with self.subTest(output=output), mock.patch.dict(os.environ, {
                     ca.BASH_CALL_ENV: "background:invalid-output",
@@ -523,7 +519,53 @@ class TestRunsOutputDirectory(_RunsSandbox):
                 before = self.snapshot()
                 code, text = self.invoke(self.command("run") + output)
                 self.assertEqual(code, 2, text)
-                self.assertEqual(self.snapshot(), before)
+                records = list(ca.bash_call_directory("invalid-output").glob("*.done"))
+                self.assertEqual(len(records), 1, "目录校验失败仍须留下后台结论")
+                result = json.loads(records[0].read_text())
+                self.assertEqual(result["exit_code"], 2)
+                self.assertIn("--output-dir", result["verdict"])
+                self.assertEqual({path: value for path, value in self.snapshot().items()
+                                  if path.partition("/")[0] != "runtime"},
+                                 {path: value for path, value in before.items()
+                                  if path.partition("/")[0] != "runtime"})
+
+    def test_detached_output_rejection_exits_before_guard_scan_and_still_reports_two(self):
+        guard = pathlib.Path(ca.__file__).with_name("background_guard.py")
+        inbox = self.output_dir.parent / "xy-goal-inbox"
+        inbox.mkdir()
+        cases = (
+            ("missing", [], False),
+            ("nonexistent", ["--output-dir", str(self.output_dir.parent / "20261024-120001-missing")], False),
+            ("outside", ["--output-dir", str(self.workdir)], False),
+            ("inbox", ["--output-dir", str(inbox)], False),
+            ("unset-root", ["--output-dir", str(self.output_dir)], True),
+        )
+        for name in ("run", "resume", "interrupt-and-resume"):
+            for label, output, unset_root in cases:
+                with self.subTest(command=name, case=label):
+                    call_id = f"output-{name}-{label}"
+                    environment = dict(os.environ, XDG_RUNTIME_DIR=str(self.home / "runtime"),
+                                       SUB_AGENT_RUNNER_BASH_CALL="background:" + call_id)
+                    if unset_root:
+                        environment.pop("RUNS_ROOT", None)
+                    command = shlex.join([sys.executable, ca.__file__, *self.command(name), *output])
+                    # wait 保证进程已退出；给护栏的原命令码是 0，不能借 wait 的 2 过关。
+                    body = (command + " > /dev/null 2>&1 &\n"
+                            "runner_pid=$!\nwait \"$runner_pid\"\n"
+                            "printf 'runner exit: %s\\n' \"$?\"\n"
+                            "exec " + shlex.join([sys.executable, str(guard), "end-call", "0"]))
+                    before = self.snapshot()
+                    result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", body],
+                                            cwd=self.home, env=environment, text=True,
+                                            capture_output=True, timeout=5)
+                    self.assertIn("runner exit: 2", result.stdout)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertNotIn("等它们跑完", result.stdout)
+                    self.assertEqual(list((self.home / "runtime").rglob("*.done")), [])
+                    self.assertEqual({path: value for path, value in self.snapshot().items()
+                                      if path.partition("/")[0] != "runtime"},
+                                     {path: value for path, value in before.items()
+                                      if path.partition("/")[0] != "runtime"})
 
     def test_output_expands_home_and_resolves_relative_paths_and_symlinks(self):
         link = self.home / "output-link"
@@ -564,36 +606,59 @@ class TestRunsOutputDirectory(_RunsSandbox):
             self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
         self.assertEqual({p.relative_to(contract): p.read_bytes() for p in contract.rglob("*") if p.is_file()}, before)
 
-    # 继承必须发生在真正的 Popen 边界，且传的是包装器持有的那个 fd。
-    def test_both_backends_pass_the_open_directory_to_a_python_child(self):
-        real_popen = subprocess.Popen
-        for runner in ("codex", "deepseek"):
-            def spawn(argv, **kwargs):
-                handles = kwargs.get("pass_fds", ())
-                self.assertEqual(len(handles), 1, "子代理必须继承产物目录句柄")
-                handle = handles[0]
-                self.assertEqual(pathlib.Path(os.readlink(f"/proc/self/fd/{handle}")), self.output_dir)
-                root_handle = os.open(self.runs_root, os.O_RDONLY | os.O_DIRECTORY)
-                try:
-                    fcntl.flock(root_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                finally:
-                    os.close(root_handle)
-                script = ("import os,pathlib,sys\n"
-                          "handle = int(sys.argv[1])\n"
-                          "pathlib.Path(sys.argv[2]).write_text(os.readlink(f'/proc/self/fd/{handle}'))\n")
-                return real_popen([sys.executable, "-c", script, str(handle), str(self.output_dir / "child-fd")],
-                                  **kwargs)
 
-            argv = self.command("run")
-            argv[argv.index("--runner") + 1] = runner
-            argv[argv.index("--task") + 1] = runner
-            if runner == "deepseek":
-                index = argv.index("--account")
-                del argv[index:index + 2]
-            with self.subTest(runner=runner), mock.patch.object(ca.subprocess, "Popen", spawn):
-                code, text = self.invoke(argv + ["--output-dir", str(self.output_dir)])
-                self.assertEqual(code, 1, text)  # Python 陪练只测句柄，没有伪造 agent 报告。
-                self.assertEqual((self.output_dir / "child-fd").read_text(), str(self.output_dir))
+class TestRecoveryCommandOutput(_RunsSandbox):
+    def setUp(self):
+        super().setUp()
+        self.output_dir = self.runs_root / "-project with spaces" / "20261024-120000-runner's-output"
+        self.storage = self.output_dir / "sub-agent-runner"
+        for name in ("tasks", "reports", "logs"):
+            (self.storage / name).mkdir(parents=True)
+        ca.write_meta(self.storage, "t", _full_meta(
+            "t", dir=str(self.workdir), session_id="01a0b408-f718-7ff3-8123-d5202551acba"))
+
+    def suggested_arguments(self, message):
+        commands = re.findall(r"`(sub-agent-runner [^`]+)`", message)
+        self.assertEqual(len(commands), 1, message)
+        try:
+            return shlex.split(commands[0])[1:]
+        except ValueError as error:
+            self.fail(f"恢复命令无法按 shell 参数解析：{error}；{commands[0]}")
+
+    def test_timeout_stop_suggestion_finds_the_same_task(self):
+        writer = _live_writer(self)
+        for kind in ("run", "resume"):
+            with self.subTest(kind=kind):
+                ca.write_meta(self.storage, "t", _full_meta("t", **writer))
+                with mock.patch.object(ca, "ROUND_END_TIMEOUT", 0), _no_codex():
+                    with self.assertRaises(ca.Rejected) as rejected:
+                        _run_round(kind, self.storage, "t", _full_meta("t"), lambda _: ["codex"])
+                code, text = self.invoke(self.suggested_arguments(rejected.exception.message))
+                self.assertEqual(code, 0, text)
+
+    def test_run_busy_stop_suggestion_finds_the_same_task(self):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=99999), _no_codex():
+            with self.assertRaises(ca.Rejected) as rejected:
+                args = ca.build_parser().parse_args(self.command("run") + ["--output-dir", str(self.output_dir)])
+                ca.cmd_run(args)
+        code, text = self.invoke(self.suggested_arguments(rejected.exception.message))
+        self.assertEqual(code, 0, text)
+
+    def test_resume_busy_suggestion_selects_the_same_task_for_the_new_message(self):
+        with mock.patch.object(ca, "find_task_agent_pid", return_value=99999), _no_codex():
+            with self.assertRaises(ca.Rejected) as rejected:
+                args = ca.build_parser().parse_args(self.command("resume") + ["--output-dir", str(self.output_dir)])
+                ca.cmd_resume(args)
+        def finished(argv, **kwargs):
+            pathlib.Path(argv[argv.index("-o") + 1]).write_text("resumed")
+            return mock.DEFAULT
+        with _no_codex() as popen:
+            popen.side_effect = finished
+            # 新消息的 brief/effort/skill 由调用方显式给，任务位置应直接沿用提示。
+            code, text = self.invoke(self.suggested_arguments(rejected.exception.message)
+                                     + self.command("interrupt-and-resume")[2:])
+        self.assertEqual(code, 0, text)
+        self.assertIn("interrupt-and-resume t", (self.storage / "logs/t.log").read_text())
 
 
 def _holds_directory(pid, directory):
@@ -668,7 +733,8 @@ while True:
             "sys.exit(ca.main())\n")
         proc = subprocess.Popen([sys.executable, "-c", driver], stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                start_new_session=True)
+                                start_new_session=True, bufsize=0)
+        # select 只看内核管道；禁用本端预读，避免 handshake 已在 Python 缓冲中却被判超时。
         self.addCleanup(proc.stderr.close)
         self.addCleanup(proc.stdout.close)
         self.addCleanup(proc.stdin.close)

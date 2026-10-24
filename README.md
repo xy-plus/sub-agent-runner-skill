@@ -57,8 +57,7 @@ sub-agent-runner stop <任务名> --output-dir "$OUTPUT_DIR"
 元数据、报告、日志分别在 `sub-agent-runner/tasks/`、`sub-agent-runner/reports/`、
 `sub-agent-runner/logs/`，brief 和 agent 自己的文件也放在这件事目录中，
 工具名子目录归对应工具，因此可以和 `xy-goal/` 契约共处。账号目录只管登录、
-配置、缓存与会话记录。写入命令在 runs 根目录的锁内完成校验和目录句柄交接，
-子代理继承句柄；包装器先退出也能让清理方识别仍在用的事情。
+配置、缓存与会话记录。
 
 旧任务由合入编排者排空旧包装器和两个后端的子代理后，一次性整体搬迁；本工具
 不在运行时迁移。搬完后管理旧任务，`--output-dir` 给

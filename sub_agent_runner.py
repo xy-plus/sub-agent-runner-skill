@@ -31,12 +31,12 @@ shell 退出时 end-call 等待本次调用脱离的 runner 并收齐结论，�
 import argparse
 import datetime
 import fcntl
-import functools
 import hashlib
 import json
 import os
 import pathlib
 import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -56,10 +56,6 @@ class Rejected(SystemExit):
     def __init__(self, message):
         self.message = message
         super().__init__(USAGE_ERROR)
-
-
-class OutputDirectoryError(Rejected):
-    """入口未通过，连 Bash 调用结论文件也不能写。"""
 
 
 def reject(message):
@@ -2067,7 +2063,7 @@ def run_codex(kind, home, task, meta, make_argv, output_fd):
                      "**也不要再 stop**。绝不升级信号：SIGTERM 会让会话永久锁死，不可逆。"
                      if kind == "interrupt-and-resume" else
                      f"等上一轮收尾完再来；{meta['runner']} 也还活着的话先 "
-                     f"`sub-agent-runner stop {task}`"
+                     f"`sub-agent-runner stop {task} --output-dir {shlex.quote(str(home.parent))}`"
                      f"（run 还可以换个任务名）。")
         reject(f"任务 {task} 的上一轮还没安静下来（等了 {ROUND_END_TIMEOUT} 秒）："
                + "；".join(busy) + "。\n" + next_step)
@@ -2374,11 +2370,11 @@ def _check_output_dir(output_dir, runs_root):
     if (output_dir.parent.parent != runs_root
             or not output_dir.parent.name.startswith("-")
             or re.fullmatch(r"[0-9]{8}-[0-9]{6}-.+", output_dir.name) is None):
-        raise OutputDirectoryError(
+        reject(
             f"--output-dir {output_dir} 必须是 {runs_root}/<以 - 开头的项目目录>/"
             "<年月日-时分秒-主题> 这一层")
     if not output_dir.is_dir():
-        raise OutputDirectoryError(f"--output-dir {output_dir} 不是已存在的目录")
+        reject(f"--output-dir {output_dir} 不是已存在的目录")
 
 
 def _with_output_dir(command):
@@ -2387,10 +2383,9 @@ def _with_output_dir(command):
     锁的是 RUNS_ROOT 目录本身，不能另建锁文件。子代理继承同一个目录句柄，
     包装器意外先退出也仍能被清理方识别为在用。status 只读，不参与写入握手。
     """
-    @functools.wraps(command)
     def checked(args):
         if "RUNS_ROOT" not in os.environ or not os.environ["RUNS_ROOT"]:
-            raise OutputDirectoryError("RUNS_ROOT 必须已设，不能猜测 runs 根目录")
+            reject("RUNS_ROOT 必须已设，不能猜测 runs 根目录")
         runs_root = pathlib.Path(os.environ["RUNS_ROOT"]).expanduser().resolve()
         output_dir = pathlib.Path(args.output_dir).expanduser().resolve()
         home = output_dir / "sub-agent-runner"
@@ -2400,17 +2395,15 @@ def _with_output_dir(command):
         try:
             root_fd = os.open(runs_root, os.O_RDONLY | os.O_DIRECTORY)
         except OSError as error:
-            raise OutputDirectoryError(f"RUNS_ROOT {runs_root} 打不开：{error}")
+            reject(f"RUNS_ROOT {runs_root} 打不开：{error}")
         try:
             fcntl.flock(root_fd, fcntl.LOCK_EX)
             _check_output_dir(output_dir, runs_root)
             try:
                 output_fd = os.open(output_dir, os.O_RDONLY | os.O_DIRECTORY)
             except OSError as error:
-                raise OutputDirectoryError(f"--output-dir {output_dir} 打不开：{error}")
+                reject(f"--output-dir {output_dir} 打不开：{error}")
         finally:
-            # 显式解锁，即使进程里还有其他根目录句柄也不把锁带进整轮执行。
-            fcntl.flock(root_fd, fcntl.LOCK_UN)
             os.close(root_fd)
         try:
             return command(args, home, output_fd)
@@ -2474,7 +2467,7 @@ def cmd_run(args, home, output_fd):
     brief = prepend_skill_guard(brief_file.read_text(), args.skills)
     if find_task_agent_pid(runner, home, args.task) is not None:
         reject(f"任务名 {args.task} 还在跑（{home}），"
-               f"换个名字或先 `sub-agent-runner stop {args.task} --output-dir {home.parent}`")
+               f"换个名字或先 `sub-agent-runner stop {args.task} --output-dir {shlex.quote(str(home.parent))}`")
 
     ensure_isolation(runner, account)
     meta = new_meta(args.task, runner, account, str(workdir), args.effort, args.skills)
@@ -2680,7 +2673,8 @@ def cmd_resume(args, home, output_fd):
     # **不要为了对称把新命令的闸挪到信号后面**：那条路上 INT 发出去就收不回来。
     if find_task_agent_pid(meta["runner"], home, args.task) is not None:
         reject(f"任务 {args.task} 还在跑，resume 会撞上它自己的写锁。"
-               f"等它结束，或用 `sub-agent-runner interrupt-and-resume {args.task}`。")
+               f"等它结束，或用 `sub-agent-runner interrupt-and-resume {args.task} "
+               f"--output-dir {shlex.quote(str(home.parent))}`。")
     return _resume_round("resume", home, meta, args.task, args.brief, args.effort,
                          args.skills, output_fd)
 
@@ -2818,11 +2812,10 @@ def _add_prompt_round_args(sub):
 
 class _RunnerArgumentParser(argparse.ArgumentParser):
     def error(self, message):
-        # 子 parser 同样继承此类；产物目录参数失败时不能写调用结论。
+        # 子 parser 同样继承此类；参数解析与预检拒绝均由 main 留下后台结论。
         # 提示仍用 argparse 给出的原因与用法，不另写参数校验。
         self.print_usage(sys.stderr)
-        error = OutputDirectoryError if "--output-dir" in message else Rejected
-        raise error(f"{self.prog}: error: {message}")
+        reject(f"{self.prog}: error: {message}")
 
 
 def build_parser():
@@ -2898,7 +2891,6 @@ def build_parser():
     k.set_defaults(func=cmd_stop)
     for command in (r, s, m, j, k):
         command.add_argument("--output-dir", required=True,
-                             type=lambda value: pathlib.Path(value).expanduser().resolve(),
                              help="runs 里这件事的目录（必须已经存在）")
     return p
 
@@ -2955,8 +2947,7 @@ def main():
         args = build_parser().parse_args()
         return args.func(args)
     except Rejected as e:
-        if (not isinstance(e, OutputDirectoryError)
-                and len(sys.argv) > 1 and sys.argv[1] in _KINDS):
+        if len(sys.argv) > 1 and sys.argv[1] in _KINDS:
             write_bash_call_result(e.code, e.message)
         print(e.message, file=sys.stderr)
         return e.code
