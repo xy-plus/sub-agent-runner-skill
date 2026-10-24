@@ -1851,8 +1851,7 @@ def _previous_writer_alive(home, task):
     if not q.exists():
         return False
     previous = _load_meta(q)
-    # 换家时 cmd_run 已把本轮的 writer 身份写到新家，尚未进入 tee；同进程顺序
-    # 续跑时，上一轮 tee 也已返回。这两种都不该等自己，否则会白等到超时，
+    # 同进程顺序续跑时，上一轮 tee 已返回，不该等自己，否则会白等到超时，
     # 再误报「包装器还在读输出」。
     if (previous["writer_pid"], previous["writer_start"]) == _writer_identity():
         return False
