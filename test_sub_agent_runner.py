@@ -3563,8 +3563,7 @@ class TestMeta(_HomeSandbox):
 
 
 class TestWriteMetaIsAtomic(_HomeSandbox):
-    """落元数据必须**原子替换**，不许原地截断重写。
-    """
+    """落元数据必须**原子替换**，不许原地截断重写。"""
 
     def test_并发读永远读不到半截json(self):
         d = self.task_storage(ca.CODEX, "default")
