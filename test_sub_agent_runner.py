@@ -2281,8 +2281,6 @@ class TestUsageLimitFile(unittest.TestCase):
 
 class TestAccountChoicesGuards(_HomeSandbox):
     def test_保留名目录要拒跑并点名(self):
-        # default：现有代码会返回两个 'default'，两次指向同一个 home，
-        #          find_meta 会对同一份元数据数出两份，当场误拒。
         # auto   ：它是 --account 的模式词，真账号同名就再也没法被明确指定。
         for name in ("default", "auto"):
             with self.subTest(保留名=name):
@@ -2292,18 +2290,11 @@ class TestAccountChoicesGuards(_HomeSandbox):
                     ca.account_choices()
                 self.assertIn(name, got.exception.message)
                 self.assertIn(str(d), got.exception.message, "要点名是哪个目录")
-                # **迁移办法要给全的那一半。** 拒绝半径是整个 CLI
-                # （account_choices 挂在 build_parser 的 choices= 上），所以用户
-                # 只能照着这段话做。光改账号目录名不够：住在
-                # .codex-subagent-auto 里的任务之后再也扫不到，status 看不见、
-                # stop 停不掉——正是本函数上方注释反复要避免的静默失效。
                 self.assertIn(str(ca.isolation_home(ca.CODEX, name)), got.exception.message,
                               "没告诉用户隔离目录也要一起改名，照做之后任务会从 status 消失")
                 d.rmdir()
 
     def test_候选各自指向不同的隔离目录(self):
-        # 重名只是表象，**真正咬人的是两个候选指向同一个 home**：
-        # find_meta 会把同一份元数据数成两份，当场拒绝「任务名在多个隔离目录里都有」。
         for name in ("acct2", "acct3"):
             (self.home / ".codex-accounts" / name).mkdir(parents=True)
         got = ca.account_choices()
@@ -3527,13 +3518,13 @@ class TestFixedArgs(unittest.TestCase):
 
 
 class TestMeta(_HomeSandbox):
-    def test_元数据从指定产物目录原样读回(self):
+    def test_metadata_is_read_unchanged_from_output_directory(self):
         d = self.task_storage(ca.CODEX, "default")
         meta = _full_meta("t1", dir="/abs/x")
         ca.write_meta(d, "t1", meta)
         self.assertEqual(ca.find_meta(self.storage, "t1"), meta)
 
-    def test_查不到返回None(self):
+    def test_missing_metadata_returns_none(self):
         self.assertIsNone(ca.find_meta(self.storage, "不存在的任务"))
 
     def test_元数据缺字段就拒绝_不给默认值圆场(self):
@@ -4713,7 +4704,7 @@ class TestRunGuards(_HomeSandbox):
                          "拒绝来自 run_codex 里等满超时那条路，不是入口这道闸")
         self.assertEqual(ca.all_metas(self.storage), [meta], "拒跑不许增删或修改元数据")
 
-    def test_同名任务属于别的账号就拒绝_否则留下够不着的孤儿元数据(self):
+    def test_rejects_same_task_name_under_another_account(self):
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
         (self.home / ".codex-accounts" / "acct2" / "auth.json").write_text("{}")
         ca.write_meta(self.task_storage(ca.CODEX, "acct2"), "t", _full_meta("t", account="acct2"))
@@ -5404,7 +5395,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.assertIn("acct3", self.printed)
         self.assertIn("acct2", self.printed)
 
-    def test_原账号无登录态时auto仍能换号(self):
+    def test_auto_changes_account_when_old_account_has_no_login(self):
         ca.write_meta(self.task_storage(ca.CODEX, "acct3"), "t",
                       ca.new_meta("t", ca.CODEX, "acct3", "/tmp", "low", ()))
         (self.home / ".codex-accounts" / "acct3" / "auth.json").unlink()
