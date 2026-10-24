@@ -2797,7 +2797,7 @@ def _add_prompt_round_args(sub):
     光给许可不给指令的话「读没读」根本无从观测），于是「codex 到底读没读」在
     日志里看得见，就是那一行 `cat <路径>`；软链成能力之后，用没用由它决定、
     **不可观测**。对一个主张「不骗调用方」的工具，这条是决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
-    一个」，isolation_home／find_meta／account_choices／ensure_isolation 全线
+    一个」，isolation_home／account_choices／ensure_isolation 全线
     要改，换来的保证是零。
     """
     # 两支都给**不可变的 tuple**，所以 args.skills 的契约就一句话：
