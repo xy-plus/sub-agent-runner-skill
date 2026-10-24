@@ -3564,14 +3564,6 @@ class TestMeta(_HomeSandbox):
 
 class TestWriteMetaIsAtomic(_HomeSandbox):
     """落元数据必须**原子替换**，不许原地截断重写。
-
-    `Path.write_text` 先把目标截成 0 再往里填，而 `status` 随时可能在另一个
-    进程里读同一份 json——`all_metas`／`find_meta` 都是裸 `json.loads`。
-    2026-09-20 实测（截断重写的版本）：1 秒里写 5289 次、并发读 12284 次，
-    其中 **8277 次读到半截 json**。撞上的调用方拿到的是一个裸
-    `JSONDecodeError` traceback，不是干净的护栏拒绝——正是本工具存在的理由
-    反过来。这个 bug 是被那条真进程信号测试偶发地照出来的：它轮询
-    `tasks/t.json` 等 session_id 落盘，而包装器正好在写。
     """
 
     def test_并发读永远读不到半截json(self):
@@ -6673,9 +6665,7 @@ class TestSignalSafetyRealProcesses(unittest.TestCase):
 
     **它曾经偶发，而根因不在它自己身上**：它轮询 `tasks/t.json` 等 session_id
     落盘，而 `write_meta` 当时是 `Path.write_text`——先把目标截成 0 再填。
-    读到半截就是一个裸 `JSONDecodeError`。2026-09-20 量过：1 秒里写 5289 次、
-    并发读 12284 次，**8277 次读到半截**。`write_meta` 改成原子替换之后
-    连跑 20 次零失败（见 TestWriteMetaIsAtomic）。
+    读到半截就是一个裸 `JSONDecodeError`。
     **教训记在这里**：一条真进程测试偶发地红，先别归因到「机器慢」——
     那次差一点就把它当成调度抖动登记掉，而它照出来的是一个真的并发 bug。
     那几个 deadline 刻意不往上加：10 秒已经宽出两个量级，加大只会掩盖下一个
