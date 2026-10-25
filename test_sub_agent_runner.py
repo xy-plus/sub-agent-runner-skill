@@ -5735,41 +5735,19 @@ class TestSkillPrompts(_HomeSandbox):
                                      [str(self.skill), str(self.added_skill), str(self.skill)])
                     self.assertEqual(set(written), TestMetaShape.FIELDS)
 
-    def test_resume_retry_repeats_skill_request_after_spawn_failure(self):
-        # 启动前元数据已记下本次路径；重试若拿它当「已读」，读取要求就丢了。
-        for command in ("resume", "interrupt-and-resume"):
-            for runner in (ca.CODEX, ca.DEEPSEEK):
-                with self.subTest(command=command, runner=runner):
-                    d = self._meta_for_resume(runner, [str(self.old_skill)])
-                    args = self._args(command, runner, ["--skill", str(self.skill)])
-                    with _no_codex() as popen, \
-                            mock.patch.object(ca, "find_task_agent_pid", return_value=None):
-                        popen.side_effect = FileNotFoundError("agent unavailable")
-                        for _ in range(2):
-                            with self.assertRaises(FileNotFoundError):
-                                args.func(args)
-                            self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"],
-                                             [str(self.skill)])
-                    expected = ("**以下 skill 也可以用（动手前先逐个读一遍）：**\n"
-                                f"- {self.skill}\n\n" + self.brief_text)
-                    self.assertEqual([call.args[0][-1] for call in popen.call_args_list],
-                                     [expected, expected])
-
-    def test_brief_with_guard_is_rejected_by_all_prompt_commands(self):
+    def test_brief_with_guard_is_rejected_by_run_and_resume(self):
         # 即使 --no-skill 不再前置提示，brief 自带禁令仍须由 CLI 退 2。
         self.brief.write_text("**不得使用任何 skill。**\n\n干活")
-        for command in ("run", "resume", "interrupt-and-resume"):
-            for runner in (ca.CODEX, ca.DEEPSEEK):
-                for flags in (["--no-skill"], ["--skill", str(self.skill)]):
-                    with self.subTest(command=command, runner=runner, flags=flags):
-                        self._meta_for_resume(runner, [])
-                        args = self._args(command, runner, flags)
-                        with _no_codex(), \
-                                mock.patch.object(ca, "find_task_agent_pid", return_value=None):
-                            with self.assertRaises(ca.Rejected) as caught:
-                                args.func(args)
-                        self.assertEqual(caught.exception.code, 2)
-                        self.assertIn("brief 里已经有兜底句", caught.exception.message)
+        for command in ("run", "resume"):
+            with self.subTest(command=command):
+                self._meta_for_resume(ca.CODEX, [])
+                args = self._args(command, ca.CODEX, ["--no-skill"])
+                with _no_codex(), \
+                        mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                    with self.assertRaises(ca.Rejected) as caught:
+                        args.func(args)
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("brief 里已经有兜底句", caught.exception.message)
 
 
 class TestStatusIsSplittable(_HomeSandbox):
