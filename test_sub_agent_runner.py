@@ -18,7 +18,7 @@
     三种错误形式（用户层 ERROR: / tracing / 顶层 Error:）与良性 target 白名单
     退出码**五态**的绝对值、严重度排序（interrupted 在 running 之后）、元数据字段清单
     read1 的实时性、stdout flush、EPERM 即存活、strip_ansi（resume 路上承重）
-    resume 的三处 flag 差异、任务名字符集、兜底句**三条路**都真的加上且**每轮派生**
+    resume 的三处 flag 差异、任务名字符集、首轮兜底句、续跑只给新增 skill 或原文
     控制字符在入口就挡住（--dir / --skill，文件系统那一层根本不管）
     status 数据行前四列无空白、明细行有缩进——「机器切得开」是断言出来的，不是碰巧
     兜底句里那句「动手前先逐个读一遍」——**许可不等于指令**，没有指令就没有那行
@@ -2619,8 +2619,8 @@ class TestRunnerAxis(_HomeSandbox):
             ca.auth_source(None)
 
 
-class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
-    """兜底句**每轮派生**，且**只能由工具写**。
+class TestRunSkillGuard(unittest.TestCase):
+    """首轮兜底句由白名单派生，且只能由工具写。
 
     旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
     调用方无处声明白名单，只好让 brief 正文去破例。--skill 出现之后那半句就该
@@ -2693,10 +2693,6 @@ class TestSkillGuardIsDerivedPerRound(unittest.TestCase):
         # 矛盾的兜底句。字面量写死那句旧话：它已经不在代码里了，只能这么钉。
         with self.assertRaises(ca.Rejected):
             ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", ())
-
-    def test_SKILL_GUARD常量已经不存在_它不再是每轮同一句话(self):
-        self.assertFalse(hasattr(ca, "SKILL_GUARD"),
-                         "常量留着就是第二个家：派生一份、常量一份，两份必然漂移")
 
 
 class TestArgv(unittest.TestCase):
@@ -3689,8 +3685,8 @@ class TestMetaShape(_HomeSandbox):
                          set(ca.REQUIRED_META_KEYS))
 
     def test_new_meta也守同一道_它是白名单的第二个家(self):
-        # 两个家各守一道：build_skill_guard 管送进 codex 的那份，new_meta 管落盘
-        # 的那份。_resume_round 今天恰好先调前者，但闸不能靠调用顺序站着。
+        # 两个家各守一道：提示构造管送给后端的那份，new_meta 管落盘的那份，
+        # 闸不能靠调用顺序站着。
         for bad in ("/abs/SKILL.md", None, ["/abs/SKILL.md"], (1,)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 ca.new_meta("t", ca.CODEX, "default", "/abs/x", "low", bad)
@@ -4128,7 +4124,7 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
         r"--disable|project_doc_max_bytes|approval_policy": "_COMMON",
         r"session id|session_id": "extract_session_id / 元数据",
         r"\bexit 1\b|退出码不可信": "judge（判据只看产物和日志）",
-        r"不得使用任何 skill": "build_skill_guard（兜底句由 --skill/--no-skill 每轮派生）",
+        r"不得使用任何 skill": "build_skill_guard（run 首轮的兜底句）",
         # 「撞没撞上限、几点恢复、记在哪」整条链路都归代码：文档只说
         # auto 会挑一个没在限流的、撞上限会记下来，不说它存在哪个文件里。
         r"usage_limit\.json": "hit_usage_limit / parse_reset_time / write_usage_limit",
@@ -4529,7 +4525,7 @@ class TestInterruptAndResumeParser(_HomeSandbox):
 
 
 class TestSkillWhitelistFlags(_HomeSandbox):
-    """白名单是**每一轮**的事，不是任务的事——所以三条带 prompt 的命令各收一份。
+    """三条带 prompt 的命令都显式选 skill：首轮给白名单，续跑只给新增的。
 
     二选一**必填**而不是缺省成空白名单：这个工具要交给其他 agent 用，省略时
     分不清「调用方决定不给」和「调用方根本不知道有这个参数」。强制显式把
@@ -5640,94 +5636,140 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         self.assertEqual(seen["kind"], "interrupt-and-resume")
 
 
-class TestSkillGuardIsAlwaysPrepended(_HomeSandbox):
-    """兜底句是 SKILL.md 印给调用方的**对外承诺**，三条路都必须真的加上。
-
-    `prepend_skill_guard` 自己有纯函数单测，但那只证明「这个函数会加」，
-    不证明「run / resume / interrupt-and-resume 真的调了它、而且传的是**本轮**
-    的白名单」。把调用点换成裸 `read_text()` 的突变曾经**全部存活**——
-    一条印出去的承诺，没有任何东西守着。
-
-    结构性防线是 CODEX_HOME 隔离（codex 结构上看不见用户的 skill），这句是
-    内容层的第二道；白名单则是这一道上唯一的开口，所以它长什么样必须钉在
-    **真正送进 codex argv 的那段文本**上，不是钉在派生函数的返回值上。
-    """
+class TestSkillPrompts(_HomeSandbox):
+    """断言真正交给后端的提示：首轮给白名单，续跑只给新增 skill。"""
 
     def setUp(self):
         super().setUp()
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text("干活")
+        self.brief_text = "\n干活，保留原文。\n  第二行\t\n\n"
+        self.brief.write_text(self.brief_text)
         self.skill = self.home / "tdd_SKILL.md"
         self.skill.write_text("---\nname: tdd\n---\n")
+        self.old_skill = self.home / "old_SKILL.md"
+        self.added_skill = self.home / "added_SKILL.md"
+        for path in (self.old_skill, self.added_skill):
+            path.write_text("---\nname: extra\n---\n")
+
+    def _args(self, command, runner, skill_flags):
+        if command == "run":
+            argv = ["run", "--task", "t", "--dir", str(self.workdir), "--runner", runner]
+            if runner == ca.CODEX:
+                argv += ["--account", "default"]
+        else:
+            argv = [command, "t"]
+        return ca.build_parser().parse_args(
+            argv + ["--brief", str(self.brief), "--effort", "max",
+                    "--output-dir", str(self.output_dir)] + skill_flags)
 
     @staticmethod
-    def _brief_codex_actually_got(run_it):
-        """codex argv 的最后一项就是 brief 正文。"""
-        seen = {}
-
-        def grab(*a, **k):
-            seen["argv"] = a[0]
-            return mock.DEFAULT
-
+    def _brief_agent_actually_got(run_it):
+        """两个后端 argv 的最后一项都是提示正文，只替换外部进程。"""
         with _no_codex() as popen:
-            popen.side_effect = grab
             run_it()
-        return seen["argv"][-1]
+        return popen.call_args.args[0][-1]
 
-    def _meta_for_resume(self):
-        d = self.task_storage(ca.CODEX, "default")
-        ca.write_meta(d, "t", _full_meta("t", session_id="s1", dir=str(self.workdir)))
+    def _meta_for_resume(self, runner, skills):
+        account = "default" if runner == ca.CODEX else None
+        d = self.task_storage(runner, account)
+        ca.write_meta(d, "t", _full_meta("t", runner=runner, account=account,
+                                       session_id="s1", dir=str(self.workdir), skills=skills))
         return d
 
-    def test_run这条路_无白名单(self):
-        ca.ensure_isolation(ca.CODEX, "default")
-        args = ca.build_parser().parse_args(
-            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--no-skill"] + ["--output-dir", str(self.output_dir)])
-        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
-                        f"codex 实际收到的是：{brief[:60]!r}")
-        self.assertIn("干活", brief)
+    def test_run_without_skills_keeps_original_guard(self):
+        for runner in (ca.CODEX, ca.DEEPSEEK):
+            with self.subTest(runner=runner):
+                self._meta_for_resume(runner, [])
+                args = self._args("run", runner, ["--no-skill"])
+                with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                    brief = self._brief_agent_actually_got(lambda: args.func(args))
+                self.assertEqual(brief, "**不得使用任何 skill。**\n\n" + self.brief_text)
 
-    def test_run这条路_有白名单时路径真的进了argv(self):
-        ca.ensure_isolation(ca.CODEX, "default")
-        args = ca.build_parser().parse_args(
-            ["run", "--task", "t", "--dir", str(self.workdir), "--brief", str(self.brief),
-             "--effort", "max", "--runner", "codex", "--account", "default", "--skill", str(self.skill)] + ["--output-dir", str(self.output_dir)])
-        brief = self._brief_codex_actually_got(lambda: ca.cmd_run(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
-                        f"codex 实际收到的是：{brief[:60]!r}")
-        self.assertIn(f"- {self.skill}", brief)
-        # 钉在**真正送进 argv 的那段文本**上：许可送到了不等于指令送到了，
-        # 而没有指令就没有那行 `cat`，judge 看不见「它压根没读」
-        self.assertIn("动手前先逐个读一遍", brief)
-        self.assertIn("干活", brief)
+    def test_run_with_skills_keeps_original_guard_and_paths(self):
+        for runner in (ca.CODEX, ca.DEEPSEEK):
+            with self.subTest(runner=runner):
+                d = self._meta_for_resume(runner, [])
+                args = self._args("run", runner,
+                                  ["--skill", str(self.skill), "--skill", str(self.added_skill)])
+                with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                    brief = self._brief_agent_actually_got(lambda: args.func(args))
+                self.assertEqual(
+                    brief,
+                    "**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**\n"
+                    f"- {self.skill}\n- {self.added_skill}\n\n" + self.brief_text)
+                self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"],
+                                 [str(self.skill), str(self.added_skill)])
 
-    def test_resume这条路_有白名单(self):
-        self._meta_for_resume()
-        args = ca.build_parser().parse_args(
-            ["resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--skill", str(self.skill)] + ["--output-dir", str(self.output_dir)])
-        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
-            brief = self._brief_codex_actually_got(lambda: ca.cmd_resume(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**"),
-                        f"codex 实际收到的是：{brief[:60]!r}")
-        self.assertIn(f"- {self.skill}", brief)
-        self.assertIn("动手前先逐个读一遍", brief)
+    def test_resume_without_new_skills_sends_brief_unchanged(self):
+        # 续跑若仍加禁令、重放旧路径或 strip 正文，后端收到的文本就会改变。
+        for command in ("resume", "interrupt-and-resume"):
+            for runner in (ca.CODEX, ca.DEEPSEEK):
+                with self.subTest(command=command, runner=runner):
+                    d = self._meta_for_resume(runner, [str(self.skill)])
+                    args = self._args(command, runner, ["--no-skill"])
+                    with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                        brief = self._brief_agent_actually_got(lambda: args.func(args))
+                    self.assertEqual(brief, self.brief_text)
+                    self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [])
 
-    def test_interrupt_and_resume这条路_无白名单(self):
-        self._meta_for_resume()
-        args = ca.build_parser().parse_args(
-            ["interrupt-and-resume", "t", "--brief", str(self.brief), "--effort", "max",
-             "--no-skill"] + ["--output-dir", str(self.output_dir)])
-        with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
-            brief = self._brief_codex_actually_got(
-                lambda: ca.cmd_interrupt_and_resume(args))
-        self.assertTrue(brief.startswith("**不得使用任何 skill。**"),
-                        f"codex 实际收到的是：{brief[:60]!r}")
-        self.assertIn("干活", brief)
+    def test_resume_reads_only_given_skills_without_filtering_repeated_paths(self):
+        # 合并旧清单、跳过元数据已有路径、去重或丢掉读取指令，都会改掉实际提示。
+        for command in ("resume", "interrupt-and-resume"):
+            for runner in (ca.CODEX, ca.DEEPSEEK):
+                with self.subTest(command=command, runner=runner):
+                    d = self._meta_for_resume(runner, [str(self.old_skill), str(self.skill)])
+                    args = self._args(command, runner,
+                                      ["--skill", str(self.skill), "--skill", str(self.added_skill),
+                                       "--skill", str(self.skill)])
+                    with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                        brief = self._brief_agent_actually_got(lambda: args.func(args))
+                    self.assertEqual(
+                        brief,
+                        "**以下 skill 也可以用（动手前先逐个读一遍）：**\n"
+                        f"- {self.skill}\n- {self.added_skill}\n- {self.skill}\n\n"
+                        + self.brief_text)
+                    written = json.loads(ca.meta_path(d, "t").read_text())
+                    self.assertEqual(written["skills"],
+                                     [str(self.skill), str(self.added_skill), str(self.skill)])
+                    self.assertEqual(set(written), TestMetaShape.FIELDS)
+
+    def test_resume_retry_repeats_skill_request_after_spawn_failure(self):
+        # 启动前元数据已记下本次路径；重试若拿它当「已读」，读取要求就丢了。
+        for command in ("resume", "interrupt-and-resume"):
+            for runner in (ca.CODEX, ca.DEEPSEEK):
+                with self.subTest(command=command, runner=runner):
+                    d = self._meta_for_resume(runner, [str(self.old_skill)])
+                    args = self._args(command, runner, ["--skill", str(self.skill)])
+                    with _no_codex() as popen, \
+                            mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                        popen.side_effect = FileNotFoundError("agent unavailable")
+                        for _ in range(2):
+                            with self.assertRaises(FileNotFoundError):
+                                args.func(args)
+                            self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"],
+                                             [str(self.skill)])
+                    expected = ("**以下 skill 也可以用（动手前先逐个读一遍）：**\n"
+                                f"- {self.skill}\n\n" + self.brief_text)
+                    self.assertEqual([call.args[0][-1] for call in popen.call_args_list],
+                                     [expected, expected])
+
+    def test_brief_with_guard_is_rejected_by_all_prompt_commands(self):
+        # 即使 --no-skill 不再前置提示，brief 自带禁令仍须由 CLI 退 2。
+        self.brief.write_text("**不得使用任何 skill。**\n\n干活")
+        for command in ("run", "resume", "interrupt-and-resume"):
+            for runner in (ca.CODEX, ca.DEEPSEEK):
+                for flags in (["--no-skill"], ["--skill", str(self.skill)]):
+                    with self.subTest(command=command, runner=runner, flags=flags):
+                        self._meta_for_resume(runner, [])
+                        args = self._args(command, runner, flags)
+                        with _no_codex(), \
+                                mock.patch.object(ca, "find_task_agent_pid", return_value=None):
+                            with self.assertRaises(ca.Rejected) as caught:
+                                args.func(args)
+                        self.assertEqual(caught.exception.code, 2)
+                        self.assertIn("brief 里已经有兜底句", caught.exception.message)
 
 
 class TestStatusIsSplittable(_HomeSandbox):

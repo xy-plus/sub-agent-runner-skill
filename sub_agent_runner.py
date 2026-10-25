@@ -1146,11 +1146,11 @@ def ensure_isolation(runner, account):
     return d
 
 
-# 兜底句的**词干**。派生出来的两种措辞都含有它，SKILL.md 历史上印过的那句
+# 首轮兜底句的**词干**。两种首轮措辞都含有它，SKILL.md 历史上印过的那句
 # 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它。
 # 它只挡**复述过本工具措辞**的那一类——2026-09-20 实测：`禁止使用任何 skill。`
 # 和 `不要用任何 skill，除非我说了。` 都**放行**。挡不住的那一类靠的是工具的
-# 句子排在最前面（见 prepend_skill_guard 的拼接顺序），本来优先级就明确。
+# 首轮句子排在最前面（见 prepend_skill_guard 的拼接顺序），本来优先级就明确。
 # 刻意**不**升级成语义匹配：那要引入一个新判据，换来的只是挡住一类优先级本来
 # 就不含糊的输入。
 SKILL_GUARD_STEM = "不得使用任何 skill"
@@ -1189,7 +1189,7 @@ def _require_skill_paths(skills):
 
 
 def build_skill_guard(skill_paths):
-    """本轮的兜底句。**每轮派生，不是常量**——白名单是每一轮的事。
+    """run 首轮的兜底句；白名单在 run 时给。
 
     旧常量那半句「除非本 brief 明确指定」本来就是「CLI 没有这个参数」的变通：
     调用方无处声明白名单，只好让 brief 正文去破例。`--skill` 出现之后那半句就
@@ -1220,10 +1220,10 @@ def check_brief_has_no_guard(brief_text):
     明文印过、调用方照抄进 brief 开头是**可达路径**。拒绝比去重少一个分支，
     且把「无定义」变成「不可能」。
 
-    抽成独立函数，是因为它必须在**两个**地方跑（同 check_can_resume 的两次调用）：
+    抽成独立函数，是因为拒绝既要前移，也要留在实际发送正文的动作里：
       1. `check_can_resume` 里，排在 interrupt-and-resume 发 INT **之前**；
-      2. `prepend_skill_guard` 里，作为结构性兜底——闸留在动作本身上，
-         才没有一条绕过去的后门（cmd_run 根本不走 check_can_resume）。
+      2. run 的 `prepend_skill_guard` 和续跑读取正文后，作为结构性兜底——闸留在
+         动作本身上，才没有一条绕过去的后门（cmd_run 不走 check_can_resume）。
     纯拒绝、无副作用，跑两遍不花钱。
 
     **判据用子串，不用整行**，这是对「本仓刚把轮次边界从子串改成整行」那条教训
@@ -1242,7 +1242,7 @@ def check_brief_has_no_guard(brief_text):
 def prepend_skill_guard(brief_text, skill_paths):
     """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。
 
-    两个参数都**没有默认值**：白名单每轮重给，缺省成空就等于替调用方做了决定。
+    两个参数都**没有默认值**：首轮白名单显式给，缺省成空就等于替调用方做了决定。
     """
     check_brief_has_no_guard(brief_text)
     return f"{build_skill_guard(skill_paths)}\n\n{brief_text}"
@@ -1648,8 +1648,8 @@ def new_meta(task, runner, account, workdir, effort, skills):
     复用的是 `_load_meta` 从磁盘读回来的**旧记录**，根本不经过本函数——
     不盖章，resume 那两条路会落盘**上一轮**包装器的身份。
 
-    `skills` 记的是**最后一次调用**的白名单，与 effort／started_at 同一条原则
-    （见 _resume_round）。它是白名单唯一的结构化副本——刻意不进 status 的列：
+    `skills` 记的是**最后一次调用**给的路径：run 是白名单，续跑是这一轮新加的。
+    它只供审计，不参与判断（见 _resume_round），刻意不进 status 的列：
     skill 路径是任意长度的绝对路径，进数据行会把定宽格式撑坏，要审计就读这里。
     """
     if runner not in RUNNERS:
@@ -2607,8 +2607,8 @@ def check_can_resume(task, meta, brief_path):
     brief_file = pathlib.Path(brief_path).expanduser()
     if not brief_file.is_file():
         reject(f"--brief {brief_path} 不是文件（brief 只收文件路径，避开引号地狱）")
-    # 第四道：读一遍 brief 正文。`_resume_round` 随后还要再读一次（经
-    # prepend_skill_guard），两次读同一个文件不花钱，换来的是「拒绝排在 INT 之前」。
+    # 第四道：读一遍 brief 正文。`_resume_round` 随后还要读实际发出去的正文，
+    # 两次读同一个文件不花钱，换来的是「拒绝排在 INT 之前」。
     check_brief_has_no_guard(brief_file.read_text())
 
 
@@ -2627,12 +2627,22 @@ def _resume_round(kind, home, meta, task, brief_path, effort, skills, output_fd)
     拥有者手里有事实，用最后一轮就是把事实换回推测（那正是轮次边界那次改动
     修掉的整类 bug）。
 
-    `skills` 是本轮的白名单，和 effort 一样每轮重给——白名单是每一轮的事。
+    `skills` 只给这一轮新加的；`--no-skill` 什么都不跟它说，brief 原文照发。
+    给什么就叫它读什么，不跟元数据比、不去重、不收回已给的许可，也不记已读状态。
+    第 1 轮主审 M1 指出过「先记已读、要求却没送达」：起不来、撞额度或被打断时，
+    一次失败会吃掉读取要求。不记状态，重发同一条命令就仍会叫它读。
+    上下文压缩、skill 文件改动不归工具管。用户原话：
+    「Agent 应该会有自己的机制让 skill 被重新正确地加载回来，不需要我们来操这个心」。
     """
     check_can_resume(task, meta, brief_path)
     ensure_isolation(meta["runner"], meta["account"])
-    brief = prepend_skill_guard(pathlib.Path(brief_path).expanduser().read_text(), skills)
-    # 元数据描述的是**最后一次调用**：effort、白名单、开跑时间一起刷新。
+    brief = pathlib.Path(brief_path).expanduser().read_text()
+    check_brief_has_no_guard(brief)
+    _require_skill_paths(skills)
+    if skills:
+        brief = ("**以下 skill 也可以用（动手前先逐个读一遍）：**\n"
+                 + "\n".join(f"- {path}" for path in skills) + f"\n\n{brief}")
+    # 元数据描述的是**最后一次调用**：effort、本次给的 skill 路径、开跑时间一起刷新。
     # 完整的轮次历史不在这里，在日志的分隔符里（每轮一行，带时间戳）。
     meta["effort"] = effort
     meta["skills"] = skills
@@ -2781,10 +2791,10 @@ class _AppendSkillPath(argparse.Action):
 
 
 def _add_prompt_round_args(sub):
-    """带 prompt 的三条命令共用的「本轮 skill 白名单」。**二选一必填，没有默认值。**
+    """带 prompt 的三条命令共用 skill 参数。**二选一必填，没有默认值。**
 
-    白名单是**每一轮**的事，不是任务的事——resume 换一轮活，能用的 skill 就该
-    跟着换，所以三条命令各收一份，而不是在 run 时定死。
+    白名单在 run 时给；续跑的 --skill 只给这一轮新加的，没有新加的写 --no-skill，
+    不追加任何 skill 提示，也不收回首轮已给的许可。
 
     为什么 `--no-skill` 必须显式写：这个工具要交给其他 agent 用。省略时分不清
     「调用方决定不给」和「调用方根本不知道有这个参数」，而 argparse 的
@@ -2793,7 +2803,7 @@ def _add_prompt_round_args(sub):
     才发现。
 
     **刻意不把 skill 软链进隔离目录**，理由是可观测性：路径在 brief 里、**而且
-    兜底句明文叫它去读**（见 build_skill_guard——那句指令就是这条论证的地基，
+    提示明文叫它去读**（见 build_skill_guard / _resume_round——那句指令是地基，
     光给许可不给指令的话「读没读」根本无从观测），于是「codex 到底读没读」在
     日志里看得见，就是那一行 `cat <路径>`；软链成能力之后，用没用由它决定、
     **不可观测**。对一个主张「不骗调用方」的工具，这条是决定性的。第二条是奥卡姆：软链要求隔离目录从「每账号一个」变成「每任务
