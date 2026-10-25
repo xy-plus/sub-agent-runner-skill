@@ -1310,7 +1310,7 @@ def deepseek_env(home):
     经 settings 的 env 注入，不在配置目录里。所以空目录正是我们要的隔离：子代理一个 skill、一个 MCP、
     一个 hook 都看不见。
 
-    继承来的模型变量不用剥：档案（~/claude-switch/claude_switch/deepseek.py）的 env 压过它们
+    继承来的模型变量不用剥：档案（~/claude-tools/claude-switch/claude_switch/deepseek.py）的 env 压过它们
     （2026-09-25 实测）。effort 也在档案里定为 max，与本工具传的 --effort max 一致。
     """
     env = dict(os.environ)

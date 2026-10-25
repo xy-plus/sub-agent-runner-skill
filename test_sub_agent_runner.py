@@ -2820,7 +2820,7 @@ class TestDeepseekRunner(_HomeSandbox):
 
     def test_deepseek_env_passes_environment_through_and_only_sets_config_dir(self):
         """模型变量不再剥：claude-deepseek 现在挂 DeepSeek 档案，档案的 env 压过继承值
-        （~/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。"""
+        （~/claude-tools/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。"""
         with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5", "PATH": "/bin"}, clear=True):
             env = ca.deepseek_env(pathlib.Path("/d"))
         self.assertEqual(env, {"ANTHROPIC_MODEL": "claude-opus-5", "PATH": "/bin", "CLAUDE_CONFIG_DIR": "/d"})
@@ -3295,7 +3295,7 @@ class TestDeepseekWiring(_HomeSandbox):
 
     def test_继承模型变量时仍传入隔离目录(self):
         # claude-deepseek 现在挂 DeepSeek 档案，档案的 env 压过继承来的模型变量
-        # （~/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。
+        # （~/claude-tools/claude-switch/claude_switch/deepseek.py）。这里只负责隔离配置目录。
         with mock.patch.dict(os.environ, {"ANTHROPIC_MODEL": "claude-opus-5",
                                           "CLAUDE_CODE_SUBAGENT_MODEL": "claude-haiku"}):
             d, _, popen, _ = self._run([self.OK])
