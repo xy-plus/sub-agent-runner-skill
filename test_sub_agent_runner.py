@@ -3501,11 +3501,11 @@ class TestFixedArgs(unittest.TestCase):
 
     def test_模型固定且就是这一个(self):
         # 绝对值：写成 `== ca.MODEL` 的话，改掉 MODEL 两边一起动，等于没测
-        self.assertEqual(ca.MODEL, "gpt-6.1-sol")
+        self.assertEqual(ca.MODEL, "gpt-6-luna")
         for name, build in self.CASES.items():
             with self.subTest(cmd=name):
                 argv = build()
-                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6.1-sol")
+                self.assertEqual(argv[argv.index("-m") + 1], "gpt-6-luna")
 
     def test_难度分档如实传给codex(self):
         for name, build in self.CASES.items():
@@ -4453,7 +4453,7 @@ class TestParser(_HomeSandbox):
         | `--background` | 后台与否由调用方的 `Bash(run_in_background)` 决定，工具自己加只会变成孤儿进程 |
         | `-o` | 报告路径由工具派生（`<隔离目录>/reports/<任务>.md`）。让调用方指定就会落进仓库、被 `git add -A` 收走 |
         | `--log` | 同上，日志路径也由任务名派生，两个任务才不会互相覆盖 |
-        | `--model` | 模型固定 `gpt-6-astra`，难度只由 `--effort` 分档。换模型换不来正确性 |
+        | `--model` | 模型写死在 `MODEL`，难度只由 `--effort` 分档。换模型换不来正确性 |
         | `--sandbox` | 固定 `danger-full-access`；而且 resume 根本不认这个 flag，给了只会让人写出跑不起来的命令 |
         | `--json` | 同一份事实两种呈现，要永远保持一致——正是本仓一路在消灭的东西。列表形态已经机器切得开（见 status_row），单任务查询用退出码就够 |
 

@@ -36,7 +36,7 @@ brief 和 agent 自己的产物放在这件事目录里，工具名子目录归�
 
 | runner | 跑的是什么 | 账号 | effort |
 |---|---|---|---|
-| `codex` | `codex exec`，`gpt-6.1-sol` | `--account` 必填 | **只有 `max`** |
+| `codex` | `codex exec`，`gpt-6-luna` | `--account` 必填 | **只有 `max`** |
 | `deepseek` | `claude-deepseek -p`，模型由 claude-switch 决定（`claude-switch deepseek-model` 可查） | **不收 `--account`**（只有一个 token） | **只有 `max`** |
 
 DeepSeek 接入说明以 claude-switch 的 `claude_switch/deepseek.py` 文档字符串为准。
@@ -53,7 +53,7 @@ codex 号全满时，`run` 被拒（退出码 `2`）；这时不等恢复，换�
 
 ## 模型与 effort 都定死
 
-codex 侧只用 `gpt-6.1-sol`（用户 2026-10-07：「把现在写死的 Luna 改成 GPT 6.1 sol……用 6.1 的 sol max。然后只支持这个档位，其他档位都不准用」），effort 只有 `max`；deepseek 侧也只有 `max`（用户 2026-10-03：「要求只用gpt6 luna max」）。
+codex 侧只用 `gpt-6-luna`（用户 2026-10-28：「现在指定6.1sol max，改成6luna max」「改成最新的luna，luna版本需要你搜一下」），effort 只有 `max`（用户 2026-10-07：「然后只支持这个档位，其他档位都不准用」）；deepseek 侧也只有 `max`（用户 2026-10-03：「要求只用gpt6 luna max」）。
 两者都写死在 `sub_agent_runner.py` 里（`MODEL`、`EFFORTS`），传别的档位当场退 2，不会替你改正。
 
 ## 另外四条命令
