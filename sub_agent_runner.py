@@ -1183,7 +1183,7 @@ def _closing_brief_fence(line, fence):
 
 
 def check_brief_sections(brief_text):
-    """Reject a malformed first-run brief before account choice or task state changes.
+    """首轮 brief 结构不合格时，在选账号或改动任务状态前拒跑。
 
     六段标题固定，段落内容按任务决定。「怎么做」不设必填，因为 skill 或任务本身常
     已规定方法，强制添加只会逼出空话。brief 可能用 Markdown fence 举例，所以围栏只
@@ -1214,8 +1214,7 @@ def check_brief_sections(brief_text):
             occurrences[heading_line].append(current)
             continue
 
-        # ATX level-one and level-two headings end a section. Three or more hashes
-        # are content, as are non-required level-two headings such as "## 怎么做".
+        # 一级、二级 ATX 标题都会结束当前段；三级及更深标题算正文，其他二级标题也允许。
         if re.match(r"^#{1,2}(?:[ \t]+|$)", heading_line):
             current = None
             continue
@@ -1332,7 +1331,7 @@ def build_run_prompt(brief_text, skill_paths, task, output_dir):
     """前置工具拥有的 skill 禁令和子代理须知，再原样保留 brief。
 
     须知来自 quant 的五次事故：11-01 和 11-02 停掉父 runner，11-12 对自己的任务
-    运行 stop 一次、打断时连带停掉两个未用 setsid 启动的后台进程。任务名和产物目录把
+    运行 stop 一次，两次打断连带停掉未用 setsid 启动的后台计算。任务名和产物目录把
     stop／resume／interrupt-and-resume 的限制限定在本轮任务；派不派下级仍由 brief
     决定。固定顺序让工具的两条约束在首轮提示里先于任务正文。
     """
@@ -1381,7 +1380,8 @@ def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
 
 def codex_env(home):
     env = dict(os.environ)
-    # 子代理跑 status 等命令时，不能把它的结论写回编排者的 Bash 调用（11-10 两次 exit 4）。
+    # 子代理里的 runner 命令不属于编排者这次 Bash 调用：不写入本次结论，也不由它等待。
+    # 子代理若派了下级要自己等；继承标记会把子代理的 status 退出码写回父调用，xy-skills 11-10 两次因此误报 exit 4。
     env.pop(BASH_CALL_ENV, None)
     env["CODEX_HOME"] = str(home)
     # 会话索引留在主目录，resume 才找得到（隔离的是 skill/plugin，不是会话历史）
@@ -1416,8 +1416,7 @@ def deepseek_env(home):
     继承来的模型变量不用剥：档案（~/claude-tools/claude-switch/claude_switch/deepseek.py）的 env 压过它们
     （2026-09-25 实测）。effort 也在档案里定为 max，与本工具传的 --effort max 一致。
 
-    Bash-call marker 是例外：若子代理继承它，它自己的 runner 命令会把退出码写回父调用，
-    两次 `status` 曾把真实成功误报为 exit 4。只从 child env 移除，不改 runner 的环境。
+    子环境同样移除此标记；边界和理由见 `codex_env`。
     """
     env = dict(os.environ)
     env.pop(BASH_CALL_ENV, None)
@@ -2542,7 +2541,7 @@ def cmd_run(args, home, output_fd):
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
     brief_text = brief_file.read_text()
-    # A malformed first brief is rejected before account selection, isolation, or metadata.
+    # 先拒绝结构不合格的首轮 brief，再选账号、建隔离目录或写任务元数据。
     check_brief_sections(brief_text)
 
     old_meta = find_meta(home, args.task)
