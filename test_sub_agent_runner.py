@@ -1085,9 +1085,15 @@ class TestGoalRunsIntegration(_RunsSandbox):
         self.output_dir = contracts[0].parent.parent
         self.storage = self.output_dir / "sub-agent-runner"
         self.brief = self.output_dir / "brief.md"
-        self.brief.write_text("执行任务")
+        self.brief.write_text(
+            "## 任务\n执行任务\n\n"
+            "## 要看的\n本测试工作树\n\n"
+            "## 边界\n只验证 xy-goal 与 runner 共存\n\n"
+            "## 产出\n测试临时目录中的 runner 任务文件\n\n"
+            "## 验收\n本测试所有断言通过\n\n"
+            "## 最后一条回复\n报告联调结论\n")
         task = goal(["add", "--title", "验证", "--criteria", "通过", "--state", "在办",
-                     "--pointer", "无", "--source", "1"], None).strip()
+                     "--pointer", "无", "--source-kind", "原话直提", "--source", "1"], None).strip()
         with _no_codex():
             self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
         goal(["hook-prompt"], {"session_id": session, "prompt": "补充说明", "transcript_path": str(transcript)})
