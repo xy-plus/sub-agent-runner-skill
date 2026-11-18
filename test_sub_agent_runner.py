@@ -169,13 +169,6 @@ HEADER = ("Reading additional input from stdin...\n"
           "\x1b[1mworkdir:\x1b[0m /home/xy/repo\n"
           "\x1b[1msession id:\x1b[0m 01a0b408-f718-7ff3-8123-d5202551acba\n"
           "--------\n")
-VALID_BRIEF_TEXT = (
-    "## 任务\n执行本测试指定的动作。\n\n"
-    "## 要看的\n本测试代码和临时工作目录。\n\n"
-    "## 边界\n只操作本测试的临时工作目录。\n\n"
-    "## 产出\n按本测试断言生成临时产物。\n\n"
-    "## 验收\n本测试的断言全部通过。\n\n"
-    "## 最后一条回复\n报告本测试结果。\n")
 
 
 # 一副**必定停了**的 writer 身份：`pid_max` 这个值内核从不分配（分配区间是
@@ -429,7 +422,7 @@ class _RunsSandbox(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.output_dir / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("执行任务\n")
 
     def command(self, name):
         if name == "run":
@@ -807,12 +800,7 @@ while True:
                     proc.wait(timeout=5)
                     self.assertTrue(_holds_directory(child, self.output_dir))
                     if runner == "deepseek":
-                        argv = _argv_of(child)[:-1]  # `/proc/<pid>/cmdline` ends with NUL.
-                        self.assertNotIn(str(self.output_dir), " ".join(argv[:-1]))
-                        if command == "run":
-                            self.assertIn(str(self.output_dir), argv[-1])
-                        else:
-                            self.assertNotIn(str(self.output_dir), argv[-1])
+                        self.assertNotIn(str(self.output_dir), " ".join(_argv_of(child)))
                         self.assertEqual(pathlib.Path(os.readlink(f"/proc/{child}/cwd")), self.workdir)
                     self.clean_if_unused(child)
                     self.assertTrue(self.output_dir.is_dir())
@@ -1097,9 +1085,9 @@ class TestGoalRunsIntegration(_RunsSandbox):
         self.output_dir = contracts[0].parent.parent
         self.storage = self.output_dir / "sub-agent-runner"
         self.brief = self.output_dir / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("执行任务")
         task = goal(["add", "--title", "验证", "--criteria", "通过", "--state", "在办",
-                     "--pointer", "无", "--source-kind", "原话直提", "--source", "1"], None).strip()
+                     "--pointer", "无", "--source", "1"], None).strip()
         with _no_codex():
             self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
         goal(["hook-prompt"], {"session_id": session, "prompt": "补充说明", "transcript_path": str(transcript)})
@@ -1453,7 +1441,7 @@ class TestRoundBoundaryWiring(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
 
     def _race(self, d):
         """假 codex：本轮被打断（只留痕、不留报告），紧接着下一轮的分隔符抢先落地。"""
@@ -2631,125 +2619,6 @@ class TestRunnerAxis(_HomeSandbox):
             ca.auth_source(None)
 
 
-class TestRunBriefSections(_RunsSandbox):
-    """首轮只检查固定骨架，续跑保留只写增量的契约。
-
-    Q5 要求 brief 固定说明要读什么、怎么验收、产物格式；任务、边界和最后一条回复
-    给这些段落一个落点。「怎么做」不强制，因为方法常由 skill 或任务决定，强制它会
-    逼出空话。过去的 brief-paths-name-the-host 事故让产物写进共享检出目录，边界段
-    因此也要明确写可改范围。续跑 brief 是增量，不能拿首轮骨架覆盖它。
-
-    fenced code 里的标题可能只是格式示例。围栏必须按相同字符和不少于开启长度配对：
-    说明 Markdown fence 的 brief 会包含反例，反引号块里单独一行 `~~~` 不能关块，
-    四个反引号块里的三个反引号也不能关块。三级标题是正文，其他二级标题仍可自由加。
-    拒绝要发生在选号、隔离目录和元数据写入前，brief 错误不该留下任务状态。
-    """
-
-    def _invoke_run(self, brief_text, account="default"):
-        self.brief.write_text(brief_text)
-        args = self.command("run")
-        args += ["--account", account, "--output-dir", str(self.output_dir)]
-        calls = {}
-        with contextlib.ExitStack() as stack:
-            calls["accounts"] = stack.enter_context(
-                mock.patch.object(ca, "accounts_by_availability", return_value=["default"]))
-            calls["limits"] = stack.enter_context(
-                mock.patch.object(ca, "active_account_limits", return_value=[]))
-            calls["isolation"] = stack.enter_context(mock.patch.object(ca, "ensure_isolation"))
-            calls["metadata"] = stack.enter_context(
-                mock.patch.object(ca, "new_meta", return_value=_full_meta("t", dir=str(self.workdir))))
-            calls["run"] = stack.enter_context(mock.patch.object(ca, "run_codex", return_value=None))
-            stack.enter_context(mock.patch.object(
-                ca, "judge", return_value=ca.Verdict("success", "ok", [])))
-            stack.enter_context(mock.patch.object(ca, "find_task_agent_pid", return_value=None))
-            code, output = self.invoke(args)
-        return code, output, calls
-
-    @staticmethod
-    def _brief_missing_read_section(body):
-        return (
-            "## 任务\n执行测试动作。\n"
-            + body
-            + "## 边界\n只操作临时工作目录。\n"
-            "## 产出\n生成测试产物。\n"
-            "## 验收\n测试断言通过。\n"
-            "## 最后一条回复\n报告测试结果。\n")
-
-    def test_缺段拒跑并且早于选号隔离和元数据(self):
-        """缺段是编排输入错误；R1 要让它在账号选择及任何任务状态之前退码 2。"""
-        brief = "## 任务\n执行测试动作。\n## 要看的\n读取测试文件。\n"
-        code, output, calls = self._invoke_run(brief, account="auto")
-        self.assertEqual(code, 2, output)
-        self.assertIn("## 边界", output)
-        self.assertIn(str(pathlib.Path(ca.__file__).resolve().with_name("SKILL.md")), output)
-        for name in ("accounts", "limits", "isolation", "metadata", "run"):
-            with self.subTest(side_effect=name):
-                calls[name].assert_not_called()
-
-    def test_重复段列出段名(self):
-        """重复段会让读者不知道哪一处是契约正文，故每个必需段只能出现一次。"""
-        brief = VALID_BRIEF_TEXT + "\n## 任务\n重复的正文。\n"
-        code, output, _ = self._invoke_run(brief)
-        self.assertEqual(code, 2, output)
-        self.assertIn("重复", output)
-        self.assertIn("## 任务", output)
-
-    def test_空段包括只含空白或被一级标题截断(self):
-        """正文在下一个一级或二级标题处结束；空白和标题前的空段都算空。"""
-        brief = VALID_BRIEF_TEXT.replace(
-            "## 要看的\n本测试代码和临时工作目录。\n",
-            "## 要看的\n \t \n# 一级标题\n")
-        code, output, _ = self._invoke_run(brief)
-        self.assertEqual(code, 2, output)
-        self.assertIn("正文为空", output)
-        self.assertIn("## 要看的", output)
-
-    def test_围栏里的标题不计数并按字符和开启长度配对(self):
-        """围栏样例都不能把示例标题误认为 brief 的真实段落。"""
-        examples = (
-            "```markdown\n## 要看的\n示例标题\n```\n",
-            "~~~markdown\n## 要看的\n示例标题\n~~~\n",
-            "  ```markdown\n~~~\n## 要看的\n示例标题\n  ```\n",
-            "````markdown\n```\n## 要看的\n示例标题\n````\n",
-        )
-        for fence in examples:
-            with self.subTest(fence=fence):
-                code, output, _ = self._invoke_run(self._brief_missing_read_section(fence))
-                self.assertEqual(code, 2, output)
-                self.assertIn("缺少", output)
-                self.assertIn("## 要看的", output)
-                self.assertNotIn("## 边界", output)
-
-    def test_段落前的围栏也忽略标题并拒绝缺段(self):
-        brief = (
-            "```markdown\n## 任务\n这只是格式示例。\n```\n"
-            "## 要看的\n读取测试文件。\n"
-            "## 边界\n只改临时目录。\n"
-            "## 产出\n生成测试产物。\n"
-            "## 验收\n测试断言通过。\n"
-            "## 最后一条回复\n报告结果。\n")
-        code, output, _ = self._invoke_run(brief)
-        self.assertEqual(code, 2, output)
-        self.assertIn("缺少", output)
-        self.assertIn("## 任务", output)
-
-    def test_三级标题计入正文且其他二级标题允许(self):
-        """标题行以外的正文可由三级标题构成；可选的「怎么做」等二级标题不拒跑。"""
-        empty = VALID_BRIEF_TEXT.replace(
-            "## 任务\n执行本测试指定的动作。\n",
-            "## 任务\n\n")
-        code, output, _ = self._invoke_run(empty)
-        self.assertEqual(code, 2, output)
-
-        legal = VALID_BRIEF_TEXT.replace(
-            "## 任务\n执行本测试指定的动作。\n",
-            "## 任务  \n### 任务内容\n执行本测试指定的动作。\n")
-        legal = legal.replace("## 要看的\n", "## 要看的\t\n")
-        legal = legal.replace("## 边界\n", "## 怎么做\n使用本测试的固定流程。\n## 边界\n")
-        code, output, _ = self._invoke_run(legal)
-        self.assertEqual(code, 0, output)
-
-
 class TestRunSkillGuard(unittest.TestCase):
     """首轮兜底句由白名单派生，且只能由工具写。
 
@@ -2814,7 +2683,7 @@ class TestRunSkillGuard(unittest.TestCase):
 
     def test_brief自带兜底句就拒跑_并提示改用参数(self):
         with self.assertRaises(ca.Rejected) as cm:
-            ca.build_run_prompt("**不得使用任何 skill。**\n\n干活", (), "t", "/tmp/run")
+            ca.prepend_skill_guard("**不得使用任何 skill。**\n\n干活", ())
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("--no-skill", cm.exception.message)
         self.assertIn("--skill", cm.exception.message)
@@ -2823,8 +2692,7 @@ class TestRunSkillGuard(unittest.TestCase):
         # 调用方照抄 SKILL.md 开头那句是**可达路径**，不拒就会出现两句互相
         # 矛盾的兜底句。字面量写死那句旧话：它已经不在代码里了，只能这么钉。
         with self.assertRaises(ca.Rejected):
-            ca.build_run_prompt(
-                "**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", (), "t", "/tmp/run")
+            ca.prepend_skill_guard("**不得使用任何 skill，除非本 brief 明确指定。**\n\n干活", ())
 
 
 class TestArgv(unittest.TestCase):
@@ -2866,30 +2734,6 @@ class TestArgv(unittest.TestCase):
         env = ca.codex_env(pathlib.Path("/d"))
         self.assertEqual(env["CODEX_HOME"], "/d")
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
-
-
-class TestChildRunnerEnvironment(unittest.TestCase):
-    """子代理不继承编排者的 Bash 调用标记。
-
-    xy-skills 2026-11-10 两次 `status` 把子代理的退出码写回父 Bash 调用，真实任务成功却被
-    通知成 exit 4。根因是整份 `os.environ` 复制进了子代理；即使须知提醒别跑 status，
-    也不能阻止命令污染父调用，因此两个 runner 的 child env 都要剥掉这个标记，
-    同时保留 runner 自己进程中的值。
-    """
-
-    def test_codex和deepseek都剥掉父调用标记但保留runner环境(self):
-        builders = (
-            ("codex", ca.codex_env, pathlib.Path("/tmp/codex-child")),
-            ("deepseek", ca.deepseek_env, pathlib.Path("/tmp/deepseek-child")),
-        )
-        for marker in ("foreground:parent-call", "background:parent-call"):
-            with mock.patch.dict(os.environ, {ca.BASH_CALL_ENV: marker}):
-                self.assertEqual(os.environ[ca.BASH_CALL_ENV], marker)
-                for name, build_env, home in builders:
-                    with self.subTest(marker=marker, runner=name):
-                        child_env = build_env(home)
-                        self.assertNotIn(ca.BASH_CALL_ENV, child_env)
-                        self.assertEqual(os.environ[ca.BASH_CALL_ENV], marker)
 
 
 class TestDeepseekRunner(_HomeSandbox):
@@ -3783,7 +3627,7 @@ class TestMetaShape(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
 
     # 字段清单的**绝对值**。REQUIRED_META_KEYS 是从 new_meta 派生的，所以
     # 「构造器的键集 == 校验面」那条断言两边会一起动——构造器少一个字段，
@@ -4294,17 +4138,6 @@ class TestSkillDocDoesNotRepeatCode(unittest.TestCase):
                          "这些约束已经由代码保证，文档里不该再说一遍："
                          + "；".join(f"{p} → 归 {o}" for p, o in leaked.items()))
 
-    def test_SKILL首轮brief表逐段等于代码常量(self):
-        """人写 brief 的表必须和 runner 实际检查的六个标题一致，避免两份契约漂移。"""
-        skill = (pathlib.Path(ca.__file__).parent / "SKILL.md").read_text()
-        headings = [line.split("|")[1].strip().strip("`")
-                    for line in skill.splitlines() if line.startswith("| `## ")]
-        self.assertEqual(headings, list(ca.REQUIRED_BRIEF_SECTIONS))
-        self.assertIn("首轮 brief 必须六段齐全", skill)
-        self.assertIn("工具首轮自动加入", skill)
-        self.assertIn("brief 不用重复", skill)
-        self.assertIn("续跑只写增量", skill)
-
     def test_参数说明不许承诺失败时的行为(self):
         """`--help` 是子代理唯一会读的那份说明，也是最容易和代码悄悄脱节的那份。
 
@@ -4811,7 +4644,7 @@ class TestRunGuards(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
 
     def _args(self, **over):
         argv = ["run", "--task", over.get("task", "t"), "--dir", over.get("dir", str(self.workdir)),
@@ -4994,7 +4827,7 @@ class TestRunnerCLI(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
         # `--account` 的 choices 是**扫盘**来的：不建这个目录，连 argparse 都过不去，
         # 后面那几条「cmd_run 怎么拒」根本走不到。
         (self.home / ".codex-accounts" / "acct2").mkdir(parents=True)
@@ -5208,7 +5041,7 @@ class TestAutoAccountPick(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "b.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活\n")
         self.spawned = []        # 真的 spawn 了哪个账号（不止一个就是回归）
         # 反查表，不写 `home.name.replace(...)`：那是 isolation_home 的逆运算，
         # 抄一份就会和它漂移，而漂了之后这里只会 KeyError，不会给出线索。
@@ -5498,8 +5331,7 @@ class TestAutoAccountPick(_HomeSandbox):
         # 打断标记是本工具自己写的，不可伪造（见 judge 里「打断排最前」）。
         # 顺序反了的代价：一个「resume 就行」的任务被记成账号限流，
         # 那个健康账号从此被排到后面。
-        self.brief.write_text(VALID_BRIEF_TEXT.replace(
-            "执行本测试指定的动作。", self.LIMIT_LINE))
+        self.brief.write_text(self.LIMIT_LINE)
         code = self._run(ca.AUTO, self.LIMIT_LINE + ca.INTERRUPT_MARK + "\n")
         self.assertEqual(code, ca.EXIT["interrupted"])
         self.assertEqual(code, 130)
@@ -5709,7 +5541,7 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
         一律在任何不可逆动作之前做完。**
 
         「brief 里已经有兜底句」完全由调用方交进来的那个文件决定，动手之前就
-        问得出来。留在 build_run_prompt 里的话，这条路会先发 INT 把当前轮
+        问得出来。留在 prepend_skill_guard 里的话，这条路会先发 INT 把当前轮
         截断、再因为一个**本可提前发现**的理由拒绝——白烧一轮，即使可恢复
         也是浪费。所以它进了 check_can_resume，和另外三道闸并排。
         """
@@ -5805,28 +5637,14 @@ class TestInterruptAndResumeOrder(_HomeSandbox):
 
 
 class TestSkillPrompts(_HomeSandbox):
-    """断言真正交给后端的首轮和续跑提示。
-
-    R2 covers five quant incidents: codex stopped its parent runner on 11-01 and 11-02,
-    stopped its own task on 11-12, and two non-setsid background jobs died when interrupted
-    on 11-12.
-    The notice names those process facts without deciding whether this task may delegate.
-    R2b separately removes the inherited Bash-call marker behind two false exit-code-4
-    notifications; a sentence telling agents not to run status cannot fix that leak.
-    """
+    """断言真正交给后端的提示：首轮给白名单，续跑只给新增 skill。"""
 
     def setUp(self):
         super().setUp()
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief_text = (
-            "## 任务\n干活，保留原文。\n  第二行\t\n\n"
-            "## 要看的\n读取测试指定的文件。\n\n"
-            "## 边界\n只操作临时工作目录。\n\n"
-            "## 产出\n生成测试需要的产物。\n\n"
-            "## 验收\n测试断言全部通过。\n\n"
-            "## 最后一条回复\n报告测试结论。\n")
+        self.brief_text = "\n干活，保留原文。\n  第二行\t\n\n"
         self.brief.write_text(self.brief_text)
         self.skill = self.home / "tdd_SKILL.md"
         self.skill.write_text("---\nname: tdd\n---\n")
@@ -5853,18 +5671,6 @@ class TestSkillPrompts(_HomeSandbox):
             run_it()
         return popen.call_args.args[0][-1]
 
-    def _expected_run_notice(self):
-        """独立钉住须知字面量；只有任务名和产物目录随调用变化。"""
-        return (
-            "启动你的 runner 进程是你的父进程，停掉它你也会被停掉；不要停它。\n"
-            "本轮任务名：t\n"
-            f"本轮产物目录：{self.output_dir}\n"
-            "不要对上面这个任务运行 `sub-agent-runner stop`、`resume` 或 "
-            "`interrupt-and-resume`。\n"
-            "除 brief 点名要你停的进程外，只停你自己启动并记下 PID 的进程。\n"
-            "长时间运行的后台进程用 `setsid` 启动并记下 PID，结束前确认它已退出；"
-            "不这样起的后台进程可能在你被打断时一起被停掉。")
-
     def _meta_for_resume(self, runner, skills):
         account = "default" if runner == ca.CODEX else None
         d = self.task_storage(runner, account)
@@ -5872,19 +5678,16 @@ class TestSkillPrompts(_HomeSandbox):
                                        session_id="s1", dir=str(self.workdir), skills=skills))
         return d
 
-    def test_run_adds_notice_after_guard_before_original_brief(self):
+    def test_run_without_skills_keeps_original_guard(self):
         for runner in (ca.CODEX, ca.DEEPSEEK):
             with self.subTest(runner=runner):
                 self._meta_for_resume(runner, [])
                 args = self._args("run", runner, ["--no-skill"])
                 with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
                     brief = self._brief_agent_actually_got(lambda: args.func(args))
-                self.assertEqual(
-                    brief,
-                    "**不得使用任何 skill。**\n\n" + self._expected_run_notice()
-                    + "\n\n" + self.brief_text)
+                self.assertEqual(brief, "**不得使用任何 skill。**\n\n" + self.brief_text)
 
-    def test_run_with_skills_places_notice_after_guard_and_paths(self):
+    def test_run_with_skills_keeps_original_guard_and_paths(self):
         for runner in (ca.CODEX, ca.DEEPSEEK):
             with self.subTest(runner=runner):
                 d = self._meta_for_resume(runner, [])
@@ -5895,15 +5698,12 @@ class TestSkillPrompts(_HomeSandbox):
                 self.assertEqual(
                     brief,
                     "**不得使用任何 skill，以下几个除外（动手前先逐个读一遍）：**\n"
-                    f"- {self.skill}\n- {self.added_skill}\n\n"
-                    + self._expected_run_notice() + "\n\n" + self.brief_text)
+                    f"- {self.skill}\n- {self.added_skill}\n\n" + self.brief_text)
                 self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"],
                                  [str(self.skill), str(self.added_skill)])
 
     def test_resume_without_new_skills_sends_brief_unchanged(self):
         # 续跑若仍加禁令、重放旧路径或 strip 正文，后端收到的文本就会改变。
-        self.brief_text = "只补充这一轮的信息；续跑不要求重写首轮六段。\n"
-        self.brief.write_text(self.brief_text)
         for command in ("resume", "interrupt-and-resume"):
             for runner in (ca.CODEX, ca.DEEPSEEK):
                 with self.subTest(command=command, runner=runner):
@@ -5912,14 +5712,10 @@ class TestSkillPrompts(_HomeSandbox):
                     with mock.patch.object(ca, "find_task_agent_pid", return_value=None):
                         brief = self._brief_agent_actually_got(lambda: args.func(args))
                     self.assertEqual(brief, self.brief_text)
-                    self.assertNotIn("本轮任务名：", brief)
-                    self.assertNotIn("setsid", brief)
                     self.assertEqual(json.loads(ca.meta_path(d, "t").read_text())["skills"], [])
 
     def test_resume_reads_only_given_skills_without_filtering_repeated_paths(self):
         # 合并旧清单、跳过元数据已有路径、去重或丢掉读取指令，都会改掉实际提示。
-        self.brief_text = "这一轮只添加新的 skill 指令。\n"
-        self.brief.write_text(self.brief_text)
         for command in ("resume", "interrupt-and-resume"):
             for runner in (ca.CODEX, ca.DEEPSEEK):
                 with self.subTest(command=command, runner=runner):
@@ -5941,8 +5737,7 @@ class TestSkillPrompts(_HomeSandbox):
 
     def test_brief_with_guard_is_rejected_by_run_and_resume(self):
         # 即使 --no-skill 不再前置提示，brief 自带禁令仍须由 CLI 退 2。
-        self.brief.write_text(VALID_BRIEF_TEXT.replace(
-            "执行本测试指定的动作。", "**不得使用任何 skill。**"))
+        self.brief.write_text("**不得使用任何 skill。**\n\n干活")
         for command in ("run", "resume"):
             with self.subTest(command=command):
                 self._meta_for_resume(ca.CODEX, [])
@@ -6108,7 +5903,7 @@ class TestExitCodeContract(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
 
     def _run_args(self):
         return ca.build_parser().parse_args(
@@ -6995,7 +6790,7 @@ class TestQuotaReadTime(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("继续干活")
         self.task_home = self.task_storage(ca.CODEX, "default")
         real_datetime = datetime.datetime
 
@@ -7228,7 +7023,7 @@ class TestBackgroundRunner(_HomeSandbox):
         self.workdir = self.home / "repo"
         self.workdir.mkdir()
         self.brief = self.home / "brief.md"
-        self.brief.write_text(VALID_BRIEF_TEXT)
+        self.brief.write_text("干活")
         self.env_patch = mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(self.runtime)})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)

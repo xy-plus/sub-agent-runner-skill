@@ -100,7 +100,6 @@ ln -sfn ~/.claude/skills/sub-agent-runner/sub_agent_runner.py ~/.local/bin/sub-a
 `interrupt-and-resume`。护栏会拒绝前台派活并显示正确写法；后台调用中用 `&`、
 setsid、嵌套 shell 或循环脱离的 runner，会等到全部结束，把结论与退出码带进
 这次调用的一次完成通知。只提到 runner 的 grep、printf 等命令照常运行。
-子代理里再跑的 runner 命令不属于这次调用，护栏不等待它们，也不把它们计入结论；子代理若派了下级，应由子代理自己等它们完成。
 
 这是防常见派活写法错误的护栏，以下四种刻意绕过不防：
 
