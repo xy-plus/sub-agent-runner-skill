@@ -2736,6 +2736,30 @@ class TestArgv(unittest.TestCase):
         self.assertEqual(env["CODEX_SQLITE_HOME"], str(pathlib.Path.home() / ".codex"))
 
 
+class TestChildRunnerEnvironment(unittest.TestCase):
+    """子代理不继承编排者的 Bash 调用标记。
+
+    xy-skills 2026-11-10 两次 `status` 把子代理的退出码写回父 Bash 调用，真实任务成功却被
+    通知成 exit 4。根因是整份 `os.environ` 复制进了子代理；即使须知提醒别跑 status，
+    也不能阻止命令污染父调用，因此两个 runner 的 child env 都要剥掉这个标记，
+    同时保留 runner 自己进程中的值。
+    """
+
+    def test_codex和deepseek都剥掉父调用标记但保留runner环境(self):
+        builders = (
+            ("codex", ca.codex_env, pathlib.Path("/tmp/codex-child")),
+            ("deepseek", ca.deepseek_env, pathlib.Path("/tmp/deepseek-child")),
+        )
+        for marker in ("foreground:parent-call", "background:parent-call"):
+            with mock.patch.dict(os.environ, {ca.BASH_CALL_ENV: marker}):
+                self.assertEqual(os.environ[ca.BASH_CALL_ENV], marker)
+                for name, build_env, home in builders:
+                    with self.subTest(marker=marker, runner=name):
+                        child_env = build_env(home)
+                        self.assertNotIn(ca.BASH_CALL_ENV, child_env)
+                        self.assertEqual(os.environ[ca.BASH_CALL_ENV], marker)
+
+
 class TestDeepseekRunner(_HomeSandbox):
     """deepseek runner 的纯函数。**`judge` 一行不改**——runner 的职责是把本轮的
     产物摆成 judge 已经认识的形状：报告文件 + 本轮日志文本。

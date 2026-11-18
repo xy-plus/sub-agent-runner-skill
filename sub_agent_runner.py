@@ -1280,6 +1280,9 @@ def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
 
 def codex_env(home):
     env = dict(os.environ)
+    # 子代理里的 runner 命令不属于编排者这次 Bash 调用：不写入本次结论，也不由它等待。
+    # 子代理若派了下级要自己等；继承标记会把子代理的 status 退出码写回父调用，xy-skills 11-10 两次因此误报 exit 4。
+    env.pop(BASH_CALL_ENV, None)
     env["CODEX_HOME"] = str(home)
     # 会话索引留在主目录，resume 才找得到（隔离的是 skill/plugin，不是会话历史）
     env["CODEX_SQLITE_HOME"] = str(pathlib.Path.home() / ".codex")
@@ -1312,8 +1315,11 @@ def deepseek_env(home):
 
     继承来的模型变量不用剥：档案（~/claude-tools/claude-switch/claude_switch/deepseek.py）的 env 压过它们
     （2026-09-25 实测）。effort 也在档案里定为 max，与本工具传的 --effort max 一致。
+
+    子环境同样移除此标记；边界和理由见 `codex_env`。
     """
     env = dict(os.environ)
+    env.pop(BASH_CALL_ENV, None)
     env["CLAUDE_CONFIG_DIR"] = str(home)
     return env
 
