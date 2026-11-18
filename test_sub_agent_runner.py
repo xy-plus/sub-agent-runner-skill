@@ -1087,7 +1087,7 @@ class TestGoalRunsIntegration(_RunsSandbox):
         self.brief = self.output_dir / "brief.md"
         self.brief.write_text("执行任务")
         task = goal(["add", "--title", "验证", "--criteria", "通过", "--state", "在办",
-                     "--pointer", "无", "--source", "1"], None).strip()
+                     "--pointer", "无", "--source-kind", "原话直提", "--source", "1"], None).strip()
         with _no_codex():
             self.invoke(self.command("run") + ["--output-dir", str(self.output_dir)])
         goal(["hook-prompt"], {"session_id": session, "prompt": "补充说明", "transcript_path": str(transcript)})
