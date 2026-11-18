@@ -1150,10 +1150,99 @@ def ensure_isolation(runner, account):
 # 「**不得使用任何 skill，除非本 brief 明确指定。**」也含有它。
 # 它只挡**复述过本工具措辞**的那一类——2026-09-20 实测：`禁止使用任何 skill。`
 # 和 `不要用任何 skill，除非我说了。` 都**放行**。挡不住的那一类靠的是工具的
-# 首轮句子排在最前面（见 prepend_skill_guard 的拼接顺序），本来优先级就明确。
+# 首轮句子排在最前面（见 build_run_prompt 的拼接顺序），本来优先级就明确。
 # 刻意**不**升级成语义匹配：那要引入一个新判据，换来的只是挡住一类优先级本来
 # 就不含糊的输入。
 SKILL_GUARD_STEM = "不得使用任何 skill"
+
+# Q5 给出了要看的（`## 要看的`）、验收（`## 验收`）和产出格式（`## 产出`）。
+# `## 任务` 说明其他段落围绕什么；`## 边界` 防止改错范围——brief-paths-name-the-host
+# 事故曾让产物写进共享检出目录；`## 最后一条回复` 固定 runner 记下的报告格式。
+# 每条要求只在这里定义一次。
+REQUIRED_BRIEF_SECTIONS = (
+    "## 任务",
+    "## 要看的",
+    "## 边界",
+    "## 产出",
+    "## 验收",
+    "## 最后一条回复",
+)
+
+
+def _opening_brief_fence(line):
+    match = re.match(r"(`{3,}|~{3,})", line.lstrip())
+    if match is None:
+        return None
+    marker = match.group(1)
+    return marker[0], len(marker)
+
+
+def _closing_brief_fence(line, fence):
+    character, length = fence
+    return re.fullmatch(re.escape(character) + f"{{{length},}}[ \\t]*", line.lstrip()) is not None
+
+
+def check_brief_sections(brief_text):
+    """Reject a malformed first-run brief before account choice or task state changes.
+
+    六段标题固定，段落内容按任务决定。「怎么做」不设必填，因为 skill 或任务本身常
+    已规定方法，强制添加只会逼出空话。brief 可能用 Markdown fence 举例，所以围栏只
+    与同字符且长度不小于开启标记的行配对；三级标题仍算段落正文。
+    """
+    occurrences = {heading: [] for heading in REQUIRED_BRIEF_SECTIONS}
+    current = None
+    fence = None
+
+    for line in brief_text.splitlines():
+        if fence is not None:
+            if line.strip() and current is not None:
+                current["has_body"] = True
+            if _closing_brief_fence(line, fence):
+                fence = None
+            continue
+
+        opening = _opening_brief_fence(line)
+        if opening is not None:
+            if line.strip() and current is not None:
+                current["has_body"] = True
+            fence = opening
+            continue
+
+        heading_line = line.rstrip()
+        if heading_line in occurrences:
+            current = {"has_body": False}
+            occurrences[heading_line].append(current)
+            continue
+
+        # ATX level-one and level-two headings end a section. Three or more hashes
+        # are content, as are non-required level-two headings such as "## 怎么做".
+        if re.match(r"^#{1,2}(?:[ \t]+|$)", heading_line):
+            current = None
+            continue
+        if current is not None and line.strip():
+            current["has_body"] = True
+
+    missing = [heading for heading in REQUIRED_BRIEF_SECTIONS if not occurrences[heading]]
+    repeated = [f"{heading}（{len(occurrences[heading])} 次）"
+                for heading in REQUIRED_BRIEF_SECTIONS if len(occurrences[heading]) > 1]
+    empty = [f"{heading}（第 {index} 处）"
+             for heading in REQUIRED_BRIEF_SECTIONS
+             for index, section in enumerate(occurrences[heading], 1)
+             if not section["has_body"]]
+    if not (missing or repeated or empty):
+        return
+
+    details = []
+    if missing:
+        details.append("缺少：" + "、".join(missing))
+    if repeated:
+        details.append("重复：" + "、".join(repeated))
+    if empty:
+        details.append("正文为空：" + "、".join(empty))
+    skill_doc = pathlib.Path(__file__).resolve().with_name("SKILL.md")
+    reject("首轮 brief 必须恰好包含六个二级标题，且每段正文非空：\n"
+           + "\n".join(details)
+           + f"\n格式说明见 {skill_doc}")
 
 # 主线和 resume 都固定带上的参数。调用方碰不到它们，也就不可能漏掉。
 # `--color never` **不在这里**：resume 不认它（见 build_resume_argv）。
@@ -1222,7 +1311,7 @@ def check_brief_has_no_guard(brief_text):
 
     抽成独立函数，是因为拒绝既要前移，也要留在实际发送正文的动作里：
       1. `check_can_resume` 里，排在 interrupt-and-resume 发 INT **之前**；
-      2. run 的 `prepend_skill_guard` 和续跑读取正文后，作为结构性兜底——闸留在
+      2. run 的 `build_run_prompt` 和续跑读取正文后，作为结构性兜底——闸留在
          动作本身上，才没有一条绕过去的后门（cmd_run 不走 check_can_resume）。
     纯拒绝、无副作用，跑两遍不花钱。
 
@@ -1239,13 +1328,25 @@ def check_brief_has_no_guard(brief_text):
                f"一个都不给就用 --no-skill。")
 
 
-def prepend_skill_guard(brief_text, skill_paths):
-    """兜底句前置。CODEX_HOME 隔离是结构性防线，这句是内容层的第二道。
+def build_run_prompt(brief_text, skill_paths, task, output_dir):
+    """前置工具拥有的 skill 禁令和子代理须知，再原样保留 brief。
 
-    两个参数都**没有默认值**：首轮白名单显式给，缺省成空就等于替调用方做了决定。
+    须知来自 quant 的五次事故：11-01 和 11-02 停掉父 runner，11-12 对自己的任务
+    运行 stop 一次、打断时连带停掉两个未用 setsid 启动的后台进程。任务名和产物目录把
+    stop／resume／interrupt-and-resume 的限制限定在本轮任务；派不派下级仍由 brief
+    决定。固定顺序让工具的两条约束在首轮提示里先于任务正文。
     """
     check_brief_has_no_guard(brief_text)
-    return f"{build_skill_guard(skill_paths)}\n\n{brief_text}"
+    notice = (
+        "启动你的 runner 进程是你的父进程，停掉它你也会被停掉；不要停它。\n"
+        f"本轮任务名：{task}\n"
+        f"本轮产物目录：{output_dir}\n"
+        "不要对上面这个任务运行 `sub-agent-runner stop`、`resume` 或 "
+        "`interrupt-and-resume`。\n"
+        "除 brief 点名要你停的进程外，只停你自己启动并记下 PID 的进程。\n"
+        "长时间运行的后台进程用 `setsid` 启动并记下 PID，结束前确认它已退出；"
+        "不这样起的后台进程可能在你被打断时一起被停掉。")
+    return f"{build_skill_guard(skill_paths)}\n\n{notice}\n\n{brief_text}"
 
 
 def build_run_argv(dir_abs, effort, report_path, brief):
@@ -1280,6 +1381,8 @@ def build_resume_argv(dir_abs, session_id, effort, report_path, brief):
 
 def codex_env(home):
     env = dict(os.environ)
+    # 子代理跑 status 等命令时，不能把它的结论写回编排者的 Bash 调用（11-10 两次 exit 4）。
+    env.pop(BASH_CALL_ENV, None)
     env["CODEX_HOME"] = str(home)
     # 会话索引留在主目录，resume 才找得到（隔离的是 skill/plugin，不是会话历史）
     env["CODEX_SQLITE_HOME"] = str(pathlib.Path.home() / ".codex")
@@ -1312,8 +1415,12 @@ def deepseek_env(home):
 
     继承来的模型变量不用剥：档案（~/claude-tools/claude-switch/claude_switch/deepseek.py）的 env 压过它们
     （2026-09-25 实测）。effort 也在档案里定为 max，与本工具传的 --effort max 一致。
+
+    Bash-call marker 是例外：若子代理继承它，它自己的 runner 命令会把退出码写回父调用，
+    两次 `status` 曾把真实成功误报为 exit 4。只从 child env 移除，不改 runner 的环境。
     """
     env = dict(os.environ)
+    env.pop(BASH_CALL_ENV, None)
     env["CLAUDE_CONFIG_DIR"] = str(home)
     return env
 
@@ -2434,6 +2541,9 @@ def cmd_run(args, home, output_fd):
     brief_file = pathlib.Path(args.brief).expanduser()
     if not brief_file.is_file():
         reject(f"--brief {args.brief} 不是文件（brief 只收文件路径，避开引号地狱）")
+    brief_text = brief_file.read_text()
+    # A malformed first brief is rejected before account selection, isolation, or metadata.
+    check_brief_sections(brief_text)
 
     old_meta = find_meta(home, args.task)
 
@@ -2464,7 +2574,7 @@ def cmd_run(args, home, output_fd):
                    f"要换账号就用 --account {AUTO}，它会更新元数据里的账号。")
 
     # 先拒绝还在跑的任务；上一轮 writer 的排干由 run_codex 在写新元数据前等待。
-    brief = prepend_skill_guard(brief_file.read_text(), args.skills)
+    brief = build_run_prompt(brief_text, args.skills, args.task, home.parent)
     if find_task_agent_pid(runner, home, args.task) is not None:
         reject(f"任务名 {args.task} 还在跑（{home}），"
                f"换个名字或先 `sub-agent-runner stop {args.task} --output-dir {shlex.quote(str(home.parent))}`")
@@ -2587,6 +2697,9 @@ def check_can_resume(task, meta, brief_path):
     但那条判据的**本意**是「有些检查在动手之前做不了」（比如 `ensure_isolation`
     要先解析出账号），不是「可恢复就随便放」。brief 的内容是调用方交进来的输入，
     动手之前就问得出来；白白烧掉一轮，即使可恢复也是浪费。
+
+    不要在续跑这里调用 `check_brief_sections`：续跑 brief 按 xy-workflow／xy-review
+    约定只写增量，首轮六段不能拿来约束后续消息。skill 禁令仍由下面的原闸拒绝。
 
     四道闸里前三道拒的是**不可恢复**的事：没 session id 就再也回不来，工作目录
     没了、brief 不是文件则连命令都拼不出来。第四道（brief 自带兜底句）是纯输入
